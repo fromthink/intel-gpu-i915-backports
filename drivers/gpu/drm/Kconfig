@@ -36,8 +36,7 @@ config DRM_MIPI_DBI
 	select DRM_KMS_HELPER
 
 config DRM_MIPI_DSI
-	bool
-	depends on DRM
+	tristate
 
 config DRM_DEBUG_MM
 	bool "Insert extra checks and debug info into the DRM range managers"
