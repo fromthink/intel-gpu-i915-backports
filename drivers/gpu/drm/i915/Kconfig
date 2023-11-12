@@ -37,7 +37,7 @@ config DRM_I915
 	depends on CRC32
 	select SND_HDA_I915 if SND_HDA_CORE
 	select CEC_CORE if CEC_NOTIFIER
-	depends on VMAP_PFN
+	select VMAP_PFN
 	select DRM_TTM if DRM
 	select DRM_BUDDY if DRM
 	# depends on AUXILIARY_BUS
