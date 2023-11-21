@@ -34,20 +34,14 @@ static void uc_expand_default_options(struct intel_uc *uc)
 	if (i915->params.enable_guc != -1)
 		return;
 
-	/* Don't enable GuC/HuC on pre-Gen12 */
+	/* Don't enable GuC/HuC on pre-Gen9 */
+	if (GRAPHICS_VER(i915) < 9) {
+		i915->params.enable_guc = 0;
+		return;
+	}
+
+	/* Enable HuC on pre-Gen12 */
 	if (GRAPHICS_VER(i915) < 12) {
-		i915->params.enable_guc = 0;
-		return;
-	}
-
-	/* Don't enable GuC/HuC on older Gen12 platforms */
-	if (IS_TIGERLAKE(i915) || IS_ROCKETLAKE(i915)) {
-		i915->params.enable_guc = 0;
-		return;
-	}
-
-	/* Intermediate platforms are HuC authentication only */
-	if (IS_ALDERLAKE_S(i915) && !IS_RAPTORLAKE_S(i915)) {
 		i915->params.enable_guc = ENABLE_GUC_LOAD_HUC;
 		return;
 	}
