@@ -4,7 +4,7 @@
  */
 
 #include "i915_drv.h"
-
+#include "intel_gt.h"
 #include "intel_gt_mcr.h"
 #include "intel_gt_print.h"
 #include "intel_gt_regs.h"
@@ -35,7 +35,7 @@
  * ignored.
  */
 
-#define HAS_MSLICE_STEERING(dev_priv)	(INTEL_INFO(dev_priv)->has_mslice_steering)
+#define HAS_MSLICE_STEERING(i915)	(INTEL_INFO(i915)->has_mslice_steering)
 
 static const char * const intel_steering_types[] = {
 	"L3BANK",
@@ -162,12 +162,12 @@ void intel_gt_mcr_init(struct intel_gt *gt)
 			gt_warn(gt, "mslice mask all zero!\n");
 	}
 
-	if (MEDIA_VER(i915) >= 13 && gt->type == GT_MEDIA) {
+	if (gt->type == GT_MEDIA && MEDIA_VER(i915) >= 13) {
 		gt->steering_table[OADDRM] = xelpmp_oaddrm_steering_table;
 	} else if (GRAPHICS_VER_FULL(i915) >= IP_VER(12, 70)) {
 		/* Wa_14016747170 */
-		if (IS_MTL_GRAPHICS_STEP(i915, M, STEP_A0, STEP_B0) ||
-		    IS_MTL_GRAPHICS_STEP(i915, P, STEP_A0, STEP_B0))
+		if (IS_GFX_GT_IP_STEP(gt, IP_VER(12, 70), STEP_A0, STEP_B0) ||
+		    IS_GFX_GT_IP_STEP(gt, IP_VER(12, 71), STEP_A0, STEP_B0))
 			fuse = REG_FIELD_GET(MTL_GT_L3_EXC_MASK,
 					     intel_uncore_read(gt->uncore,
 							       MTL_GT_ACTIVITY_FACTOR));
@@ -364,6 +364,7 @@ static u32 rw_with_mcr_steering(struct intel_gt *gt,
  *          function call.
  */
 void intel_gt_mcr_lock(struct intel_gt *gt, unsigned long *flags)
+	__acquires(&gt->mcr_lock)
 {
 	unsigned long __flags;
 	int err = 0;
@@ -375,9 +376,26 @@ void intel_gt_mcr_lock(struct intel_gt *gt, unsigned long *flags)
 	 * driver threads, but also with hardware/firmware agents.  A dedicated
 	 * locking register is used.
 	 */
-	if (GRAPHICS_VER_FULL(gt->i915) >= IP_VER(12, 70))
+	if (GRAPHICS_VER_FULL(gt->i915) >= IP_VER(12, 70)) {
+		/*
+		 * The steering control and semaphore registers are inside an
+		 * "always on" power domain with respect to RC6.  However there
+		 * are some issues if higher-level platform sleep states are
+		 * entering/exiting at the same time these registers are
+		 * accessed.  Grabbing GT forcewake and holding it over the
+		 * entire lock/steer/unlock cycle ensures that those sleep
+		 * states have been fully exited before we access these
+		 * registers.  This wakeref will be released in the unlock
+		 * routine.
+		 *
+		 * This is expected to become a formally documented/numbered
+		 * workaround soon.
+		 */
+		intel_uncore_forcewake_get(gt->uncore, FORCEWAKE_GT);
+
 		err = wait_for(intel_uncore_read_fw(gt->uncore,
 						    MTL_STEER_SEMAPHORE) == 0x1, 100);
+	}
 
 	/*
 	 * Even on platforms with a hardware lock, we'll continue to grab
@@ -410,8 +428,34 @@ void intel_gt_mcr_lock(struct intel_gt *gt, unsigned long *flags)
  * Context: Releases gt->mcr_lock
  */
 void intel_gt_mcr_unlock(struct intel_gt *gt, unsigned long flags)
+	__releases(&gt->mcr_lock)
 {
 	spin_unlock_irqrestore(&gt->mcr_lock, flags);
+
+	if (GRAPHICS_VER_FULL(gt->i915) >= IP_VER(12, 70)) {
+		intel_uncore_write_fw(gt->uncore, MTL_STEER_SEMAPHORE, 0x1);
+
+		intel_uncore_forcewake_put(gt->uncore, FORCEWAKE_GT);
+	}
+}
+
+/**
+ * intel_gt_mcr_lock_sanitize - Sanitize MCR steering lock
+ * @gt: GT structure
+ *
+ * This will be used to sanitize the initial status of the hardware lock
+ * during driver load and resume since there won't be any concurrent access
+ * from other agents at those times, but it's possible that boot firmware
+ * may have left the lock in a bad state.
+ *
+ */
+void intel_gt_mcr_lock_sanitize(struct intel_gt *gt)
+{
+	/*
+	 * This gets called at load/resume time, so we shouldn't be
+	 * racing with other driver threads grabbing the mcr lock.
+	 */
+	lockdep_assert_not_held(&gt->mcr_lock);
 
 	if (GRAPHICS_VER_FULL(gt->i915) >= IP_VER(12, 70))
 		intel_uncore_write_fw(gt->uncore, MTL_STEER_SEMAPHORE, 0x1);
@@ -437,26 +481,6 @@ u32 intel_gt_mcr_read(struct intel_gt *gt,
 }
 
 /**
- * intel_gt_mcr_read_fw - read a specific instance of an MCR register
- * @gt: GT structure
- * @reg: the MCR register to read
- * @group: the MCR group
- * @instance: the MCR instance
- *
- * Returns the value read from an MCR register after steering toward a specific
- * group/instance.  This function assumes the caller is already holding any
- * necessary forcewake domains; use intel_gt_mcr_read() in cases where
- * forcewake should be obtained automatically.
-
- */
-u32 intel_gt_mcr_read_fw(struct intel_gt *gt,
-			 i915_mcr_reg_t reg,
-			 int group, int instance)
-{
-	return rw_with_mcr_steering_fw(gt, reg, FW_REG_READ, group, instance, 0);
-}
-
-/**
  * intel_gt_mcr_unicast_write - write a specific instance of an MCR register
  * @gt: GT structure
  * @reg: the MCR register to write
@@ -473,25 +497,6 @@ void intel_gt_mcr_unicast_write(struct intel_gt *gt, i915_mcr_reg_t reg, u32 val
 				int group, int instance)
 {
 	rw_with_mcr_steering(gt, reg, FW_REG_WRITE, group, instance, value);
-}
-
-/**
- * intel_gt_mcr_unicast_write_fw - write a specific instance of an MCR register
- * @gt: GT structure
- * @reg: the MCR register to write
- * @value: value to write
- * @group: the MCR group
- * @instance: the MCR instance
- *
- * Write an MCR register in unicast mode after steering toward a specific
- * group/instance.  This function assumes the caller is already holding any
- * necessary forcewake domains; use intel_gt_mcr_unicast_write() in cases where
- * forcewake should be obtained automatically.
- */
-void intel_gt_mcr_unicast_write_fw(struct intel_gt *gt, i915_mcr_reg_t reg, u32 value,
-				   int group, int instance)
-{
-	rw_with_mcr_steering_fw(gt, reg, FW_REG_WRITE, group, instance, value);
 }
 
 /**
@@ -561,6 +566,10 @@ void intel_gt_mcr_multicast_write_fw(struct intel_gt *gt, i915_mcr_reg_t reg, u3
  * This operation only makes sense on MCR registers where all instances are
  * expected to have the same value.  The read will target any non-terminated
  * instance and the write will be applied to all instances.
+ *
+ * This function assumes the caller is already holding any necessary forcewake
+ * domains; use intel_gt_mcr_multicast_rmw() in cases where forcewake should
+ * be obtained automatically.
  *
  * Context: Calls functions that take and release gt->mcr_lock
  *
@@ -810,9 +819,7 @@ void intel_gt_mcr_report_steering(struct drm_printer *p, struct intel_gt *gt,
 			   gt->default_steering.instanceid);
 
 	if (GRAPHICS_VER_FULL(gt->i915) >= IP_VER(12, 70)) {
-		int i;
-
-		for (i = 0; i < NUM_STEERING_TYPES; i++)
+		for (int i = 0; i < NUM_STEERING_TYPES; i++)
 			if (gt->steering_table[i])
 				report_steering_type(p, gt, i, dump_table);
 	} else if (IS_PONTEVECCHIO(gt->i915)) {
@@ -872,6 +879,9 @@ void intel_gt_mcr_get_ss_steering(struct intel_gt *gt, unsigned int dss,
  * on GAM registers which are a bit special --- although they're MCR registers,
  * reads (e.g., waiting for status updates) are always directed to the primary
  * instance.
+ *
+ * Note that this routine assumes the caller holds forcewake asserted, it is
+ * not suitable for very long waits.
  *
  * Context: Calls a function that takes and releases gt->mcr_lock
  * Return: 0 if the register matches the desired condition, or -ETIMEDOUT.

@@ -10,6 +10,7 @@
 #include "gt/intel_reset.h"
 #include "gt/iov/intel_iov_memirq.h"
 #include "gt/iov/intel_iov_query.h"
+#include "gt/iov/intel_iov_utils.h"
 #include "intel_gsc_fw.h"
 #include "intel_gsc_uc.h"
 #include "intel_guc.h"
@@ -46,7 +47,7 @@ static void uc_expand_default_options(struct intel_uc *uc)
 	}
 
 	/* Intermediate platforms are HuC authentication only */
-	if (IS_ALDERLAKE_S(i915) && !IS_ADLS_RPLS(i915)) {
+	if (IS_ALDERLAKE_S(i915) && !IS_RAPTORLAKE_S(i915)) {
 		i915->params.enable_guc = ENABLE_GUC_LOAD_HUC;
 		return;
 	}
@@ -54,20 +55,8 @@ static void uc_expand_default_options(struct intel_uc *uc)
 	/* Default: enable HuC authentication and GuC submission */
 	i915->params.enable_guc = ENABLE_GUC_LOAD_HUC | ENABLE_GUC_SUBMISSION;
 
-	/*
-	 * XEHPSDV and PVC do not use HuC. We keep HuC on for PVC A-step to
-	 * use it as an sdv
-	 */
-	if (IS_XEHPSDV(i915) ||
-	    IS_PVC_BD_STEP(i915, STEP_B0, STEP_FOREVER))
-		i915->params.enable_guc &= ~ENABLE_GUC_LOAD_HUC;
-
-	/*
-	 * FIXME: MTL IFWI still has issues with FLR, so we can't reload the
-	 * driver with GSC enabled. Since GSC is a requirement for HuC, we can't
-	 * enable HuC without GSC.
-	 */
-	if (IS_METEORLAKE(i915))
+	/* XEHPSDV and PVC do not use HuC */
+	if (IS_XEHPSDV(i915) || IS_PONTEVECCHIO(i915))
 		i915->params.enable_guc &= ~ENABLE_GUC_LOAD_HUC;
 }
 
@@ -78,9 +67,6 @@ static int __intel_uc_reset_hw(struct intel_uc *uc)
 	struct intel_gt *gt = uc_to_gt(uc);
 	int ret;
 	u32 guc_status;
-
-	if (gt->i915->quiesce_gpu)
-		return 0;
 
 	ret = i915_inject_probe_error(gt->i915, -ENXIO);
 	if (ret)
@@ -134,7 +120,7 @@ static void __confirm_options(struct intel_uc *uc)
 		gt_info(gt, "Incompatible option enable_guc=%d - %s\n",
 			i915->params.enable_guc, "GuC submission is N/A");
 
-	if (i915->params.enable_guc & ~(ENABLE_GUC_MASK | ENABLE_GUC_DO_NOT_LOAD_GUC))
+	if (i915->params.enable_guc & ~ENABLE_GUC_MASK)
 		gt_info(gt, "Incompatible option enable_guc=%d - %s\n",
 			i915->params.enable_guc, "undocumented flag");
 }
@@ -160,6 +146,7 @@ void intel_uc_init_early(struct intel_uc *uc)
 void intel_uc_init_late(struct intel_uc *uc)
 {
 	intel_guc_init_late(&uc->guc);
+	intel_gsc_uc_load_start(&uc->gsc);
 }
 
 void intel_uc_driver_late_release(struct intel_uc *uc)
@@ -323,8 +310,7 @@ static void __uc_fetch_firmwares(struct intel_uc *uc)
 		}
 
 		if (intel_uc_wants_gsc_uc(uc)) {
-			drm_dbg(&uc_to_gt(uc)->i915->drm,
-				"Failed to fetch GuC: %d disabling GSC\n", err);
+			gt_dbg(gt, "Failed to fetch GuC fw (%pe) disabling GSC\n", ERR_PTR(err));
 			intel_uc_fw_change_status(&uc->gsc.fw,
 						  INTEL_UC_FIRMWARE_ERROR);
 		}
@@ -386,9 +372,6 @@ static int __uc_sanitize(struct intel_uc *uc)
 	struct intel_huc *huc = &uc->huc;
 
 	GEM_BUG_ON(!intel_uc_supports_guc(uc));
-
-	if (guc_to_gt(guc)->i915->quiesce_gpu)
-		return 0;
 
 	intel_huc_sanitize(huc);
 	intel_guc_sanitize(guc);
@@ -459,17 +442,6 @@ static bool uc_is_wopcm_locked(struct intel_uc *uc)
 	       (intel_uncore_read(uncore, DMA_GUC_WOPCM_OFFSET) & GUC_WOPCM_OFFSET_VALID);
 }
 
-static inline bool skip_lock_check(struct drm_i915_private *i915)
-{
-	/*
-	 * For platforms with GuC deprivilege, if a user *really* wants
-	 * to run without GuC, let that happen by setting enable_guc=0x80.
-	 */
-	return (HAS_GUC_DEPRIVILEGE(i915) &&
-		(i915->params.enable_guc & ENABLE_GUC_DO_NOT_LOAD_GUC) &&
-		!(i915->params.enable_guc & ~ENABLE_GUC_DO_NOT_LOAD_GUC));
-}
-
 static int __uc_check_hw(struct intel_uc *uc)
 {
 	if (uc->fw_table_invalid)
@@ -483,10 +455,8 @@ static int __uc_check_hw(struct intel_uc *uc)
 	 * before on this system after reboot, otherwise we risk GPU hangs.
 	 * To check if GuC was loaded before we look at WOPCM registers.
 	 */
-	if (uc_is_wopcm_locked(uc) && likely(!skip_lock_check(uc_to_gt(uc)->i915))) {
-		gt_probe_error(uc_to_gt(uc), "Can't run without GuC if GuC has previously been enabled\n");
+	if (uc_is_wopcm_locked(uc))
 		return -EIO;
-	}
 
 	return 0;
 }
@@ -531,13 +501,12 @@ static int __uc_init_hw(struct intel_uc *uc)
 
 	intel_guc_reset_interrupts(guc);
 
+	/* WaEnableuKernelHeaderValidFix:skl */
+	/* WaEnableGuCBootHashCheckNotSet:skl,bxt,kbl */
 	if (GRAPHICS_VER(i915) == 9)
-		/* WaEnableuKernelHeaderValidFix:skl */
-		/* WaEnableGuCBootHashCheckNotSet:skl,bxt,kbl */
 		attempts = 3;
 	else
-		/* Always retry at least once in case something weird happens */
-		attempts = 2;
+		attempts = 1;
 
 	/* Disable a potentially low PL1 power limit to allow freq to be raised */
 	i915_hwmon_power_max_disable(gt->i915, &pl1en);
@@ -581,7 +550,7 @@ static int __uc_init_hw(struct intel_uc *uc)
 	if (intel_huc_is_loaded_by_gsc(huc))
 		intel_huc_update_auth_status(huc);
 	else
-		intel_huc_auth(huc);
+		intel_huc_auth(huc, INTEL_HUC_AUTH_BY_GUC);
 
 	if (intel_uc_uses_guc_submission(uc)) {
 		ret = intel_guc_submission_enable(guc);
@@ -600,10 +569,6 @@ static int __uc_init_hw(struct intel_uc *uc)
 
 	i915_hwmon_power_max_restore(gt->i915, pl1en);
 
-	ret = intel_guc_g2g_register(guc);
-	if (ret)
-		guc_info(guc, "Failed to register GuC-to-GuC communication channel: %d\n", ret);
-
 	guc_info(guc, "submission %s\n", str_enabled_disabled(intel_uc_uses_guc_submission(uc)));
 	guc_info(guc, "SLPC %s\n", str_enabled_disabled(intel_uc_uses_guc_slpc(uc)));
 
@@ -617,10 +582,6 @@ err_submission:
 err_log_capture:
 	__uc_capture_load_err_log(uc);
 err_rps:
-	if (!i915_error_injected())
-		intel_klog_error_capture(uc_to_gt(uc),
-					 (intel_engine_mask_t) ~0U);
-
 	/* Return GT back to RPn */
 	intel_rps_lower_unslice(&uc_to_gt(uc)->rps);
 
@@ -644,35 +605,13 @@ static void __uc_fini_hw(struct intel_uc *uc)
 {
 	struct intel_guc *guc = &uc->guc;
 
-	if (!intel_uc_fw_is_available(&guc->fw))
+	if (!intel_guc_is_fw_running(guc))
 		return;
 
 	if (intel_uc_uses_guc_submission(uc))
 		intel_guc_submission_disable(guc);
 
 	__uc_sanitize(uc);
-}
-
-/*
- * Firmwares loaded via the GSC engine require the submission back-end to have
- * been initialized, so can only be loaded late in the probe/resume process.
- * TODO move to worker
- */
-static int __uc_init_hw_late(struct intel_uc *uc)
-{
-	int err;
-
-	if (!intel_uc_uses_gsc_uc(uc))
-		return 0;
-
-	err = intel_gsc_fw_upload(&uc->gsc);
-	if (err)
-		return err;
-
-	if (intel_uc_uses_huc(uc))
-		err = intel_huc_fw_load_and_auth_via_gsc(&uc->huc);
-
-	return err;
 }
 
 static int __vf_uc_sanitize(struct intel_uc *uc)
@@ -688,8 +627,9 @@ static void __vf_uc_init_fw(struct intel_uc *uc)
 	struct intel_gt *gt = uc_to_gt(uc);
 	unsigned int major = gt->iov.vf.config.guc_abi.major;
 	unsigned int minor = gt->iov.vf.config.guc_abi.minor;
+	unsigned int patch = gt->iov.vf.config.guc_abi.patch;
 
-	intel_uc_fw_set_preloaded(&uc->guc.fw, major, minor);
+	intel_uc_fw_set_preloaded(&uc->guc.fw, major, minor, patch);
 }
 
 static int __vf_uc_init(struct intel_uc *uc)
@@ -746,7 +686,7 @@ static int __vf_uc_init_hw(struct intel_uc *uc)
 	if (intel_uc_fw_is_supported(&huc->fw)) {
 		if (intel_huc_check_status(huc) > 0)
 			/* XXX: We don't know how to get the HuC version yet */
-			intel_uc_fw_set_preloaded(&huc->fw, 0, 0);
+			intel_uc_fw_set_preloaded(&huc->fw, 0, 0, 0);
 		else
 			intel_uc_fw_change_status(&huc->fw, INTEL_UC_FIRMWARE_DISABLED);
 	}
@@ -824,8 +764,22 @@ void intel_uc_reset_finish(struct intel_uc *uc)
 
 	uc->reset_in_progress = false;
 
-	if (intel_uc_uses_guc_submission(uc))
+	/* Firmware expected to be running when this function is called */
+	if (intel_guc_is_fw_running(guc) && intel_uc_uses_guc_submission(uc)) {
+		struct drm_i915_private *i915 = uc_to_gt(uc)->i915;
+
 		intel_guc_submission_reset_finish(guc);
+
+		/*
+		 * Wa_14019103365:
+		 * In case the VFs are enabled and the GuC is reset,
+		 * we need to re-disableGSC engine in GuC.
+		 */
+		if (IS_METEORLAKE(i915) &&
+		    pf_has_vfs_enabled(&uc_to_gt(uc)->iov) &&
+		    intel_gsc_uc_fw_init_done(&uc->gsc))
+			intel_guc_disable_gsc_engine(guc);
+	}
 }
 
 void intel_uc_cancel_requests(struct intel_uc *uc)
@@ -864,6 +818,9 @@ void intel_uc_suspend(struct intel_uc *uc)
 	intel_wakeref_t wakeref;
 	int err;
 
+	/* flush the GSC worker */
+	intel_gsc_uc_flush_work(&uc->gsc);
+
 	if (!intel_guc_is_ready(guc)) {
 		guc->interrupts.enabled = false;
 		return;
@@ -876,11 +833,10 @@ void intel_uc_suspend(struct intel_uc *uc)
 	}
 }
 
-static void __uc_resume_early(struct intel_uc *uc)
+static void __uc_resume_mappings(struct intel_uc *uc)
 {
-	intel_uc_fw_resume(&uc->guc.fw);
-	intel_uc_fw_resume(&uc->huc.fw);
-	intel_uc_fw_resume(&uc->gsc.fw);
+	intel_uc_fw_resume_mapping(&uc->guc.fw);
+	intel_uc_fw_resume_mapping(&uc->huc.fw);
 }
 
 static int __uc_resume(struct intel_uc *uc, bool enable_communication)
@@ -914,6 +870,8 @@ static int __uc_resume(struct intel_uc *uc, bool enable_communication)
 		return err;
 	}
 
+	intel_gsc_uc_resume(&uc->gsc);
+
 	return 0;
 }
 
@@ -937,6 +895,7 @@ int intel_uc_runtime_resume(struct intel_uc *uc)
 
 static const struct intel_uc_ops uc_ops_off = {
 	.init_hw = __uc_check_hw,
+	.fini = __uc_fini, /* to clean-up the init_early initialization */
 };
 
 static const struct intel_uc_ops uc_ops_on = {
@@ -949,10 +908,9 @@ static const struct intel_uc_ops uc_ops_on = {
 	.fini = __uc_fini,
 
 	.init_hw = __uc_init_hw,
-	.init_hw_late = __uc_init_hw_late,
 	.fini_hw = __uc_fini_hw,
 
-	.resume_early = __uc_resume_early,
+	.resume_mappings = __uc_resume_mappings,
 };
 
 static const struct intel_uc_ops uc_ops_vf = {

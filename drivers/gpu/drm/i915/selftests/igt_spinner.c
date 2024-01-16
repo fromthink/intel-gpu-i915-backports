@@ -64,9 +64,9 @@ static void *igt_spinner_pin_obj(struct intel_context *ce,
 		return vaddr;
 
 	if (ww)
-		ret = i915_vma_pin_ww(*vma, ww, 0, 0, PIN_USER | PIN_ZONE_48);
+		ret = i915_vma_pin_ww(*vma, ww, 0, 0, PIN_USER);
 	else
-		ret = i915_vma_pin(*vma, 0, 0, PIN_USER | PIN_ZONE_48);
+		ret = i915_vma_pin(*vma, 0, 0, PIN_USER);
 
 	if (ret) {
 		i915_gem_object_unpin_map(obj);
@@ -97,7 +97,7 @@ int igt_spinner_pin(struct igt_spinner *spin,
 	if (!spin->batch) {
 		unsigned int mode;
 
-		mode = i915_coherent_map_type(spin->gt->i915, spin->obj, false);
+		mode = i915_coherent_map_type(spin->gt, spin->obj, false);
 		vaddr = igt_spinner_pin_obj(ce, ww, spin->obj, mode, &spin->batch_vma);
 		if (IS_ERR(vaddr))
 			return PTR_ERR(vaddr);
@@ -117,22 +117,6 @@ static u64 hws_address(const struct i915_vma *hws,
 		       const struct i915_request *rq)
 {
 	return i915_vma_offset(hws) + seqno_offset(rq->fence.context);
-}
-
-static int move_to_active(struct i915_vma *vma,
-			  struct i915_request *rq,
-			  unsigned int flags)
-{
-	int err;
-
-	i915_vma_lock(vma);
-	err = i915_request_await_object(rq, vma->obj,
-					flags & EXEC_OBJECT_WRITE);
-	if (err == 0)
-		err = i915_vma_move_to_active(vma, rq, flags);
-	i915_vma_unlock(vma);
-
-	return err;
 }
 
 struct i915_request *
@@ -165,11 +149,11 @@ igt_spinner_create_request(struct igt_spinner *spin,
 	if (IS_ERR(rq))
 		return ERR_CAST(rq);
 
-	err = move_to_active(vma, rq, 0);
+	err = igt_vma_move_to_active_unlocked(vma, rq, 0);
 	if (err)
 		goto cancel_rq;
 
-	err = move_to_active(hws, rq, 0);
+	err = igt_vma_move_to_active_unlocked(hws, rq, 0);
 	if (err)
 		goto cancel_rq;
 
@@ -191,9 +175,19 @@ igt_spinner_create_request(struct igt_spinner *spin,
 		*batch++ = MI_STORE_DWORD_IMM | MI_MEM_VIRTUAL;
 		*batch++ = hws_address(hws, rq);
 	}
-	*batch++ = i915_request_seqno(rq);
+	*batch++ = rq->fence.seqno;
 
 	*batch++ = arbitration_command;
+
+	/*
+	 * Insert an arbitrary delay between MI_BATCH_BUFFER_STARTs to afford HW
+	 * the chance to interrupt the Command Parser
+	 *
+	 * Caveats:
+	 * - mtl bcs0 fails to reset if there is no MI_NOOP between MI_BB_START.
+	 */
+	memset32(batch, MI_NOOP, 128);
+	batch += 128;
 
 	if (GRAPHICS_VER(rq->engine->i915) >= 8)
 		*batch++ = MI_BATCH_BUFFER_START | BIT(8) | 1;
@@ -219,10 +213,7 @@ igt_spinner_create_request(struct igt_spinner *spin,
 	flags = 0;
 	if (GRAPHICS_VER(rq->engine->i915) <= 5)
 		flags |= I915_DISPATCH_SECURE;
-	err = engine->emit_bb_start(rq,
-				    i915_vma_offset(vma),
-				    PAGE_SIZE,
-				    flags);
+	err = engine->emit_bb_start(rq, i915_vma_offset(vma), PAGE_SIZE, flags);
 
 cancel_rq:
 	if (err) {
@@ -272,9 +263,9 @@ bool igt_wait_for_spinner(struct igt_spinner *spin, struct i915_request *rq)
 		intel_engine_flush_submission(rq->engine);
 
 	return !(wait_for_us(i915_seqno_passed(hws_seqno(spin, rq),
-					       i915_request_seqno(rq)),
+					       rq->fence.seqno),
 			     100) &&
 		 wait_for(i915_seqno_passed(hws_seqno(spin, rq),
-					    i915_request_seqno(rq)),
+					    rq->fence.seqno),
 			  50));
 }

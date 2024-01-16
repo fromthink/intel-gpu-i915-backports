@@ -178,8 +178,7 @@ retry:
 	if (err)
 		goto err_context;
 
-	err = i915_vma_pin_ww(so->vma, &so->ww, 0, 0,
-			      PIN_GLOBAL | PIN_HIGH | PIN_ZONE_48);
+	err = i915_vma_pin_ww(so->vma, &so->ww, 0, 0, PIN_GLOBAL | PIN_HIGH);
 	if (err)
 		goto err_context;
 
@@ -216,9 +215,7 @@ int intel_renderstate_emit(struct intel_renderstate *so,
 	if (!so->vma)
 		return 0;
 
-	err = i915_request_await_object(rq, so->vma->obj, false);
-	if (err == 0)
-		err = i915_vma_move_to_active(so->vma, rq, 0);
+	err = i915_vma_move_to_active(so->vma, rq, 0);
 	if (err)
 		return err;
 

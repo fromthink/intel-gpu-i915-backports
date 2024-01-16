@@ -9,7 +9,8 @@
 #include <linux/mutex.h>
 #include <linux/spinlock.h>
 #include <drm/drm_mm.h>
-#include "intel_lmtt.h"
+#include "abi/iov_actions_abi.h"
+#include "gt/intel_gtt.h"
 #include "i915_reg.h"
 #include "i915_selftest.h"
 #include "intel_wakeref.h"
@@ -36,7 +37,7 @@ IOV_THRESHOLDS(__to_intel_iov_threshold_enum)
 #undef __to_intel_iov_threshold_enum
 };
 
-#define __count_iov_thresholds(...) +1
+#define __count_iov_thresholds(...) + 1
 #define IOV_THRESHOLD_MAX (0 IOV_THRESHOLDS(__count_iov_thresholds))
 
 /**
@@ -48,10 +49,10 @@ IOV_THRESHOLDS(__to_intel_iov_threshold_enum)
  * @begin_db: start index of GuC doorbells.
  * @exec_quantum: execution-quantum in milliseconds.
  * @preempt_timeout: preemption timeout in microseconds.
+ * @thresholds: FIXME missing docs
  */
 struct intel_iov_config {
 	struct drm_mm_node ggtt_region;
-	struct drm_i915_gem_object *lmem_obj;
 	u16 num_ctxs;
 	u16 begin_ctx;
 	u16 num_dbs;
@@ -64,13 +65,11 @@ struct intel_iov_config {
 /**
  * struct intel_iov_spare_config - PF spare configuration data.
  * @ggtt_size: GGTT size.
- * @lmem_size: LMEM size.
  * @num_ctxs: number of GuC submission contexts.
  * @num_dbs: number of GuC doorbells.
  */
 struct intel_iov_spare_config {
 	u64 ggtt_size;
-	u64 lmem_size;
 	u16 num_ctxs;
 	u16 num_dbs;
 };
@@ -98,9 +97,13 @@ struct intel_iov_policies {
 /**
  * struct intel_iov_provisioning - IOV provisioning data.
  * @auto_mode: indicates manual or automatic provisioning mode.
+ * @num_pushed: FIXME missing doc
+ * @worker: FIXME missing doc
  * @policies: provisioning policies.
+ * @spare: spare resources configuration
  * @configs: flexible array with configuration data for PF and VFs.
  * @lock: protects provisionining data
+ * @self_done: FIXME missing doc
  */
 struct intel_iov_provisioning {
 	bool auto_mode;
@@ -120,6 +123,8 @@ struct intel_iov_provisioning {
 /**
  * struct intel_iov_data - Data related to one VF.
  * @state: VF state bits
+ * @paused: FIXME missing doc
+ * @adverse_events: FIXME missing doc
  * @guc_state: pointer to VF state from GuC
  */
 struct intel_iov_data {
@@ -128,6 +133,7 @@ struct intel_iov_data {
 #define IOV_VF_NEEDS_FLR_START		1
 #define IOV_VF_FLR_DONE_RECEIVED	2
 #define IOV_VF_NEEDS_FLR_FINISH		3
+#define IOV_VF_NEEDS_FLR_DONE_SYNC	4
 #define IOV_VF_FLR_FAILED		(BITS_PER_LONG - 1)
 	bool paused;
 	unsigned int adverse_events[IOV_THRESHOLD_MAX];
@@ -137,6 +143,7 @@ struct intel_iov_data {
 /**
  * struct intel_iov_state - Placeholder for all VFs data.
  * @worker: event processing worker
+ * @data: FIXME missing doc
  */
 struct intel_iov_state {
 	struct work_struct worker;
@@ -177,6 +184,25 @@ struct intel_iov_vf_runtime {
 };
 
 /**
+ * struct intel_iov_vf_ggtt_ptes - Placeholder for the VF PTEs data.
+ * @ptes: an array of buffered GGTT PTEs awaiting update by PF.
+ * @count: count of the buffered PTEs in the array.
+ * @offset: GGTT offset for the first PTE from the array.
+ * @num_copies: number of copies of the first or last PTE (depending on mode).
+ * @mode: mode of generating PTEs on PF.
+ * @lock: protects PTEs data
+ */
+struct intel_iov_vf_ggtt_ptes {
+	gen8_pte_t ptes[VF2PF_UPDATE_GGTT_MAX_PTES];
+	u16 count;
+	u32 offset;
+	u16 num_copies;
+	u8 mode;
+#define VF_RELAY_UPDATE_GGTT_MODE_INVALID	U8_MAX
+	struct mutex lock;
+};
+
+/**
  * struct intel_iov_memirq - IOV interrupts data.
  * @obj: GEM object with memory interrupt data.
  * @vma: VMA of the object.
@@ -193,6 +219,7 @@ struct intel_iov_memirq {
  * @lock: protects #pending_relays and #last_fence.
  * @pending_relays: list of relay requests that await a response.
  * @last_fence: fence used with last message.
+ * @selftest: FIXME missing doc
  */
 struct intel_iov_relay {
 	spinlock_t lock;
@@ -211,12 +238,11 @@ struct intel_iov_relay {
 
 /**
  * struct intel_iov_vf_config - VF configuration data.
+ * @guc_abi: FIXME missing doc
  * @ggtt_base: base of GGTT region.
  * @ggtt_size: size of GGTT region.
- * @lmem_size: LMEM size.
  * @num_ctxs: number of GuC submission contexts.
  * @num_dbs: number of GuC doorbells.
- * @tile_mask: assigned tiles (as bitmask with tile0 = BIT(0)).
  */
 struct intel_iov_vf_config {
 	struct {
@@ -227,33 +253,18 @@ struct intel_iov_vf_config {
 	} guc_abi;
 	u64 ggtt_base;
 	u64 ggtt_size;
-	u64 lmem_size;
 	u16 num_ctxs;
 	u16 num_dbs;
-	u32 tile_mask;
 };
-
-#if IS_ENABLED(CPTCFG_DRM_I915_SELFTEST)
-struct intel_iov;
-/**
- * struct intel_iov_selftest - I/O Virtualization selftest related data
- * @mmio_set_pte: pointer to the function that writes the PTE to the MMIO
- * @mmio_get_pte: pointer to the function that reads the PTE from the MMIO
- */
-struct intel_iov_selftest
-{
-	void (*mmio_set_pte)(struct intel_iov *iov, void __iomem *pte_addr, u64 pte);
-	u64 (*mmio_get_pte)(struct intel_iov *iov, void __iomem *pte_addr);
-};
-#endif
 
 /**
  * struct intel_iov - I/O Virtualization related data.
+ * @pf: PF's data.
  * @pf.sysfs: sysfs data.
  * @pf.provisioning: provisioning data.
  * @pf.service: placeholder for service data.
  * @pf.state: placeholder for VFs data.
- * @pf.lmtt: local memory translation tables for VFs.
+ * @vf: FIXME missing doc
  * @vf.config: configuration of the resources assigned to VF.
  * @vf.runtime: retrieved runtime info.
  * @vf.irq: Memory based interrupts data.
@@ -266,19 +277,18 @@ struct intel_iov {
 			struct intel_iov_provisioning provisioning;
 			struct intel_iov_service service;
 			struct intel_iov_state state;
-			struct intel_lmtt lmtt;
 		} pf;
 
 		struct {
 			struct intel_iov_vf_config config;
 			struct intel_iov_vf_runtime runtime;
+			struct intel_iov_vf_ggtt_ptes ptes_buffer;
 			struct drm_mm_node ggtt_balloon[2];
 			struct intel_iov_memirq irq;
 		} vf;
 	};
 
 	struct intel_iov_relay relay;
-	I915_SELFTEST_DECLARE(struct intel_iov_selftest selftest);
 };
 
 #endif /* __INTEL_IOV_TYPES_H__ */

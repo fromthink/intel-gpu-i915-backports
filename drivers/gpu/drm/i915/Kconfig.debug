@@ -21,80 +21,31 @@ config DRM_I915_DEBUG
 	depends on DRM_I915
 	depends on EXPERT # only for developers
 	depends on !COMPILE_TEST # never built by robots
-	select PCI_MSI # ... for iommu enabled by default
-	depends on IOMMU_API
-	depends on IOMMU_IOVA
-	depends on IOMMU_SUPPORT
-	depends on NEED_DMA_MAP_STATE
-	depends on DMAR_TABLE
-	depends on INTEL_IOMMU
-	depends on INTEL_IOMMU_DEFAULT_ON
 	depends on DEBUG_FS
 	depends on PREEMPT_COUNT
 	depends on I2C_CHARDEV
-	depends on REF_TRACKER
 	depends on STACKDEPOT
-	depends on STACKTRACE
 	select DRM_DP_AUX_CHARDEV
 	select X86_MSR # used by igt/pm_rpm
 	select DRM_VGEM # used by igt/prime_vgem (dmabuf interop checks)
 	select DRM_DEBUG_MM if DRM=y
 	select DRM_EXPORT_FOR_TESTS if m
-	select DRM_DEBUG_SELFTEST
-#	select DMABUF_SELFTESTS
-#	select SW_SYNC # signaling validation framework (igt/syncobj*)
+	depends on DRM_DEBUG_SELFTEST
+	depends on DMABUF_SELFTESTS
+	select SW_SYNC # signaling validation framework (igt/syncobj*)
 	select DRM_I915_WERROR
-	select DRM_I915_CAPTURE_ERROR
-	select DRM_I915_DEBUGGER
 	select DRM_I915_DEBUG_GEM
 	select DRM_I915_DEBUG_GEM_ONCE
 	select DRM_I915_DEBUG_MMIO
-	select DRM_I915_DEBUG_MOCS
 	select DRM_I915_DEBUG_RUNTIME_PM
-	select DRM_I915_DEBUG_WAKEREF
 	select DRM_I915_SW_FENCE_DEBUG_OBJECTS
 	select DRM_I915_SELFTEST
-	select INTEL_MEI_GSC if X86
-	select INTEL_MEI_PXP if X86
-	select INTEL_MEI_IAF if X86
-	select INTEL_MEI_GSC_PROXY if X86
-	select INTEL_VSEC if X86
-	select INTEL_PMT_TELEMETRY if X86
-	select INTEL_PMT_CRASHLOG if X86
-	select INTEL_PMT_WATCHER if X86
-	select PCIE_DPC if PCIEAER
-	select BROKEN # for prototype uAPI
 	default n
 	help
 	  Choose this option to turn on extra driver debugging that may affect
 	  performance but will catch some internal issues.
 
 	  Recommended for driver developers only.
-
-	  If in doubt, say "N".
-
-config DRM_I915_DEBUG_MOCS
-	bool "Allow to specify customized MOCS table"
-	depends on DRM_I915
-	default n
-	help
-	  Choose this option if you want customised MOCS table to be loaded
-	  from the /lib/firmware directory. It can be useful when you want
-	  to provide your own MOCS table for debugging. MOCS table can be
-	  provided via module parameter i915.mocs_table_path. Current MOCS
-	  table in use can be viewed from 'i915_mocs_table' debugfs file.
-	  Each line in 'i915_mocs_table' represents one mocs table entry.
-	  Ex: 0x0001003300000099
-	  0001 represents if entry is being used
-	  0033 represents L3CC Value
-	  00000099 represents Control Value
-
-	  There is a special case for path 'uncached.bin' which write all
-	  hw mocs entries by using the drivers internal uncached entry without
-	  the need to provide a file in /lib/firmware directory.
-
-	  Note: Need to follow the same MOCS enrty format while providing
-	  customized MOCS table.
 
 	  If in doubt, say "N".
 
@@ -233,8 +184,6 @@ config DRM_I915_SELFTEST
 	depends on DRM_I915
 	default n
 	select DRM_EXPORT_FOR_TESTS if m
-	depends on FTRACE
-	depends on TRACER_SNAPSHOT
 	depends on FAULT_INJECTION
 	depends on PRIME_NUMBERS
 	depends on CRC32
@@ -294,9 +243,7 @@ config DRM_I915_DEBUG_RUNTIME_PM
 	bool "Enable extra state checking for runtime PM"
 	depends on DRM_I915
 	default n
-	depends on REF_TRACKER
 	depends on STACKDEPOT
-	depends on STACKTRACE
 	help
 	  Choose this option to turn on extra state checking for the
 	  runtime PM functionality. This may introduce overhead during
@@ -305,55 +252,3 @@ config DRM_I915_DEBUG_RUNTIME_PM
 	  Recommended for driver developers only.
 
 	  If in doubt, say "N"
-
-config DRM_I915_DEBUG_WAKEREF
-	bool "Enable extra tracking for wakerefs"
-	depends on DRM_I915
-	default n
-	depends on REF_TRACKER
-	depends on STACKDEPOT
-	depends on STACKTRACE
-	help
-	  Choose this option to turn on extra state checking and usage
-	  tracking for the wakerefPM functionality. This may introduce
-	  overhead during driver runtime.
-
-	  If in doubt, say "N"
-
-config DRM_I915_PCIE_STRICT_WRITE_ORDERING
-	bool "Enable PCIe strict ordering "
-	depends on DRM_I915
-	default n
-	help
-	  Relaxed ordering in writes is enabled by default to improve system
-	  performance. Strict ordering can be selected instead to assist in
-	  debugging.
-
-	  If in doubt, say "N".
-
-config DRM_I915_DEBUG_CONTIGUOUS
-        bool "Enable debug support for forcing physically contiguous userspace allocations"
-        depends on DRM_I915
-        depends on EXPERT
-        depends on STAGING
-        default n
-	select CMA if HAVE_DMA_CONTIGUOUS
-	select DMA_CMA if HAVE_DMA_CONTIGUOUS
-	help
-	  For hardware validation only.
-
-	  If in doubt, say "N".
-
-config DRM_I915_DUMP_PPGTT
-        bool "Enable PPGTT Page Table dump support"
-        depends on DRM_I915
-        default n
-        help
-	  Choose this option to enable PPGTT page table dump support.
-	  The page table snapshot helps developers to debug page table
-	  related issues. This will affect performance and dumps a lot of
-	  information, so only recommended for developer debug.
-
-          Recommended for driver developers only.
-
-	  If in doubt, say "N".

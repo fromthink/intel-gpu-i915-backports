@@ -6,9 +6,7 @@
 #include "intel_iov.h"
 #include "intel_iov_provisioning.h"
 #include "intel_iov_utils.h"
-#include "gem/i915_gem_region.h"
 #include "gt/intel_gt.h"
-#include "gt/intel_gt_buffer_pool.h"
 #include "gt/uc/abi/guc_actions_pf_abi.h"
 #include "gt/uc/abi/guc_klvs_abi.h"
 
@@ -469,43 +467,10 @@ static int guc_update_vf_klv64(struct intel_guc *guc, u32 vfid, u16 key, u64 val
 	return 0;
 }
 
-static int pf_push_config_tile_mask(struct intel_iov *iov, unsigned int id, u32 tile_mask)
-{
-	struct intel_guc *guc = iov_to_guc(iov);
-	int err;
-
-	GEM_BUG_ON(iov_is_remote(iov));
-
-	if (!pf_needs_push_config(iov, id))
-		return 0;
-
-	err = guc_update_vf_klv32(guc, id, GUC_KLV_VF_CFG_TILE_MASK_KEY, tile_mask);
-	if (unlikely(err))
-		return err;
-
-	return 0;
-}
-
-static u32 pf_get_vf_tile_mask(struct intel_iov *iov, unsigned int id);
-
-static int pf_finish_config_change(struct intel_iov *iov, unsigned int id)
-{
-	int err = 0;
-
-	if (HAS_REMOTE_TILES(iov_to_i915(iov))) {
-		struct intel_iov *root = iov_get_root(iov);
-		u32 tile_mask = pf_get_vf_tile_mask(root, id);
-
-		err = pf_push_config_tile_mask(root, id, tile_mask);
-	}
-
-	return err;
-}
-
 static u64 pf_get_ggtt_alignment(struct intel_iov *iov)
 {
 	/* this might be platform dependent */
-	return HAS_64K_PAGES(iov_to_i915(iov)) ? SZ_64K : SZ_4K;
+	return SZ_4K;
 }
 
 static u64 pf_get_min_spare_ggtt(struct intel_iov *iov)
@@ -527,6 +492,7 @@ static u64 pf_get_spare_ggtt(struct intel_iov *iov)
 /**
  * intel_iov_provisioning_set_spare_ggtt - Set size of the PF spare GGTT.
  * @iov: the IOV struct
+ * @size: size of the spare GGTT
  *
  * This function can only be called on PF.
  */
@@ -673,7 +639,7 @@ static int pf_provision_ggtt(struct intel_iov *iov, unsigned int id, u64 size)
 	struct drm_mm_node *node = &config->ggtt_region;
 	struct i915_ggtt *ggtt = iov_to_gt(iov)->ggtt;
 	u64 alignment = pf_get_ggtt_alignment(iov);
-	int err, ret;
+	int err;
 
 	if (iov_to_gt(iov)->type == GT_MEDIA)
 		return -ENODEV;
@@ -694,33 +660,27 @@ release:
 		mutex_unlock(&ggtt->vm.mutex);
 
 		if (unlikely(err))
-			goto finish;
+			return err;
 	}
 	GEM_BUG_ON(drm_mm_node_allocated(node));
 
-	if (!size) {
-		err = 0;
-		goto finish;
-	}
+	if (!size)
+		return 0;
 
-	if (size > ggtt->vm.total) {
-		err = -E2BIG;
-		goto finish;
-	}
+	if (size > ggtt->vm.total)
+		return -E2BIG;
 
-	if (size > pf_get_max_ggtt(iov)) {
-		err = -EDQUOT;
-		goto finish;
-	}
+	if (size > pf_get_max_ggtt(iov))
+		return -EDQUOT;
 
 	mutex_lock(&ggtt->vm.mutex);
-	err = i915_gem_gtt_insert(&ggtt->vm, node, size, alignment,
+	err = i915_gem_gtt_insert(&ggtt->vm, NULL, node, size, alignment,
 		I915_COLOR_UNEVICTABLE,
 		ggtt->pin_bias, GUC_GGTT_TOP,
 		PIN_HIGH);
 	mutex_unlock(&ggtt->vm.mutex);
 	if (unlikely(err))
-		goto finish;
+		return err;
 
 	i915_ggtt_set_space_owner(ggtt, id, node);
 
@@ -730,9 +690,7 @@ release:
 
 	IOV_DEBUG(iov, "VF%u provisioned GGTT %llx-%llx (%lluK)\n",
 		  id, node->start, node->start + node->size - 1, node->size / SZ_1K);
-finish:
-	ret = pf_finish_config_change(iov, id);
-	return err ?: ret;
+	return 0;
 }
 
 /**
@@ -874,6 +832,7 @@ u16 intel_iov_provisioning_get_spare_ctxs(struct intel_iov *iov)
 /**
  * intel_iov_provisioning_set_spare_ctxs - Set number of the PF's spare contexts.
  * @iov: the IOV struct
+ * @spare: number of spare contexts
  *
  * This function can only be called on PF.
  */
@@ -1037,14 +996,14 @@ static int pf_alloc_vf_ctxs_range(struct intel_iov *iov, unsigned int id, u16 nu
 	u16 max_size = U16_MAX;
 	u16 index = U16_MAX;
 	u16 last_equal = 0;
-	unsigned int rs, re;
+	unsigned int rs = 0, re;
 
 	if (unlikely(!ctxs_bitmap))
 		return -ENOMEM;
 
 	GEM_BUG_ON(!intel_iov_is_pf(iov));
 
-	bitmap_for_each_clear_region(ctxs_bitmap, rs, re, 0, ctxs_bitmap_total_bits()) {
+	for_each_clear_bitrange(rs, re, ctxs_bitmap, ctxs_bitmap_total_bits()) {
 		u16 size_bits = re - rs;
 
 		/*
@@ -1101,20 +1060,17 @@ static int __pf_provision_vf_ctxs(struct intel_iov *iov, unsigned int id, u16 st
 
 static int __pf_provision_ctxs(struct intel_iov *iov, unsigned int id, u16 start_ctx, u16 num_ctxs)
 {
-	int err, ret;
+	int err;
 
 	GEM_BUG_ON(!intel_iov_is_pf(iov));
 
 	err = pf_push_config_ctxs(iov, id, start_ctx, num_ctxs);
 	if (unlikely(err)) {
 		__pf_provision_vf_ctxs(iov, id, 0, 0);
-		ret = pf_finish_config_change(iov, id);
-		return err ?: ret;
+		return err;
 	}
 
-	__pf_provision_vf_ctxs(iov, id, start_ctx, num_ctxs);
-	ret = pf_finish_config_change(iov, id);
-	return ret;
+	return __pf_provision_vf_ctxs(iov, id, start_ctx, num_ctxs);
 }
 
 static u16 pf_get_ctxs_max_quota(struct intel_iov *iov);
@@ -1223,13 +1179,13 @@ static u16 pf_get_ctxs_free(struct intel_iov *iov)
 {
 	u16 reserved = encode_vf_ctxs_count(pf_reserved_ctxs(iov));
 	unsigned long *ctxs_bitmap = pf_get_ctxs_bitmap(iov);
-	unsigned int rs, re;
+	unsigned int rs = 0, re;
 	u16 sum = 0;
 
 	if (unlikely(!ctxs_bitmap))
 		return 0;
 
-	bitmap_for_each_clear_region(ctxs_bitmap, rs, re, 0, ctxs_bitmap_total_bits()) {
+	for_each_clear_bitrange(rs, re, ctxs_bitmap, ctxs_bitmap_total_bits()) {
 		IOV_DEBUG(iov, "ctxs hole %u-%u (%u)\n", decode_vf_ctxs_start(rs),
 			  decode_vf_ctxs_start(re) - 1, decode_vf_ctxs_count(re - rs));
 		sum += re - rs;
@@ -1263,13 +1219,13 @@ static u16 pf_get_ctxs_max_quota(struct intel_iov *iov)
 {
 	u16 reserved = encode_vf_ctxs_count(pf_reserved_ctxs(iov));
 	unsigned long *ctxs_bitmap = pf_get_ctxs_bitmap(iov);
-	unsigned int rs, re;
+	unsigned int rs = 0, re;
 	u16 max = 0;
 
 	if (unlikely(!ctxs_bitmap))
 		return 0;
 
-	bitmap_for_each_clear_region(ctxs_bitmap, rs, re, 0, ctxs_bitmap_total_bits()) {
+	for_each_clear_bitrange(rs, re, ctxs_bitmap, ctxs_bitmap_total_bits()) {
 		IOV_DEBUG(iov, "ctxs hole %u-%u (%u)\n", decode_vf_ctxs_start(rs),
 			  decode_vf_ctxs_start(re) - 1, decode_vf_ctxs_count(re - rs));
 		reserved -= min3(reserved, (u16)(re - rs), max);
@@ -1338,6 +1294,7 @@ u16 intel_iov_provisioning_get_spare_dbs(struct intel_iov *iov)
 /**
  * intel_iov_provisioning_set_spare_dbs - Set number of the PF's spare doorbells.
  * @iov: the IOV struct
+ * @spare: number of spare doorbells
  *
  * This function can only be called on PF.
  */
@@ -1454,30 +1411,24 @@ static int pf_provision_dbs(struct intel_iov *iov, unsigned int id, u16 num_dbs)
 
 		err = pf_push_config_dbs(iov, id, 0, 0);
 		if (unlikely(err))
-			goto finish;
+			return err;
 	}
 
-	if (!num_dbs) {
-		err = 0;
-		goto finish;
-	}
+	if (!num_dbs)
+		return 0;
 
 	ret = pf_alloc_dbs_range(iov, num_dbs);
-	if (unlikely(ret < 0)) {
-		err = ret;
-		goto finish;
-	}
+	if (unlikely(ret < 0))
+		return ret;
 
 	err = pf_push_config_dbs(iov, id, ret, num_dbs);
 	if (unlikely(err))
-		goto finish;
+		return err;
 
 	config->begin_db = ret;
 	config->num_dbs = num_dbs;
 
-finish:
-	ret = pf_finish_config_change(iov, id);
-	return err ?: ret;
+	return 0;
 }
 
 /**
@@ -1572,13 +1523,13 @@ u16 intel_iov_provisioning_query_free_dbs(struct intel_iov *iov)
 static u16 pf_get_max_dbs(struct intel_iov *iov)
 {
 	unsigned long *dbs_bitmap = pf_get_dbs_bitmap(iov);
-	unsigned int rs, re;
+	unsigned int rs = 0, re;
 	u16 limit = 0;
 
 	if (unlikely(!dbs_bitmap))
 		return 0;
 
-	bitmap_for_each_clear_region(dbs_bitmap, rs, re, 0, GUC_NUM_DOORBELLS) {
+	for_each_clear_bitrange(rs, re, dbs_bitmap, GUC_NUM_DOORBELLS) {
 		IOV_DEBUG(iov, "dbs hole %u-%u (%u)\n", rs, re, re - rs);
 		limit = max_t(u16, limit, re - rs);
 	}
@@ -1604,12 +1555,12 @@ u16 intel_iov_provisioning_query_max_dbs(struct intel_iov *iov)
 	return num_dbs;
 }
 
-static const char* exec_quantum_unit(u32 exec_quantum)
+static const char *exec_quantum_unit(u32 exec_quantum)
 {
 	return exec_quantum ? "ms" : "(inifinity)";
 }
 
-static int pf_push_config_exec_quantum(struct intel_iov* iov, unsigned int id, u32 exec_quantum)
+static int pf_push_config_exec_quantum(struct intel_iov *iov, unsigned int id, u32 exec_quantum)
 {
 	return guc_update_vf_klv32(iov_to_guc(iov), id,
 				   GUC_KLV_VF_CFG_EXEC_QUANTUM_KEY, exec_quantum);
@@ -1700,7 +1651,7 @@ u32 intel_iov_provisioning_get_exec_quantum(struct intel_iov *iov, unsigned int 
 	return exec_quantum;
 }
 
-static const char* preempt_timeout_unit(u32 preempt_timeout)
+static const char *preempt_timeout_unit(u32 preempt_timeout)
 {
 	return preempt_timeout ? "us" : "(inifinity)";
 }
@@ -1792,297 +1743,6 @@ u32 intel_iov_provisioning_get_preempt_timeout(struct intel_iov *iov, unsigned i
 	mutex_unlock(pf_provisioning_mutex(iov));
 
 	return preempt_timeout;
-}
-
-static u64 pf_get_min_spare_lmem(struct intel_iov *iov)
-{
-	/* this might be platform dependent */
-	return SZ_128M; /* XXX: preliminary */
-}
-
-static u64 pf_get_spare_lmem(struct intel_iov *iov)
-{
-	u64 spare;
-
-	spare = iov->pf.provisioning.spare.lmem_size;
-	spare = max_t(u64, spare, pf_get_min_spare_lmem(iov));
-
-	return spare;
-}
-
-/**
- * intel_iov_provisioning_get_spare_lmem - Get size of the PF spare LMEM.
- * @iov: the IOV struct
- *
- * This function can only be called on PF.
- */
-u64 intel_iov_provisioning_get_spare_lmem(struct intel_iov *iov)
-{
-	u64 spare;
-
-	GEM_BUG_ON(!intel_iov_is_pf(iov));
-
-	mutex_lock(pf_provisioning_mutex(iov));
-	spare = pf_get_spare_lmem(iov);
-	mutex_unlock(pf_provisioning_mutex(iov));
-
-	return spare;
-}
-
-/**
- * intel_iov_provisioning_set_spare_lmem - Set size of the PF spare LMEM.
- * @iov: the IOV struct
- *
- * This function can only be called on PF.
- */
-int intel_iov_provisioning_set_spare_lmem(struct intel_iov *iov, u64 size)
-{
-	GEM_BUG_ON(!intel_iov_is_pf(iov));
-
-	if (size && size < pf_get_min_spare_lmem(iov))
-		return -EINVAL;
-
-	mutex_lock(pf_provisioning_mutex(iov));
-	iov->pf.provisioning.spare.lmem_size = size;
-	mutex_unlock(pf_provisioning_mutex(iov));
-
-	return 0;
-}
-
-static u64 pf_query_max_lmem(struct intel_iov *iov);
-
-static int pf_push_config_lmem(struct intel_iov *iov, unsigned int id, u64 size)
-{
-	struct intel_guc *guc = iov_to_guc(iov);
-	int err;
-
-	if (!pf_needs_push_config(iov, id))
-		return 0;
-
-	err = guc_update_vf_klv64(guc, id, GUC_KLV_VF_CFG_LMEM_SIZE_KEY, size);
-	if (unlikely(err))
-		return err;
-
-	return 0;
-}
-
-static int pf_update_lmtt(struct intel_iov *iov, unsigned int id)
-{
-	struct intel_gt *gt = iov_to_gt(iov);
-	struct intel_guc *guc = &gt->uc.guc;
-	int ret;
-
-	ret = intel_lmtt_update_entries(&iov->pf.lmtt, id);
-
-	if (INTEL_GUC_SUPPORTS_TLB_INVALIDATION(guc))
-		intel_guc_invalidate_tlb_all(guc);
-
-	return ret;
-}
-
-static int pf_update_all_lmtt(struct drm_i915_private *i915, unsigned int vfid)
-{
-	struct intel_gt *gt;
-	unsigned int gtid;
-	int err;
-
-	for_each_gt(gt, i915, gtid) {
-		err = pf_update_lmtt(&gt->iov, vfid);
-		if (unlikely(err))
-			return err;
-	}
-
-	return 0;
-}
-
-static int pf_provision_lmem(struct intel_iov *iov, unsigned int id, u64 size)
-{
-	struct intel_iov_provisioning *provisioning = &iov->pf.provisioning;
-	struct intel_iov_config *config = &provisioning->configs[id];
-	struct drm_i915_gem_object *obj = fetch_and_zero(&config->lmem_obj);
-	int err, ret;
-
-	if (check_round_up_overflow(size, (u64)SZ_2M, &size))
-		return -EOVERFLOW;
-
-	if (obj) {
-		if (size == obj->base.size) {
-			config->lmem_obj = obj;
-			return 0;
-		}
-
-		err = pf_push_config_lmem(iov, id, 0);
-
-		i915_gem_object_unpin_pages(obj);
-		i915_gem_object_put(obj);
-
-		if (unlikely(err))
-			goto finish;
-	}
-
-	if (!size) {
-		err = 0;
-		goto finish;
-	}
-
-	if (size > pf_query_max_lmem(iov)) {
-		err = -EDQUOT;
-		goto finish;
-	}
-
-	obj = intel_gt_object_create_lmem(iov_to_gt(iov), size,
-					  I915_BO_ALLOC_USER | /* must clear */
-					  I915_BO_ALLOC_CHUNK_2M |
-					  I915_BO_ALLOC_VOLATILE |
-					  I915_BO_SYNC_HINT);
-	if (IS_ERR(obj)) {
-		err = PTR_ERR(obj);
-		goto finish;
-	}
-
-	err = i915_gem_object_pin_pages_unlocked(obj);
-	if (unlikely(err))
-		goto err_put;
-
-	err = i915_gem_object_migrate_sync(obj);
-	if (unlikely(err))
-		goto err_unpin;
-
-	err = pf_push_config_lmem(iov, id, obj->base.size);
-	if (unlikely(err))
-		goto err_unpin;
-
-	IOV_DEBUG(iov, "VF%u provisioned LMEM %zu (%zuM)\n",
-		  id, obj->base.size, obj->base.size / SZ_1M);
-	config->lmem_obj = obj;
-	goto finish;
-
-err_unpin:
-	i915_gem_object_unpin_pages(obj);
-err_put:
-	i915_gem_object_put(obj);
-finish:
-	ret = pf_update_all_lmtt(iov_to_i915(iov), id);
-	err = err ?: ret;
-	ret = pf_finish_config_change(iov, id);
-	return err ?: ret;
-}
-
-static bool pf_is_config_valid_lmem(struct intel_iov *iov, unsigned int id)
-{
-	GEM_BUG_ON(!intel_iov_is_pf(iov));
-
-	return iov->pf.provisioning.configs[id].lmem_obj;
-}
-
-/**
- * intel_iov_provisioning_set_lmem - Provision VF with LMEM.
- * @iov: the IOV struct
- * @id: VF identifier
- * @size: requested LMEM size
- *
- * This function can only be called on PF.
- */
-int intel_iov_provisioning_set_lmem(struct intel_iov *iov, unsigned int id, u64 size)
-{
-	struct intel_runtime_pm *rpm = iov_to_gt(iov)->uncore->rpm;
-	intel_wakeref_t wakeref;
-	bool reprovisioning;
-	int err = -ENONET;
-
-	GEM_BUG_ON(!intel_iov_is_pf(iov));
-	GEM_BUG_ON(id > pf_get_totalvfs(iov));
-	GEM_BUG_ON(!id);
-
-	mutex_lock(pf_provisioning_mutex(iov));
-
-	reprovisioning = pf_is_config_valid_lmem(iov, id) || size;
-
-	with_intel_runtime_pm(rpm, wakeref)
-		err = pf_provision_lmem(iov, id, size);
-
-	if (unlikely(err))
-		IOV_ERROR(iov, "Failed to provision VF%u with %llu of LMEM (%pe)\n",
-			  id, size, ERR_PTR(err));
-	else if (reprovisioning)
-		pf_mark_manual_provisioning(iov);
-
-	mutex_unlock(pf_provisioning_mutex(iov));
-	return err;
-}
-
-/**
- * intel_iov_provisioning_get_lmem - Get VF LMEM quota.
- * @iov: the IOV struct
- * @id: VF identifier
- *
- * This function can only be called on PF.
- */
-u64 intel_iov_provisioning_get_lmem(struct intel_iov *iov, unsigned int id)
-{
-	struct drm_i915_gem_object *obj;
-	u64 size;
-
-	GEM_BUG_ON(!intel_iov_is_pf(iov));
-	GEM_BUG_ON(id > pf_get_totalvfs(iov));
-	GEM_BUG_ON(!id);
-
-	mutex_lock(pf_provisioning_mutex(iov));
-	obj = iov->pf.provisioning.configs[id].lmem_obj;
-	size = obj ? obj->base.size : 0;
-	mutex_unlock(pf_provisioning_mutex(iov));
-
-	return size;
-}
-
-static u64 pf_query_free_lmem(struct intel_iov *iov)
-{
-	struct intel_gt *gt = iov_to_gt(iov);
-
-	/* Flush any pending work to get reliable results */
-	intel_memory_region_flush(gt->lmem);
-	intel_gt_flush_buffer_pool(gt);
-	i915_gem_drain_workqueue(gt->i915);
-
-	return atomic64_read(&gt->lmem->avail);
-}
-
-/**
- * intel_iov_provisioning_query_free_lmem - Query available LMEM.
- * @iov: the IOV struct
- *
- * This function can only be called on PF.
- */
-u64 intel_iov_provisioning_query_free_lmem(struct intel_iov *iov)
-{
-	return pf_query_free_lmem(iov);
-}
-
-static u64 pf_query_max_lmem(struct intel_iov *iov)
-{
-	u64 spare = pf_get_spare_lmem(iov);
-	u64 free = pf_query_free_lmem(iov);
-	u64 avail;
-
-	/* XXX: need to account for 2MB blocks only */
-	avail = free > spare ? free - spare : 0;
-	avail = round_down(avail, SZ_2M);
-
-	return avail;
-}
-
-/**
- * intel_iov_provisioning_query_max_lmem - Query maximum VF quota.
- * @iov: the IOV struct
- *
- * VF can't be provisioned with arbitrary size of LMEM.
- * One of the limiting factor is size of the VF LMEM BAR.
- *
- * This function can only be called on PF.
- */
-u64 intel_iov_provisioning_query_max_lmem(struct intel_iov *iov)
-{
-	return pf_query_max_lmem(iov);
 }
 
 static u32 intel_iov_threshold_to_klv_key(enum intel_iov_threshold threshold)
@@ -2242,9 +1902,6 @@ static void pf_unprovision_config(struct intel_iov *iov, unsigned int id)
 	pf_provision_exec_quantum(iov, id, 0);
 	pf_provision_preempt_timeout(iov, id, 0);
 
-	if (HAS_LMEM(iov_to_i915(iov)))
-		pf_provision_lmem(iov, id, 0);
-
 	pf_unprovision_thresholds(iov, id);
 }
 
@@ -2275,7 +1932,7 @@ static int pf_auto_provision_ggtt(struct intel_iov *iov, unsigned int num_vfs)
 	int err;
 
 	/*
-	 * can't rely only on 'free_ggtt' as all VFs allocations must be continous
+	 * can't rely only on 'free_ggtt' as all VFs allocations must be continuous
 	 * use 'max_ggtt' instead, on fresh/idle system those should be similar
 	 * and both already accounts for the spare GGTT
 	 */
@@ -2355,48 +2012,6 @@ static int pf_auto_provision_dbs(struct intel_iov *iov, unsigned int num_vfs)
 	return 0;
 }
 
-static int pf_auto_provision_lmem(struct intel_iov *iov, unsigned int num_vfs)
-{
-	unsigned int n;
-	u64 available = pf_query_max_lmem(iov);
-	u64 fair;
-	int err;
-
-	GEM_BUG_ON(!intel_iov_is_pf(iov));
-	GEM_BUG_ON(num_vfs > pf_get_totalvfs(iov));
-
-	fair = div_u64(available, num_vfs);
-	fair = round_down(fair, SZ_2M);
-
-	/* for more VFs we shouldn't ignore sizes of LMTT and PPGTT */
-	if (num_vfs > 1) {
-		/* LMTT must cover allocations from all tiles, all likely of similar size */
-		u64 lmtt_sz = intel_lmtt_estimate_pt_size(&iov->pf.lmtt, fair *
-							  (iov_to_i915(iov)->remote_tiles + 1));
-		u64 pt_sz = i915_vm_estimate_pt_size(iov_to_gt(iov)->vm, fair);
-
-		fair = fair > lmtt_sz ? fair - lmtt_sz : 0;
-		fair = fair > pt_sz ? fair - pt_sz : 0;
-		fair = round_down(fair, SZ_2M);
-	}
-
-	IOV_DEBUG(iov, "LMEM available(%lluM) fair(%u x %lluM)\n",
-		  available / SZ_1M, num_vfs, fair / SZ_1M);
-	if (!fair)
-		return -ENOSPC;
-
-	for (n = 1; n <= num_vfs; n++) {
-		if (pf_is_config_valid_lmem(iov, n))
-			return -EUCLEAN;
-
-		err = pf_provision_lmem(iov, n, fair);
-		if (unlikely(err))
-			return err;
-	}
-
-	return 0;
-}
-
 static int pf_auto_provision(struct intel_iov *iov, unsigned int num_vfs)
 {
 	int err;
@@ -2425,12 +2040,6 @@ static int pf_auto_provision(struct intel_iov *iov, unsigned int num_vfs)
 	err = pf_auto_provision_dbs(iov, num_vfs);
 	if (unlikely(err))
 		goto fail;
-
-	if (HAS_LMEM(iov_to_i915(iov))) {
-		err = pf_auto_provision_lmem(iov, num_vfs);
-		if (unlikely(err))
-			goto fail;
-	}
 
 	return 0;
 fail:
@@ -2473,7 +2082,6 @@ static int pf_validate_config(struct intel_iov *iov, unsigned int id)
 	bool valid_ggtt = pf_is_valid_config_ggtt(iov, id);
 	bool valid_ctxs = pf_is_valid_config_ctxs(iov, id);
 	bool valid_dbs = pf_is_valid_config_dbs(iov, id);
-	bool valid_lmem =  true;
 	bool valid_any = valid_ggtt || valid_ctxs || valid_dbs;
 	bool valid_all = valid_ggtt && valid_ctxs;
 
@@ -2485,19 +2093,13 @@ static int pf_validate_config(struct intel_iov *iov, unsigned int id)
 		GEM_BUG_ON(iov_is_root(iov));
 		valid_ggtt = pf_is_valid_config_ggtt(root, id);
 		valid_any = valid_ctxs || valid_dbs;
-		valid_all = valid_any && valid_ggtt && valid_ctxs && pf_validate_config(root, id);
-	}
-
-	if (HAS_LMEM(iov_to_i915(iov))) {
-		valid_lmem = pf_is_config_valid_lmem(iov, id);
-		valid_any = valid_any || valid_lmem;
-		valid_all = valid_all && valid_lmem;
+		valid_all = valid_any && valid_ggtt && valid_ctxs &&
+			    pf_validate_config(root, id) == 0;
 	}
 
 	if (!valid_all) {
-		IOV_DEBUG(iov, "%u: invalid config: %s%s%s%s\n", id,
+		IOV_DEBUG(iov, "%u: invalid config: %s%s%s\n", id,
 			  valid_ggtt ? "" : "GGTT ",
-			  valid_lmem ? "" : "LMEM ",
 			  valid_ctxs ? "" : "contexts ",
 			  valid_dbs ? "" : "doorbells ");
 		return valid_any ? -ENOKEY : -ENODATA;
@@ -2552,50 +2154,6 @@ int intel_iov_provisioning_verify(struct intel_iov *iov, unsigned int num_vfs)
 	return 0;
 }
 
-static u32 pf_get_vf_tile_mask(struct intel_iov *iov, unsigned int vfid)
-{
-	struct intel_gt *gt;
-	unsigned int gtid;
-	u32 tile_mask  = 0;
-	int err;
-
-	GEM_BUG_ON(iov_is_remote(iov));
-
-	for_each_gt(gt, iov_to_i915(iov), gtid) {
-		err = pf_validate_config(&gt->iov, vfid);
-		if (!err)
-			tile_mask |= BIT(gtid);
-	}
-
-	IOV_DEBUG(iov, "VF%d tile_mask=%#x\n", vfid, tile_mask);
-	GEM_BUG_ON(tile_mask & ~GENMASK(iov_to_i915(iov)->remote_tiles, 0));
-
-	return tile_mask;
-}
-
-/**
- * intel_iov_provisioning_get_tile_mask() - Query tile mask of the VF.
- * @iov: the IOV struct
- * @id: VF identifier
- *
- * This function shall be called only on PF.
- *
- * Return: tile mask.
- */
-u32 intel_iov_provisioning_get_tile_mask(struct intel_iov *iov, unsigned int id)
-{
-	u32 tile_mask;
-
-	GEM_BUG_ON(!intel_iov_is_pf(iov));
-	GEM_BUG_ON(id > pf_get_totalvfs(iov));
-
-	mutex_lock(pf_provisioning_mutex(iov));
-	tile_mask = pf_get_vf_tile_mask(iov_get_root(iov), id);
-	mutex_unlock(pf_provisioning_mutex(iov));
-
-	return tile_mask;
-}
-
 /* Return: number of configuration dwords written */
 static u32 encode_config_ggtt(u32 *cfg, const struct intel_iov_config *config)
 {
@@ -2633,12 +2191,6 @@ static u32 encode_config(u32 *cfg, const struct intel_iov_config *config)
 	cfg[n++] = MAKE_GUC_KLV(VF_CFG_NUM_DOORBELLS);
 	cfg[n++] = config->num_dbs;
 
-	if (config->lmem_obj) {
-		cfg[n++] = MAKE_GUC_KLV(VF_CFG_LMEM_SIZE);
-		cfg[n++] = lower_32_bits(config->lmem_obj->base.size);
-		cfg[n++] = upper_32_bits(config->lmem_obj->base.size);
-	}
-
 	cfg[n++] = MAKE_GUC_KLV(VF_CFG_EXEC_QUANTUM);
 	cfg[n++] = config->exec_quantum;
 
@@ -2651,19 +2203,6 @@ static u32 encode_config(u32 *cfg, const struct intel_iov_config *config)
 
 	IOV_THRESHOLDS(__encode_threshold)
 #undef __encode_threshold
-
-	return n;
-}
-
-/* Return: number of configuration dwords written */
-static u32 encode_tile_mask(u32 *cfg, u32 tile_mask)
-{
-	u32 n = 0;
-
-	if (tile_mask) {
-		cfg[n++] = MAKE_GUC_KLV(VF_CFG_TILE_MASK);
-		cfg[n++] = tile_mask;
-	}
 
 	return n;
 }
@@ -2727,12 +2266,6 @@ static int pf_push_configs(struct intel_iov *iov, unsigned int num)
 		err = pf_validate_config(iov, n);
 		if (err != -ENODATA)
 			cfg_size = encode_config(cfg, &provisioning->configs[n]);
-
-		if (iov_is_root(iov) && HAS_REMOTE_TILES(iov_to_i915(iov))) {
-			u32 tile_mask = pf_get_vf_tile_mask(iov, n);
-
-			cfg_size += encode_tile_mask(cfg + cfg_size, tile_mask);
-		}
 
 		if (iov_to_gt(iov)->type == GT_MEDIA) {
 			struct intel_iov *root = iov_get_root(iov);
@@ -3108,95 +2641,6 @@ int intel_iov_provisioning_print_dbs(struct intel_iov *iov, struct drm_printer *
 
 	return 0;
 }
-
-#if IS_ENABLED(CPTCFG_DRM_I915_DEBUG_IOV)
-
-static int pf_reprovision_ggtt(struct intel_iov *iov, unsigned int id)
-{
-	struct i915_ggtt *ggtt = iov_to_gt(iov)->ggtt;
-	struct intel_iov_provisioning *provisioning = &iov->pf.provisioning;
-	struct intel_iov_config *config = &provisioning->configs[id];
-	struct drm_mm_node *node = &config->ggtt_region;
-	struct drm_mm_node new_node = {};
-	u64 alignment = pf_get_ggtt_alignment(iov);
-	u64 node_size = node->size;
-	unsigned int ptes_size;
-	void *ptes;
-	int err;
-
-	if (!drm_mm_node_allocated(node))
-		return -ENODATA;
-
-	/* save PTEs */
-	ptes_size = i915_ggtt_save_ptes(ggtt, node, NULL, 0, 0);
-	ptes = kmalloc(ptes_size, GFP_KERNEL);
-	if (!ptes)
-		return -ENOMEM;
-	err = i915_ggtt_save_ptes(ggtt, node, ptes, ptes_size, 0);
-	if (err < 0)
-		goto out;
-
-	/* allocate new block */
-	mutex_lock(&ggtt->vm.mutex);
-	err = i915_gem_gtt_insert(&ggtt->vm, &new_node, node_size, alignment,
-		I915_COLOR_UNEVICTABLE,
-		0, ggtt->vm.total,
-		PIN_HIGH);
-	mutex_unlock(&ggtt->vm.mutex);
-	if (err)
-		goto out;
-	GEM_WARN_ON(node_size != new_node.size);
-
-	/* reprovision */
-	err = pf_push_config_ggtt(iov, id, new_node.start, new_node.size);
-	if (err) {
-		mutex_lock(&ggtt->vm.mutex);
-		drm_mm_remove_node(&new_node);
-		mutex_unlock(&ggtt->vm.mutex);
-		goto out;
-	}
-
-	/* replace node */
-	mutex_lock(&ggtt->vm.mutex);
-	drm_mm_remove_node(node);
-	drm_mm_replace_node(&new_node, node);
-	mutex_unlock(&ggtt->vm.mutex);
-
-	/* restore PTEs */
-	err = i915_ggtt_restore_ptes(ggtt, node, ptes, ptes_size, 0);
-	if (err)
-		i915_ggtt_set_space_owner(ggtt, id, node);
-
-out:
-	kfree(ptes);
-	return err;
-}
-
-/**
- * intel_iov_provisioning_move_ggtt - Move existing GGTT allocation to other location.
- * @iov: the IOV struct
- * @id: VF identifier
- *
- * This function is for internal testing of VF migration scenarios.
- * This function can only be called on PF.
- */
-int intel_iov_provisioning_move_ggtt(struct intel_iov *iov, unsigned int id)
-{
-	struct intel_runtime_pm *rpm = iov_to_gt(iov)->uncore->rpm;
-	intel_wakeref_t wakeref;
-	int err = -ENONET;
-
-	GEM_BUG_ON(!intel_iov_is_pf(iov));
-	GEM_BUG_ON(id > pf_get_totalvfs(iov));
-	GEM_BUG_ON(id == PFID);
-
-	with_intel_runtime_pm(rpm, wakeref)
-		err = pf_reprovision_ggtt(iov, id);
-
-	return err;
-}
-
-#endif /* CPTCFG_DRM_I915_DEBUG_IOV */
 
 static int pf_push_self_config(struct intel_iov *iov)
 {

@@ -1412,7 +1412,7 @@ static unsigned long *alloc_whitelist(u32 batch_length)
 
 	/* Prefer to report transient allocation failure rather than hit oom */
 	jmp = bitmap_zalloc(DIV_ROUND_UP(batch_length, sizeof(u32)),
-			    I915_GFP_ALLOW_FAIL);
+			    GFP_KERNEL | __GFP_RETRY_MAYFAIL | __GFP_NOWARN);
 	if (!jmp)
 		return ERR_PTR(-ENOMEM);
 
@@ -1471,10 +1471,8 @@ int intel_engine_cmd_parser(struct intel_engine_cs *engine,
 		/* Defer failure until attempted use */
 		jump_whitelist = alloc_whitelist(batch_length);
 
-	shadow_addr = intel_canonical_addr(INTEL_PPGTT_MSB(engine->i915),
-					   i915_vma_offset(shadow));
-	batch_addr = intel_canonical_addr(INTEL_PPGTT_MSB(engine->i915),
-					  i915_vma_offset(batch) + batch_offset);
+	shadow_addr = gen8_canonical_addr(i915_vma_offset(shadow));
+	batch_addr = gen8_canonical_addr(i915_vma_offset(batch) + batch_offset);
 
 	/*
 	 * We use the batch length as size because the shadow object is as

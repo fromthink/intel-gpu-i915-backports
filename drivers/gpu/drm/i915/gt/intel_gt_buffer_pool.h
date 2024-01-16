@@ -11,9 +11,8 @@
 #include "i915_active.h"
 #include "intel_gt_buffer_pool_types.h"
 
-enum i915_map_type;
-struct i915_request;
 struct intel_gt;
+struct i915_request;
 
 struct intel_gt_buffer_pool_node *
 intel_gt_get_buffer_pool(struct intel_gt *gt, size_t size,

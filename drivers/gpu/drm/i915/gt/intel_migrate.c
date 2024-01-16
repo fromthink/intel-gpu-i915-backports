@@ -10,6 +10,7 @@
 #include "intel_gtt.h"
 #include "intel_migrate.h"
 #include "intel_ring.h"
+#include "gem/i915_gem_lmem.h"
 
 struct insert_pte_data {
 	u64 offset;
@@ -44,7 +45,9 @@ static void xehpsdv_toggle_pdes(struct i915_address_space *vm,
 	 * Insert a dummy PTE into every PT that will map to LMEM to ensure
 	 * we have a correctly setup PDE structure for later use.
 	 */
-	vm->insert_page(vm, 0, d->offset, I915_CACHE_NONE, PTE_LM);
+	vm->insert_page(vm, 0, d->offset,
+			i915_gem_get_pat_index(vm->i915, I915_CACHE_NONE),
+			PTE_LM);
 	GEM_BUG_ON(!pt->is_compact);
 	d->offset += SZ_2M;
 }
@@ -62,7 +65,9 @@ static void xehpsdv_insert_pte(struct i915_address_space *vm,
 	 * alignment is 64K underneath for the pt, and we are careful
 	 * not to access the space in the void.
 	 */
-	vm->insert_page(vm, px_dma(pt), d->offset, I915_CACHE_NONE, PTE_LM);
+	vm->insert_page(vm, px_dma(pt), d->offset,
+			i915_gem_get_pat_index(vm->i915, I915_CACHE_NONE),
+			PTE_LM);
 	d->offset += SZ_64K;
 }
 
@@ -72,7 +77,8 @@ static void insert_pte(struct i915_address_space *vm,
 {
 	struct insert_pte_data *d = data;
 
-	vm->insert_page(vm, px_dma(pt), d->offset, I915_CACHE_NONE,
+	vm->insert_page(vm, px_dma(pt), d->offset,
+			i915_gem_get_pat_index(vm->i915, I915_CACHE_NONE),
 			i915_gem_object_is_lmem(pt->base) ? PTE_LM : 0);
 	d->offset += PAGE_SIZE;
 }
@@ -136,7 +142,7 @@ static struct i915_address_space *migrate_vm(struct intel_gt *gt)
 	 * [3 * CHUNK_SZ, 3 * CHUNK_SZ + ((3 * CHUNK_SZ / SZ_2M) * SZ_64K)] -> PTE
 	 */
 
-	vm = i915_ppgtt_create(gt, 0);
+	vm = i915_ppgtt_create(gt, I915_BO_ALLOC_PM_EARLY);
 	if (IS_ERR(vm))
 		return ERR_CAST(vm);
 
@@ -258,7 +264,7 @@ static struct intel_context *pinned_context(struct intel_gt *gt)
 	return ce;
 }
 
-int __maybe_unused intel_migrate_init(struct intel_migrate *m, struct intel_gt *gt)
+int intel_migrate_init(struct intel_migrate *m, struct intel_gt *gt)
 {
 	struct intel_context *ce;
 
@@ -289,8 +295,6 @@ static struct intel_context *__migrate_engines(struct intel_gt *gt)
 		if (engine_supports_migration(engine))
 			engines[count++] = engine;
 	}
-	if (count == 0)
-		return ERR_PTR(-ENODEV);
 
 	return intel_context_create(engines[random_index(count)]);
 }
@@ -343,6 +347,18 @@ static int emit_no_arbitration(struct i915_request *rq)
 	return 0;
 }
 
+static int max_pte_pkt_size(struct i915_request *rq, int pkt)
+{
+	struct intel_ring *ring = rq->ring;
+
+	pkt = min_t(int, pkt, (ring->space - rq->reserved_space) / sizeof(u32) + 5);
+	pkt = min_t(int, pkt, (ring->size - ring->emit) / sizeof(u32) + 5);
+
+	return pkt;
+}
+
+#define I915_EMIT_PTE_NUM_DWORDS 6
+
 static int emit_pte(struct i915_request *rq,
 		    struct sgt_dma *it,
 		    unsigned int pat_index,
@@ -384,13 +400,12 @@ static int emit_pte(struct i915_request *rq,
 
 	offset += (u64)rq->engine->instance << 32;
 
-	cs = intel_ring_begin(rq, 6);
+	cs = intel_ring_begin(rq, I915_EMIT_PTE_NUM_DWORDS);
 	if (IS_ERR(cs))
 		return PTR_ERR(cs);
 
 	/* Pack as many PTE updates as possible into a single MI command */
-	pkt = min_t(int, dword_length, ring->space / sizeof(u32) + 5);
-	pkt = min_t(int, pkt, (ring->size - ring->emit) / sizeof(u32) + 5);
+	pkt = max_pte_pkt_size(rq, dword_length);
 
 	hdr = cs;
 	*cs++ = MI_STORE_DATA_IMM | REG_BIT(21); /* as qword elements */
@@ -408,7 +423,7 @@ static int emit_pte(struct i915_request *rq,
 			intel_ring_advance(rq, cs);
 			intel_ring_update_space(ring);
 
-			cs = intel_ring_begin(rq, 6);
+			cs = intel_ring_begin(rq, I915_EMIT_PTE_NUM_DWORDS);
 			if (IS_ERR(cs))
 				return PTR_ERR(cs);
 
@@ -423,8 +438,7 @@ static int emit_pte(struct i915_request *rq,
 				}
 			}
 
-			pkt = min_t(int, dword_rem, ring->space / sizeof(u32) + 5);
-			pkt = min_t(int, pkt, (ring->size - ring->emit) / sizeof(u32) + 5);
+			pkt = max_pte_pkt_size(rq, dword_rem);
 
 			hdr = cs;
 			*cs++ = MI_STORE_DATA_IMM | REG_BIT(21);
@@ -461,11 +475,11 @@ static int emit_pte(struct i915_request *rq,
 	return total;
 }
 
-static bool wa_1209644611_applies(int gen, u32 size)
+static bool wa_1209644611_applies(int ver, u32 size)
 {
 	u32 height = size >> PAGE_SHIFT;
 
-	if (gen != 11)
+	if (ver != 11)
 		return false;
 
 	return height % 4 == 3 && height <= 8;
@@ -518,8 +532,7 @@ static int emit_copy_ccs(struct i915_request *rq,
 			 u32 src_offset, u8 src_access, int size)
 {
 	struct drm_i915_private *i915 = rq->engine->i915;
-	u32 mocs = FIELD_PREP(XY_CSC_BLT_MOCS_INDEX_MASK_XEHP,
-			      rq->engine->gt->mocs.uc_index);
+	int mocs = rq->engine->gt->mocs.uc_index << 1;
 	u32 num_ccs_blks;
 	u32 *cs;
 
@@ -549,11 +562,13 @@ static int emit_copy_ccs(struct i915_request *rq,
 	*cs++ = XY_CTRL_SURF_COPY_BLT |
 		src_access << SRC_ACCESS_TYPE_SHIFT |
 		dst_access << DST_ACCESS_TYPE_SHIFT |
-		REG_FIELD_PREP(CCS_SIZE_MASK_XEHP, num_ccs_blks - 1);
+		((num_ccs_blks - 1) & CCS_SIZE_MASK) << CCS_SIZE_SHIFT;
 	*cs++ = src_offset;
-	*cs++ = rq->engine->instance | mocs;
+	*cs++ = rq->engine->instance |
+		FIELD_PREP(XY_CTRL_SURF_MOCS_MASK, mocs);
 	*cs++ = dst_offset;
-	*cs++ = rq->engine->instance | mocs;
+	*cs++ = rq->engine->instance |
+		FIELD_PREP(XY_CTRL_SURF_MOCS_MASK, mocs);
 
 	cs = i915_flush_dw(cs, MI_FLUSH_DW_LLC | MI_FLUSH_DW_CCS);
 	*cs++ = MI_NOOP;
@@ -566,15 +581,15 @@ static int emit_copy_ccs(struct i915_request *rq,
 static int emit_copy(struct i915_request *rq,
 		     u32 dst_offset, u32 src_offset, int size)
 {
-	const int gen = GRAPHICS_VER(rq->engine->i915);
+	const int ver = GRAPHICS_VER(rq->engine->i915);
 	u32 instance = rq->engine->instance;
 	u32 *cs;
 
-	cs = intel_ring_begin(rq, gen >= 8 ? 10 : 6);
+	cs = intel_ring_begin(rq, ver >= 8 ? 10 : 6);
 	if (IS_ERR(cs))
 		return PTR_ERR(cs);
 
-	if (gen >= 9 && !wa_1209644611_applies(gen, size)) {
+	if (ver >= 9 && !wa_1209644611_applies(ver, size)) {
 		*cs++ = GEN9_XY_FAST_COPY_BLT_CMD | (10 - 2);
 		*cs++ = BLT_DEPTH_32 | PAGE_SIZE;
 		*cs++ = 0;
@@ -585,7 +600,7 @@ static int emit_copy(struct i915_request *rq,
 		*cs++ = PAGE_SIZE;
 		*cs++ = src_offset;
 		*cs++ = instance;
-	} else if (gen >= 8) {
+	} else if (ver >= 8) {
 		*cs++ = XY_SRC_COPY_BLT_CMD | BLT_WRITE_RGBA | (10 - 2);
 		*cs++ = BLT_DEPTH_32 | BLT_ROP_SRC_COPY | PAGE_SIZE;
 		*cs++ = 0;
@@ -617,7 +632,7 @@ static u64 scatter_list_length(struct scatterlist *sg)
 	while (sg && sg_dma_len(sg)) {
 		len += sg_dma_len(sg);
 		sg = sg_next(sg);
-	};
+	}
 
 	return len;
 }
@@ -661,7 +676,7 @@ static void get_ccs_sg_sgt(struct sgt_dma *it, u64 bytes_to_cpy)
 
 int
 intel_context_migrate_copy(struct intel_context *ce,
-			   struct dma_fence *await,
+			   const struct i915_deps *deps,
 			   struct scatterlist *src,
 			   unsigned int src_pat_index,
 			   bool src_is_lmem,
@@ -741,8 +756,8 @@ intel_context_migrate_copy(struct intel_context *ce,
 			goto out_ce;
 		}
 
-		if (await) {
-			err = i915_request_await_dma_fence(rq, await);
+		if (deps) {
+			err = i915_request_await_deps(rq, deps);
 			if (err)
 				goto out_rq;
 
@@ -752,7 +767,7 @@ intel_context_migrate_copy(struct intel_context *ce,
 					goto out_rq;
 			}
 
-			await = NULL;
+			deps = NULL;
 		}
 
 		/* The PTE updates + copy must not be interrupted. */
@@ -829,14 +844,35 @@ intel_context_migrate_copy(struct intel_context *ce,
 			if (err)
 				goto out_rq;
 
-			/*
-			 * While we can't always restore/manage the CCS state,
-			 * we still need to ensure we don't leak the CCS state
-			 * from the previous user, so make sure we overwrite it
-			 * with something.
-			 */
-			err = emit_copy_ccs(rq, dst_offset, INDIRECT_ACCESS,
-					    dst_offset, DIRECT_ACCESS, len);
+			if (src_is_lmem) {
+				/*
+				 * If the src is already in lmem, then we must
+				 * be doing an lmem -> lmem transfer, and so
+				 * should be safe to directly copy the CCS
+				 * state. In this case we have either
+				 * initialised the CCS aux state when first
+				 * clearing the pages (since it is already
+				 * allocated in lmem), or the user has
+				 * potentially populated it, in which case we
+				 * need to copy the CCS state as-is.
+				 */
+				err = emit_copy_ccs(rq,
+						    dst_offset, INDIRECT_ACCESS,
+						    src_offset, INDIRECT_ACCESS,
+						    len);
+			} else {
+				/*
+				 * While we can't always restore/manage the CCS
+				 * state, we still need to ensure we don't leak
+				 * the CCS state from the previous user, so make
+				 * sure we overwrite it with something.
+				 */
+				err = emit_copy_ccs(rq,
+						    dst_offset, INDIRECT_ACCESS,
+						    dst_offset, DIRECT_ACCESS,
+						    len);
+			}
+
 			if (err)
 				goto out_rq;
 
@@ -889,7 +925,7 @@ static int emit_clear(struct i915_request *rq, u32 offset, int size,
 
 	GEM_BUG_ON(size >> PAGE_SHIFT > S16_MAX);
 
-	if (HAS_FLAT_CCS(i915) && ver >= 12)
+	if (GRAPHICS_VER_FULL(i915) >= IP_VER(12, 50))
 		ring_sz = XY_FAST_COLOR_BLT_DW;
 	else if (ver >= 8)
 		ring_sz = 8;
@@ -900,9 +936,8 @@ static int emit_clear(struct i915_request *rq, u32 offset, int size,
 	if (IS_ERR(cs))
 		return PTR_ERR(cs);
 
-	if (HAS_FLAT_CCS(i915) && ver >= 12) {
-		*cs++ = GEN9_XY_FAST_COLOR_BLT_CMD |
-			XY_FAST_COLOR_BLT_DEPTH_32 |
+	if (GRAPHICS_VER_FULL(i915) >= IP_VER(12, 50)) {
+		*cs++ = XY_FAST_COLOR_BLT_CMD | XY_FAST_COLOR_BLT_DEPTH_32 |
 			(XY_FAST_COLOR_BLT_DW - 2);
 		*cs++ = FIELD_PREP(XY_FAST_COLOR_BLT_MOCS_MASK, mocs) |
 			(PAGE_SIZE - 1);
@@ -947,7 +982,7 @@ static int emit_clear(struct i915_request *rq, u32 offset, int size,
 
 int
 intel_context_migrate_clear(struct intel_context *ce,
-			    struct dma_fence *await,
+			    const struct i915_deps *deps,
 			    struct scatterlist *sg,
 			    unsigned int pat_index,
 			    bool is_lmem,
@@ -978,8 +1013,8 @@ intel_context_migrate_clear(struct intel_context *ce,
 			goto out_ce;
 		}
 
-		if (await) {
-			err = i915_request_await_dma_fence(rq, await);
+		if (deps) {
+			err = i915_request_await_deps(rq, deps);
 			if (err)
 				goto out_rq;
 
@@ -989,7 +1024,7 @@ intel_context_migrate_clear(struct intel_context *ce,
 					goto out_rq;
 			}
 
-			await = NULL;
+			deps = NULL;
 		}
 
 		/* The PTE updates + clear must not be interrupted. */
@@ -1042,7 +1077,7 @@ out_ce:
 
 int intel_migrate_copy(struct intel_migrate *m,
 		       struct i915_gem_ww_ctx *ww,
-		       struct dma_fence *await,
+		       const struct i915_deps *deps,
 		       struct scatterlist *src,
 		       unsigned int src_pat_index,
 		       bool src_is_lmem,
@@ -1067,7 +1102,7 @@ int intel_migrate_copy(struct intel_migrate *m,
 	if (err)
 		goto out;
 
-	err = intel_context_migrate_copy(ce, await,
+	err = intel_context_migrate_copy(ce, deps,
 					 src, src_pat_index, src_is_lmem,
 					 dst, dst_pat_index, dst_is_lmem,
 					 out);
@@ -1081,7 +1116,7 @@ out:
 int
 intel_migrate_clear(struct intel_migrate *m,
 		    struct i915_gem_ww_ctx *ww,
-		    struct dma_fence *await,
+		    const struct i915_deps *deps,
 		    struct scatterlist *sg,
 		    unsigned int pat_index,
 		    bool is_lmem,
@@ -1104,13 +1139,24 @@ intel_migrate_clear(struct intel_migrate *m,
 	if (err)
 		goto out;
 
-	err = intel_context_migrate_clear(ce, await, sg, pat_index,
+	err = intel_context_migrate_clear(ce, deps, sg, pat_index,
 					  is_lmem, value, out);
 
 	intel_context_unpin(ce);
 out:
 	intel_context_put(ce);
 	return err;
+}
+
+void intel_migrate_fini(struct intel_migrate *m)
+{
+	struct intel_context *ce;
+
+	ce = fetch_and_zero(&m->context);
+	if (!ce)
+		return;
+
+	intel_engine_destroy_pinned_context(ce);
 }
 
 #if IS_ENABLED(CPTCFG_DRM_I915_SELFTEST)

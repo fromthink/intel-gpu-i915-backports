@@ -44,7 +44,7 @@ static int intel_hang_guc(void *arg)
 	if (!engine)
 		return 0;
 
-	ctx = kernel_context(gt->i915);
+	ctx = kernel_context(gt->i915, NULL);
 	if (IS_ERR(ctx)) {
 		gt_err(gt, "Failed get kernel context: %pe\n", ctx);
 		return PTR_ERR(ctx);
@@ -67,7 +67,6 @@ static int intel_hang_guc(void *arg)
 		gt_err(gt, "Failed to boost heatbeat interval: %pe\n", ERR_PTR(ret));
 		goto err;
 	}
-	engine->props.preempt_timeout_ms = 0;
 
 	ret = igt_spinner_init(&spin, engine->gt);
 	if (ret) {
@@ -122,7 +121,6 @@ static int intel_hang_guc(void *arg)
 err_spin:
 	igt_spinner_end(&spin);
 	igt_spinner_fini(&spin);
-	engine->props.preempt_timeout_ms = engine->defaults.preempt_timeout_ms;
 	intel_engine_set_heartbeat(engine, old_beat);
 
 	if (ret == 0) {
@@ -152,21 +150,13 @@ int intel_guc_hang_check(struct drm_i915_private *i915)
 	static const struct i915_subtest tests[] = {
 		SUBTEST(intel_hang_guc),
 	};
-	struct intel_gt *gt;
-	unsigned int i;
-	int ret = 0;
+	struct intel_gt *gt = to_gt(i915);
 
-	for_each_gt(gt, i915, i) {
-		if (intel_gt_is_wedged(gt))
-			continue;
+	if (intel_gt_is_wedged(gt))
+		return 0;
 
-		if (!intel_uc_uses_guc_submission(&gt->uc))
-			continue;
+	if (!intel_uc_uses_guc_submission(&gt->uc))
+		return 0;
 
-		ret = intel_gt_live_subtests(tests, gt);
-		if (ret)
-			break;
-	}
-
-	return ret;
+	return intel_gt_live_subtests(tests, gt);
 }

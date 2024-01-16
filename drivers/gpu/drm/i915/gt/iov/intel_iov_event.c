@@ -75,10 +75,7 @@ static int pf_handle_vf_threshold_event(struct intel_iov *iov, u32 vfid, u32 thr
 {
 	int e = threshold_key_to_enum(threshold);
 
-	if (unlikely(!vfid && !IS_ENABLED(CPTCFG_DRM_I915_SELFTEST)))
-		return -EINVAL;
-
-	if (unlikely(vfid > pf_get_totalvfs(iov)))
+	if (unlikely(!vfid || vfid > pf_get_totalvfs(iov)))
 		return -EINVAL;
 
 	if (unlikely(GEM_WARN_ON(e < 0)))
@@ -163,7 +160,7 @@ int intel_iov_event_print_events(struct intel_iov *iov, struct drm_printer *p)
 			continue;
 
 #define __format_iov_threshold(...) "%s:%u "
-#define __value_iov_threshold(K, N, ...) , #N, data->adverse_events[IOV_THRESHOLD_##K]
+#define __value_iov_threshold(K, N, ...), #N, data->adverse_events[IOV_THRESHOLD_##K]
 
 		drm_printf(p, "VF%u:\t" IOV_THRESHOLDS(__format_iov_threshold) "\n",
 			   n IOV_THRESHOLDS(__value_iov_threshold));
@@ -175,7 +172,3 @@ int intel_iov_event_print_events(struct intel_iov *iov, struct drm_printer *p)
 
 	return 0;
 }
-
-#if IS_ENABLED(CPTCFG_DRM_I915_SELFTEST)
-#include "selftests/selftest_live_iov_events.c"
-#endif

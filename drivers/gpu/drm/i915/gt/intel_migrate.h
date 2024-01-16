@@ -11,6 +11,7 @@
 #include "intel_migrate_types.h"
 
 struct dma_fence;
+struct i915_deps;
 struct i915_request;
 struct i915_gem_ww_ctx;
 struct intel_gt;
@@ -22,7 +23,7 @@ struct intel_context *intel_migrate_create_context(struct intel_migrate *m);
 
 int intel_migrate_copy(struct intel_migrate *m,
 		       struct i915_gem_ww_ctx *ww,
-		       struct dma_fence *await,
+		       const struct i915_deps *deps,
 		       struct scatterlist *src,
 		       unsigned int src_pat_index,
 		       bool src_is_lmem,
@@ -32,7 +33,7 @@ int intel_migrate_copy(struct intel_migrate *m,
 		       struct i915_request **out);
 
 int intel_context_migrate_copy(struct intel_context *ce,
-			       struct dma_fence *await,
+			       const struct i915_deps *deps,
 			       struct scatterlist *src,
 			       unsigned int src_pat_index,
 			       bool src_is_lmem,
@@ -44,7 +45,7 @@ int intel_context_migrate_copy(struct intel_context *ce,
 int
 intel_migrate_clear(struct intel_migrate *m,
 		    struct i915_gem_ww_ctx *ww,
-		    struct dma_fence *await,
+		    const struct i915_deps *deps,
 		    struct scatterlist *sg,
 		    unsigned int pat_index,
 		    bool is_lmem,
@@ -52,11 +53,13 @@ intel_migrate_clear(struct intel_migrate *m,
 		    struct i915_request **out);
 int
 intel_context_migrate_clear(struct intel_context *ce,
-			    struct dma_fence *await,
+			    const struct i915_deps *deps,
 			    struct scatterlist *sg,
 			    unsigned int pat_index,
 			    bool is_lmem,
 			    u32 value,
 			    struct i915_request **out);
+
+void intel_migrate_fini(struct intel_migrate *m);
 
 #endif /* __INTEL_MIGRATE__ */

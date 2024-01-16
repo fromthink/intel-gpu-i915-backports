@@ -60,14 +60,8 @@ intel_timeline_pin_map(struct intel_timeline *timeline)
 	struct drm_i915_gem_object *obj = timeline->hwsp_ggtt->obj;
 	u32 ofs = offset_in_page(timeline->hwsp_offset);
 	void *vaddr;
-	int type;
 
-	if (obj->mm.mapping) /* must preserve the page protection */
-		type = page_unmask_bits(obj->mm.mapping);
-	else
-		type = i915_coherent_map_type(to_i915(obj->base.dev), obj, true);
-
-	vaddr = i915_gem_object_pin_map(obj, type);
+	vaddr = i915_gem_object_pin_map(obj, I915_MAP_WB);
 	if (IS_ERR(vaddr))
 		return PTR_ERR(vaddr);
 
@@ -85,20 +79,14 @@ static int intel_timeline_init(struct intel_timeline *timeline,
 {
 	kref_init(&timeline->kref);
 	atomic_set(&timeline->pin_count, 0);
-	INIT_LIST_HEAD(&timeline->engine_link);
 
 	timeline->gt = gt;
 
 	if (hwsp) {
-		timeline->mode = INTEL_TIMELINE_RELATIVE_ENGINE;
-		if (offset & INTEL_TIMELINE_RELATIVE_CONTEXT) {
-			timeline->mode = INTEL_TIMELINE_RELATIVE_CONTEXT;
-			offset &= ~INTEL_TIMELINE_RELATIVE_CONTEXT;
-		}
 		timeline->hwsp_offset = offset;
 		timeline->hwsp_ggtt = i915_vma_get(hwsp);
 	} else {
-		timeline->mode = INTEL_TIMELINE_ABSOLUTE;
+		timeline->has_initial_breadcrumb = true;
 		hwsp = hwsp_alloc(gt);
 		if (IS_ERR(hwsp))
 			return PTR_ERR(hwsp);
@@ -142,7 +130,6 @@ static void intel_timeline_fini(struct rcu_head *rcu)
 
 	i915_vma_put(timeline->hwsp_ggtt);
 	i915_active_fini(&timeline->active);
-	i915_active_fence_fini(&timeline->last_request);
 
 	/*
 	 * A small race exists between intel_gt_retire_requests_timeout and
@@ -214,7 +201,7 @@ int intel_timeline_pin(struct intel_timeline *tl, struct i915_gem_ww_ctx *ww)
 			return err;
 	}
 
-	err = i915_ggtt_pin_for_gt(tl->hwsp_ggtt, ww, 0, PIN_HIGH);
+	err = i915_ggtt_pin(tl->hwsp_ggtt, ww, 0, PIN_HIGH);
 	if (err)
 		return err;
 
@@ -236,9 +223,8 @@ int intel_timeline_pin(struct intel_timeline *tl, struct i915_gem_ww_ctx *ww)
 void intel_timeline_reset_seqno(const struct intel_timeline *tl)
 {
 	u32 *hwsp_seqno = (u32 *)tl->hwsp_seqno;
-
 	/* Must be pinned to be writable, and no requests in flight. */
-	GEM_BUG_ON(!tl->hwsp_map);
+	GEM_BUG_ON(!atomic_read(&tl->pin_count));
 
 	memset(hwsp_seqno + 1, 0, TIMELINE_SEQNO_BYTES - sizeof(*hwsp_seqno));
 	WRITE_ONCE(*hwsp_seqno, tl->seqno);
@@ -273,49 +259,34 @@ void intel_timeline_enter(struct intel_timeline *tl)
 		return;
 
 	spin_lock(&timelines->lock);
-	if (!atomic_fetch_inc(&tl->active_count))
-		list_add_tail_rcu(&tl->link, &timelines->active_list);
+	if (!atomic_fetch_inc(&tl->active_count)) {
+		/*
+		 * The HWSP is volatile, and may have been lost while inactive,
+		 * e.g. across suspend/resume. Be paranoid, and ensure that
+		 * the HWSP value matches our seqno so we don't proclaim
+		 * the next request as already complete.
+		 */
+		intel_timeline_reset_seqno(tl);
+		list_add_tail(&tl->link, &timelines->active_list);
+	}
 	spin_unlock(&timelines->lock);
-}
-
-bool intel_timeline_get_if_active(struct intel_timeline *tl)
-{
-	if (!atomic_add_unless(&tl->active_count, 1, 0))
-		return false;
-
-	intel_timeline_get(tl);
-	return true;
-}
-
-static bool intel_timeline_mark_inactive(struct intel_timeline *tl)
-{
-	struct intel_gt_timelines *timelines = &tl->gt->timelines;
-
-	GEM_BUG_ON(!atomic_read(&tl->active_count));
-	if (atomic_add_unless(&tl->active_count, -1, 1))
-		return false;
-
-	spin_lock(&timelines->lock);
-	if (atomic_dec_and_test(&tl->active_count))
-		list_del_rcu(&tl->link);
-	spin_unlock(&timelines->lock);
-
-	return true;
-}
-
-void intel_timeline_put_active(struct intel_timeline *tl)
-{
-	intel_timeline_mark_inactive(tl);
-	intel_timeline_put(tl);
 }
 
 void intel_timeline_exit(struct intel_timeline *tl)
 {
+	struct intel_gt_timelines *timelines = &tl->gt->timelines;
+
 	/* See intel_timeline_enter() */
 	lockdep_assert_held(&tl->mutex);
 
-	if (!intel_timeline_mark_inactive(tl))
+	GEM_BUG_ON(!atomic_read(&tl->active_count));
+	if (atomic_add_unless(&tl->active_count, -1, 1))
 		return;
+
+	spin_lock(&timelines->lock);
+	if (atomic_dec_and_test(&tl->active_count))
+		list_del(&tl->link);
+	spin_unlock(&timelines->lock);
 
 	/*
 	 * Since this timeline is idle, all bariers upon which we were waiting
@@ -328,9 +299,9 @@ void intel_timeline_exit(struct intel_timeline *tl)
 static u32 timeline_advance(struct intel_timeline *tl)
 {
 	GEM_BUG_ON(!atomic_read(&tl->pin_count));
-	GEM_BUG_ON(tl->seqno & intel_timeline_has_initial_breadcrumb(tl));
+	GEM_BUG_ON(tl->seqno & tl->has_initial_breadcrumb);
 
-	return tl->seqno += 1 + intel_timeline_has_initial_breadcrumb(tl);
+	return tl->seqno += 1 + tl->has_initial_breadcrumb;
 }
 
 static noinline int
@@ -342,8 +313,6 @@ __intel_timeline_get_seqno(struct intel_timeline *tl,
 	/* w/a: bit 5 needs to be zero for MI_FLUSH_DW address. */
 	if (TIMELINE_SEQNO_BYTES <= BIT(5) && (next_ofs & BIT(5)))
 		next_ofs = offset_in_page(next_ofs + BIT(5));
-
-	synchronize_rcu(); /* flush intel_timeline_unpin() */
 
 	tl->hwsp_offset = i915_ggtt_offset(tl->hwsp_ggtt) + next_ofs;
 	tl->hwsp_seqno = tl->hwsp_map + next_ofs;
@@ -361,7 +330,7 @@ int intel_timeline_get_seqno(struct intel_timeline *tl,
 	*seqno = timeline_advance(tl);
 
 	/* Replace the HWSP on wraparound for HW semaphores */
-	if (unlikely(!*seqno && intel_timeline_has_initial_breadcrumb(tl)))
+	if (unlikely(!*seqno && tl->has_initial_breadcrumb))
 		return __intel_timeline_get_seqno(tl, seqno);
 
 	return 0;
@@ -396,14 +365,11 @@ int intel_timeline_read_hwsp(struct i915_request *from,
 	if (!tl)
 		return 1;
 
-	/* Can't do semaphore waits on pinned context */
-	if (intel_timeline_is_relative(tl)) {
+	/* Can't do semaphore waits on kernel context */
+	if (!tl->has_initial_breadcrumb) {
 		err = -EINVAL;
 		goto out;
 	}
-
-	/* Make sure this GGTT address is visible to the reader */
-	GEM_BUG_ON(tl->hwsp_ggtt->vm != &to->engine->gt->ggtt->vm);
 
 	err = i915_active_add_request(&tl->active, to);
 
@@ -415,13 +381,11 @@ out:
 void intel_timeline_unpin(struct intel_timeline *tl)
 {
 	GEM_BUG_ON(!atomic_read(&tl->pin_count));
+	if (!atomic_dec_and_test(&tl->pin_count))
+		return;
 
-	rcu_read_lock();
-	if (atomic_dec_and_test(&tl->pin_count)) {
-		i915_active_release(&tl->active);
-		__i915_vma_unpin(tl->hwsp_ggtt);
-	}
-	rcu_read_unlock();
+	i915_active_release(&tl->active);
+	__i915_vma_unpin(tl->hwsp_ggtt);
 }
 
 void __intel_timeline_free(struct kref *kref)
@@ -451,19 +415,30 @@ void intel_gt_show_timelines(struct intel_gt *gt,
 						  int indent))
 {
 	struct intel_gt_timelines *timelines = &gt->timelines;
-	struct intel_timeline *tl;
+	struct intel_timeline *tl, *tn;
+	LIST_HEAD(free);
 
-	rcu_read_lock();
-	list_for_each_entry_rcu(tl, &timelines->active_list, link) {
+	spin_lock(&timelines->lock);
+	list_for_each_entry_safe(tl, tn, &timelines->active_list, link) {
 		unsigned long count, ready, inflight;
-		struct i915_request *rq;
+		struct i915_request *rq, *rn;
 		struct dma_fence *fence;
-		const u32 *hwsp_seqno;
+
+		if (!mutex_trylock(&tl->mutex)) {
+			drm_printf(m, "Timeline %llx: busy; skipping\n",
+				   tl->fence_context);
+			continue;
+		}
+
+		intel_timeline_get(tl);
+		GEM_BUG_ON(!atomic_read(&tl->active_count));
+		atomic_inc(&tl->active_count); /* pin the list element */
+		spin_unlock(&timelines->lock);
 
 		count = 0;
 		ready = 0;
 		inflight = 0;
-		list_for_each_entry_rcu(rq, &tl->requests, link) {
+		list_for_each_entry_safe(rq, rn, &tl->requests, link) {
 			if (i915_request_completed(rq))
 				continue;
 
@@ -477,10 +452,8 @@ void intel_gt_show_timelines(struct intel_gt *gt,
 		drm_printf(m, "Timeline %llx: { ", tl->fence_context);
 		drm_printf(m, "count: %lu, ready: %lu, inflight: %lu",
 			   count, ready, inflight);
-		hwsp_seqno = READ_ONCE(tl->hwsp_seqno);
-		if ((unsigned long)hwsp_seqno & PAGE_MASK)
-			drm_printf(m, ", seqno: { current: %d, last: %d }",
-				   *hwsp_seqno, tl->seqno);
+		drm_printf(m, ", seqno: { current: %d, last: %d }",
+			   *tl->hwsp_seqno, tl->seqno);
 		fence = i915_active_fence_get(&tl->last_request);
 		if (fence) {
 			drm_printf(m, ", engine: %s",
@@ -490,26 +463,28 @@ void intel_gt_show_timelines(struct intel_gt *gt,
 		drm_printf(m, " }\n");
 
 		if (show_request) {
-			if (!intel_timeline_get_if_active(tl))
-				continue;
-
-			if (!mutex_trylock(&tl->mutex)) {
-				intel_timeline_put_active(tl);
-				continue;
-			}
-
-			rcu_read_unlock();
-
-			list_for_each_entry(rq, &tl->requests, link)
+			list_for_each_entry_safe(rq, rn, &tl->requests, link)
 				show_request(m, rq, "", 2);
+		}
 
-			rcu_read_lock();
+		mutex_unlock(&tl->mutex);
+		spin_lock(&timelines->lock);
 
-			mutex_unlock(&tl->mutex);
-			intel_timeline_put_active(tl);
+		/* Resume list iteration after reacquiring spinlock */
+		list_safe_reset_next(tl, tn, link);
+		if (atomic_dec_and_test(&tl->active_count))
+			list_del(&tl->link);
+
+		/* Defer the final release to after the spinlock */
+		if (refcount_dec_and_test(&tl->kref.refcount)) {
+			GEM_BUG_ON(atomic_read(&tl->active_count));
+			list_add(&tl->link, &free);
 		}
 	}
-	rcu_read_unlock();
+	spin_unlock(&timelines->lock);
+
+	list_for_each_entry_safe(tl, tn, &free, link)
+		__intel_timeline_free(&tl->kref);
 }
 
 #if IS_ENABLED(CPTCFG_DRM_I915_SELFTEST)

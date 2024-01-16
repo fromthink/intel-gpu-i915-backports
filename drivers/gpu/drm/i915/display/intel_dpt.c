@@ -5,9 +5,12 @@
 
 #include "gem/i915_gem_domain.h"
 #include "gem/i915_gem_internal.h"
+#include "gem/i915_gem_lmem.h"
 #include "gt/gen8_ppgtt.h"
 
 #include "i915_drv.h"
+#include "i915_reg.h"
+#include "intel_de.h"
 #include "intel_display_types.h"
 #include "intel_dpt.h"
 #include "intel_fb.h"
@@ -26,11 +29,16 @@ static inline struct i915_dpt *
 i915_vm_to_dpt(struct i915_address_space *vm)
 {
 	BUILD_BUG_ON(offsetof(struct i915_dpt, vm));
-	GEM_BUG_ON(!i915_is_dpt(vm));
+	drm_WARN_ON(&vm->i915->drm, !i915_is_dpt(vm));
 	return container_of(vm, struct i915_dpt, vm);
 }
 
 #define dpt_total_entries(dpt) ((dpt)->vm.total >> PAGE_SHIFT)
+
+static void gen8_set_pte(void __iomem *addr, gen8_pte_t pte)
+{
+	writeq(pte, addr);
+}
 
 static void dpt_insert_page(struct i915_address_space *vm,
 			    dma_addr_t addr,
@@ -46,8 +54,7 @@ static void dpt_insert_page(struct i915_address_space *vm,
 }
 
 static void dpt_insert_entries(struct i915_address_space *vm,
-			       struct i915_vm_pt_stash *stash,
-			       struct i915_vma *vma,
+			       struct i915_vma_resource *vma_res,
 			       unsigned int pat_index,
 			       u32 flags)
 {
@@ -63,8 +70,8 @@ static void dpt_insert_entries(struct i915_address_space *vm,
 	 * not to allow the user to override access to a read only page.
 	 */
 
-	i = i915_vma_offset(vma) / I915_GTT_PAGE_SIZE;
-	for_each_sgt_daddr(addr, sgt_iter, vma->pages)
+	i = vma_res->start / I915_GTT_PAGE_SIZE;
+	for_each_sgt_daddr(addr, sgt_iter, vma_res->bi.pages)
 		gen8_set_pte(&base[i++], pte_encode | addr);
 }
 
@@ -75,34 +82,38 @@ static void dpt_clear_range(struct i915_address_space *vm,
 
 static void dpt_bind_vma(struct i915_address_space *vm,
 			 struct i915_vm_pt_stash *stash,
-			 struct i915_vma *vma,
+			 struct i915_vma_resource *vma_res,
 			 unsigned int pat_index,
 			 u32 flags)
 {
-	struct drm_i915_gem_object *obj = vma->obj;
 	u32 pte_flags;
+
+	if (vma_res->bound_flags)
+		return;
 
 	/* Applicable to VLV (gen8+ do not support RO in the GGTT) */
 	pte_flags = 0;
-	if (vma->vm->has_read_only && i915_gem_object_is_readonly(obj))
+	if (vm->has_read_only && vma_res->bi.readonly)
 		pte_flags |= PTE_READ_ONLY;
-	if (i915_gem_object_is_lmem(obj))
+	if (vma_res->bi.lmem)
 		pte_flags |= PTE_LM;
 
-	vma->vm->insert_entries(vma->vm, stash, vma, pat_index, pte_flags);
-	vma->page_sizes = I915_GTT_PAGE_SIZE;
+	vm->insert_entries(vm, vma_res, pat_index, pte_flags);
+
+	vma_res->page_sizes_gtt = I915_GTT_PAGE_SIZE;
 
 	/*
 	 * Without aliasing PPGTT there's no difference between
 	 * GLOBAL/LOCAL_BIND, it's all the same ptes. Hence unconditionally
 	 * upgrade to both bound if we bind either to avoid double-binding.
 	 */
-	atomic_or(I915_VMA_GLOBAL_BIND | I915_VMA_LOCAL_BIND, &vma->flags);
+	vma_res->bound_flags = I915_VMA_GLOBAL_BIND | I915_VMA_LOCAL_BIND;
 }
 
-static void dpt_unbind_vma(struct i915_address_space *vm, struct i915_vma *vma)
+static void dpt_unbind_vma(struct i915_address_space *vm,
+			   struct i915_vma_resource *vma_res)
 {
-	vm->clear_range(vm, i915_vma_offset(vma), vma->size);
+	vm->clear_range(vm, vma_res->start, vma_res->vma_size);
 }
 
 static void dpt_cleanup(struct i915_address_space *vm)
@@ -134,7 +145,7 @@ struct i915_vma *intel_dpt_pin(struct i915_address_space *vm)
 		if (err)
 			continue;
 
-		vma = i915_gem_object_ggtt_pin_ww(dpt->obj, &ww, vm->gt->ggtt, NULL, 0, 4096,
+		vma = i915_gem_object_ggtt_pin_ww(dpt->obj, &ww, NULL, 0, 4096,
 						  pin_flags);
 		if (IS_ERR(vma)) {
 			err = PTR_ERR(vma);
@@ -154,6 +165,8 @@ struct i915_vma *intel_dpt_pin(struct i915_address_space *vm)
 
 		i915_vma_get(vma);
 	}
+
+	dpt->obj->mm.dirty = true;
 
 	atomic_dec(&i915->gpu_error.pending_fb_pin);
 	intel_runtime_pm_put(&i915->runtime_pm, wakeref);
@@ -236,7 +249,7 @@ intel_dpt_create(struct intel_framebuffer *fb)
 	struct i915_address_space *vm;
 	struct i915_dpt *dpt;
 	size_t size;
-	int err;
+	int ret;
 
 	if (intel_fb_needs_pot_stride_remap(fb))
 		size = intel_remapped_info_size(&fb->remapped_view.gtt.remapped);
@@ -245,17 +258,25 @@ intel_dpt_create(struct intel_framebuffer *fb)
 
 	size = round_up(size * sizeof(gen8_pte_t), I915_GTT_PAGE_SIZE);
 
-	dpt_obj = i915_gem_object_create_lmem(i915, size, 0);
+	dpt_obj = i915_gem_object_create_lmem(i915, size, I915_BO_ALLOC_CONTIGUOUS);
 	if (IS_ERR(dpt_obj) && i915_ggtt_has_aperture(to_gt(i915)->ggtt))
 		dpt_obj = i915_gem_object_create_stolen(i915, size);
 	if (IS_ERR(dpt_obj) && !HAS_LMEM(i915)) {
 		drm_dbg_kms(&i915->drm, "Allocating dpt from smem\n");
-		dpt_obj = i915_gem_object_create_internal(i915, size);
+		dpt_obj = i915_gem_object_create_shmem(i915, size);
 	}
 	if (IS_ERR(dpt_obj))
 		return ERR_CAST(dpt_obj);
 
-	i915_gem_object_set_cache_coherency(dpt_obj, I915_CACHE_NONE);
+	ret = i915_gem_object_lock_interruptible(dpt_obj, NULL);
+	if (!ret) {
+		ret = i915_gem_object_set_cache_level(dpt_obj, I915_CACHE_NONE);
+		i915_gem_object_unlock(dpt_obj);
+	}
+	if (ret) {
+		i915_gem_object_put(dpt_obj);
+		return ERR_PTR(ret);
+	}
 
 	dpt = kzalloc(sizeof(*dpt), GFP_KERNEL);
 	if (!dpt) {
@@ -271,11 +292,7 @@ intel_dpt_create(struct intel_framebuffer *fb)
 	vm->total = (size / sizeof(gen8_pte_t)) * I915_GTT_PAGE_SIZE;
 	vm->is_dpt = true;
 
-	err = i915_address_space_init(vm, VM_CLASS_DPT);
-	if (err) {
-		i915_gem_object_put(dpt_obj);
-		return ERR_PTR(err);
-	}
+	i915_address_space_init(vm, VM_CLASS_DPT);
 
 	vm->insert_page = dpt_insert_page;
 	vm->clear_range = dpt_clear_range;
@@ -284,12 +301,11 @@ intel_dpt_create(struct intel_framebuffer *fb)
 
 	vm->vma_ops.bind_vma    = dpt_bind_vma;
 	vm->vma_ops.unbind_vma  = dpt_unbind_vma;
-	vm->vma_ops.set_pages   = ggtt_set_pages;
-	vm->vma_ops.clear_pages = clear_pages;
 
 	vm->pte_encode = vm->gt->ggtt->vm.pte_encode;
 
 	dpt->obj = dpt_obj;
+	dpt->obj->is_dpt = true;
 
 	return &dpt->vm;
 }
@@ -298,5 +314,29 @@ void intel_dpt_destroy(struct i915_address_space *vm)
 {
 	struct i915_dpt *dpt = i915_vm_to_dpt(vm);
 
-	i915_vm_close(&dpt->vm);
+	dpt->obj->is_dpt = false;
+	i915_vm_put(&dpt->vm);
+}
+
+void intel_dpt_configure(struct intel_crtc *crtc)
+{
+	struct drm_i915_private *i915 = to_i915(crtc->base.dev);
+
+	if (DISPLAY_VER(i915) == 14) {
+		enum pipe pipe = crtc->pipe;
+		enum plane_id plane_id;
+
+		for_each_plane_id_on_crtc(crtc, plane_id) {
+			if (plane_id == PLANE_CURSOR)
+				continue;
+
+			intel_de_rmw(i915, PLANE_CHICKEN(pipe, plane_id),
+				     PLANE_CHICKEN_DISABLE_DPT,
+				     i915->params.enable_dpt ? 0 : PLANE_CHICKEN_DISABLE_DPT);
+		}
+	} else if (DISPLAY_VER(i915) == 13) {
+		intel_de_rmw(i915, CHICKEN_MISC_2,
+			     CHICKEN_MISC_DISABLE_DPT,
+			     i915->params.enable_dpt ? 0 : CHICKEN_MISC_DISABLE_DPT);
+	}
 }

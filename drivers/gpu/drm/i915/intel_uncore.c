@@ -25,16 +25,13 @@
 #include <linux/pm_runtime.h>
 
 #include "gt/intel_engine_regs.h"
-#include "gt/intel_gt.h"
 #include "gt/intel_gt_regs.h"
-#include "gt/intel_gt.h"
 
 #include "i915_drv.h"
 #include "i915_iosf_mbi.h"
+#include "i915_reg.h"
 #include "i915_trace.h"
 #include "i915_vgpu.h"
-#include "intel_pm.h"
-#include "intel_pcode.h"
 
 #define FORCEWAKE_ACK_TIMEOUT_MS 50
 #define GT_FIFO_TIMEOUT_MS	 10
@@ -130,22 +127,16 @@ intel_uncore_forcewake_domain_to_str(const enum forcewake_domain_id id)
 static inline void
 fw_domain_reset(const struct intel_uncore_forcewake_domain *d)
 {
-	struct drm_i915_private *i915 = d->uncore->i915;
 	/*
 	 * We don't really know if the powerwell for the forcewake domain we are
 	 * trying to reset here does exist at this point (engines could be fused
 	 * off in ICL+), so no waiting for acks
 	 */
 	/* WaRsClearFWBitsAtReset */
-	if (GRAPHICS_VER(i915) >= 12) {
-		/* Wa_16017528748 mdfi wa in pcode uses bit#1 */
-		if (pvc_needs_rc6_wa(i915))
-			fw_clear(d, 0xeffd);
-		else
-			fw_clear(d, 0xefff);
-	} else {
+	if (GRAPHICS_VER(d->uncore->i915) >= 12)
+		fw_clear(d, 0xefff);
+	else
 		fw_clear(d, 0xffff);
-	}
 }
 
 static inline void
@@ -165,26 +156,8 @@ __wait_for_ack(const struct intel_uncore_forcewake_domain *d,
 	       const u32 ack,
 	       const u32 value)
 {
-	struct drm_i915_private *i915 = d->uncore->i915;
-	int ret;
-
-	/*
-	 * WA_16017528748: PVC Bx: Increase forcewake ack timeout to 500 msecs
-	 * to counteract pcode wa forcewake hold period at rc6 exit.
-	 * In the unlikely scenario that this call comes from an interrupt handling
-	 * and RC6 is enabled, we might wait this long timeout in the worst case and
-	 * cause an impact in the whole system, including other PVCs in the system.
-	 * However this might not happen unless we are already in an error kind of
-	 * situation since the Wa_16015496043 is already blocking RC6 whenever
-	 * we have any client connected.
-	 */
-	if (IS_PVC_BD_STEP(i915, STEP_B0, STEP_FOREVER) &&
-	    d->uncore->gt->rc6.supported)
-		ret = _wait_for_atomic((fw_ack(d) & ack) == value, 500000, 1);
-	else
-		ret = wait_for_atomic((fw_ack(d) & ack) == value,
-				      FORCEWAKE_ACK_TIMEOUT_MS);
-	return ret;
+	return wait_for_atomic((fw_ack(d) & ack) == value,
+			       FORCEWAKE_ACK_TIMEOUT_MS);
 }
 
 static inline int
@@ -204,28 +177,20 @@ wait_ack_set(const struct intel_uncore_forcewake_domain *d,
 static inline void
 fw_domain_wait_ack_clear(const struct intel_uncore_forcewake_domain *d)
 {
-	if (wait_ack_clear(d, FORCEWAKE_KERNEL)) {
-		if (fw_ack(d) == ~0)
-			intel_gt_log_driver_error(d->uncore->gt, INTEL_GT_DRIVER_ERROR_GT_OTHER,
-						  "%s: MMIO unreliable (forcewake register returns 0xFFFFFFFF)!\n",
-						  intel_uncore_forcewake_domain_to_str(d->id));
-		else
-			intel_gt_log_driver_error(d->uncore->gt, INTEL_GT_DRIVER_ERROR_GT_OTHER,
-						  "%s: timed out waiting for forcewake ack to clear.\n",
-						  intel_uncore_forcewake_domain_to_str(d->id));
+	if (!wait_ack_clear(d, FORCEWAKE_KERNEL))
+		return;
 
-		add_taint_for_CI(d->uncore->i915, TAINT_WARN); /* CI now unreliable */
-	}
-}
+	if (fw_ack(d) == ~0)
+		drm_err(&d->uncore->i915->drm,
+			"%s: MMIO unreliable (forcewake register returns 0xFFFFFFFF)!\n",
+			intel_uncore_forcewake_domain_to_str(d->id));
+	else
+		drm_err(&d->uncore->i915->drm,
+			"%s: timed out waiting for forcewake ack to clear.\n",
+			intel_uncore_forcewake_domain_to_str(d->id));
 
-static inline void
-fw_domain_flush(const struct intel_uncore_forcewake_domain *d)
-{
-	if (fw_ack(d)) {
-		preempt_disable();
-		fw_domain_wait_ack_clear(d);
-		preempt_enable();
-	}
+	dump_stack();
+	add_taint_for_CI(d->uncore->i915, TAINT_WARN); /* CI now unreliable */
 }
 
 enum ack_type {
@@ -241,9 +206,6 @@ fw_domain_wait_ack_with_fallback(const struct intel_uncore_forcewake_domain *d,
 	const u32 value = type == ACK_SET ? ack_bit : 0;
 	unsigned int pass;
 	bool ack_detected;
-
-	if (d->uncore->i915->quiesce_gpu || i915_is_pci_faulted(d->uncore->i915))
-		return 0;
 
 	/*
 	 * There is a possibility of driver's wake request colliding
@@ -273,11 +235,12 @@ fw_domain_wait_ack_with_fallback(const struct intel_uncore_forcewake_domain *d,
 		fw_clear(d, FORCEWAKE_KERNEL_FALLBACK);
 	} while (!ack_detected && pass++ < 10);
 
-	DRM_DEBUG_DRIVER("%s had to use fallback to %s ack, 0x%x (passes %u)\n",
-			 intel_uncore_forcewake_domain_to_str(d->id),
-			 type == ACK_SET ? "set" : "clear",
-			 fw_ack(d),
-			 pass);
+	drm_dbg(&d->uncore->i915->drm,
+		"%s had to use fallback to %s ack, 0x%x (passes %u)\n",
+		intel_uncore_forcewake_domain_to_str(d->id),
+		type == ACK_SET ? "set" : "clear",
+		fw_ack(d),
+		pass);
 
 	return ack_detected ? 0 : -ETIMEDOUT;
 }
@@ -302,9 +265,10 @@ static inline void
 fw_domain_wait_ack_set(const struct intel_uncore_forcewake_domain *d)
 {
 	if (wait_ack_set(d, FORCEWAKE_KERNEL)) {
-		intel_gt_log_driver_error(d->uncore->gt, INTEL_GT_DRIVER_ERROR_GT_OTHER,
-					  "%s: timed out waiting for forcewake ack request.\n",
-					  intel_uncore_forcewake_domain_to_str(d->id));
+		drm_err(&d->uncore->i915->drm,
+			"%s: timed out waiting for forcewake ack request.\n",
+			intel_uncore_forcewake_domain_to_str(d->id));
+		dump_stack();
 		add_taint_for_CI(d->uncore->i915, TAINT_WARN); /* CI now unreliable */
 	}
 }
@@ -333,9 +297,6 @@ fw_domains_get_normal(struct intel_uncore *uncore, enum forcewake_domains fw_dom
 
 	GEM_BUG_ON(fw_domains & ~uncore->fw_domains);
 
-	if (uncore->gt->i915->quiesce_gpu)
-		return;
-
 	for_each_fw_domain_masked(d, fw_domains, uncore, tmp) {
 		fw_domain_wait_ack_clear(d);
 		fw_domain_get(d);
@@ -356,9 +317,6 @@ fw_domains_get_with_fallback(struct intel_uncore *uncore,
 
 	GEM_BUG_ON(fw_domains & ~uncore->fw_domains);
 
-	if (uncore->gt->i915->quiesce_gpu)
-		return;
-
 	for_each_fw_domain_masked(d, fw_domains, uncore, tmp) {
 		fw_domain_wait_ack_clear_fallback(d);
 		fw_domain_get(d);
@@ -377,9 +335,6 @@ fw_domains_put(struct intel_uncore *uncore, enum forcewake_domains fw_domains)
 	unsigned int tmp;
 
 	GEM_BUG_ON(fw_domains & ~uncore->fw_domains);
-
-	if (uncore->gt->i915->quiesce_gpu)
-		return;
 
 	for_each_fw_domain_masked(d, fw_domains, uncore, tmp)
 		fw_domain_put(d);
@@ -499,9 +454,6 @@ intel_uncore_forcewake_reset(struct intel_uncore *uncore)
 	int retry_count = 100;
 	enum forcewake_domains fw, active_domains;
 
-	if (uncore->i915->quiesce_gpu)
-		return 0;
-
 	iosf_mbi_assert_punit_acquired();
 
 	/* Hold uncore.lock across reset to prevent any register access
@@ -532,8 +484,7 @@ intel_uncore_forcewake_reset(struct intel_uncore *uncore)
 			break;
 
 		if (--retry_count == 0) {
-			intel_gt_log_driver_error(uncore->gt, INTEL_GT_DRIVER_ERROR_GT_OTHER,
-						  "Timed out waiting for forcewake timers to finish\n");
+			drm_err(&uncore->i915->drm, "Timed out waiting for forcewake timers to finish\n");
 			break;
 		}
 
@@ -585,7 +536,6 @@ fpga_check_for_unclaimed_mmio(struct intel_uncore *uncore)
 	return true;
 }
 
-#if IS_ENABLED(CPTCFG_DRM_I915_DISPLAY)
 static bool
 vlv_check_for_unclaimed_mmio(struct intel_uncore *uncore)
 {
@@ -599,10 +549,6 @@ vlv_check_for_unclaimed_mmio(struct intel_uncore *uncore)
 
 	return true;
 }
-#else
-static bool vlv_check_for_unclaimed_mmio(struct intel_uncore *uncore)
-{ return 0; }
-#endif
 
 static bool
 gen6_check_for_fifo_debug(struct intel_uncore *uncore)
@@ -882,14 +828,13 @@ void intel_uncore_forcewake_flush(struct intel_uncore *uncore,
 		WRITE_ONCE(domain->active, false);
 		if (hrtimer_cancel(&domain->timer))
 			intel_uncore_fw_release_timer(&domain->timer);
-		fw_domain_flush(domain);
 	}
 }
 
 /**
- * intel_uncore_forcewake_put__locked - grab forcewake domain references
+ * intel_uncore_forcewake_put__locked - release forcewake domain references
  * @uncore: the intel_uncore structure
- * @fw_domains: forcewake domains to get reference on
+ * @fw_domains: forcewake domains to put references
  *
  * See intel_uncore_forcewake_put(). This variant places the onus
  * on the caller to explicitly handle the dev_priv->uncore.lock spinlock.
@@ -1982,25 +1927,31 @@ __unclaimed_previous_reg_debug(struct intel_uncore *uncore,
 			i915_mmio_reg_offset(reg));
 }
 
-static inline void
-unclaimed_reg_debug(struct intel_uncore *uncore,
-		    const i915_reg_t reg,
-		    const bool read,
-		    const bool before)
+static inline bool __must_check
+unclaimed_reg_debug_header(struct intel_uncore *uncore,
+			   const i915_reg_t reg, const bool read)
 {
 	if (likely(!uncore->i915->params.mmio_debug) || !uncore->debug)
-		return;
+		return false;
 
 	/* interrupts are disabled and re-enabled around uncore->lock usage */
 	lockdep_assert_held(&uncore->lock);
 
-	if (before) {
-		spin_lock(&uncore->debug->lock);
-		__unclaimed_previous_reg_debug(uncore, reg, read);
-	} else {
-		__unclaimed_reg_debug(uncore, reg, read);
-		spin_unlock(&uncore->debug->lock);
-	}
+	spin_lock(&uncore->debug->lock);
+	__unclaimed_previous_reg_debug(uncore, reg, read);
+
+	return true;
+}
+
+static inline void
+unclaimed_reg_debug_footer(struct intel_uncore *uncore,
+			   const i915_reg_t reg, const bool read)
+{
+	/* interrupts are disabled and re-enabled around uncore->lock usage */
+	lockdep_assert_held(&uncore->lock);
+
+	__unclaimed_reg_debug(uncore, reg, read);
+	spin_unlock(&uncore->debug->lock);
 }
 
 #define __vgpu_read(x) \
@@ -2078,13 +2029,15 @@ __gen2_read(64)
 #define GEN6_READ_HEADER(x) \
 	u32 offset = i915_mmio_reg_offset(reg); \
 	unsigned long irqflags; \
+	bool unclaimed_reg_debug; \
 	u##x val = 0; \
 	assert_rpm_wakelock_held(uncore->rpm); \
 	spin_lock_irqsave(&uncore->lock, irqflags); \
-	unclaimed_reg_debug(uncore, reg, true, true)
+	unclaimed_reg_debug = unclaimed_reg_debug_header(uncore, reg, true)
 
 #define GEN6_READ_FOOTER \
-	unclaimed_reg_debug(uncore, reg, true, false); \
+	if (unclaimed_reg_debug) \
+		unclaimed_reg_debug_footer(uncore, reg, true);	\
 	spin_unlock_irqrestore(&uncore->lock, irqflags); \
 	trace_i915_reg_rw(false, reg, val, sizeof(val), trace); \
 	return val
@@ -2182,13 +2135,15 @@ __gen2_write(32)
 #define GEN6_WRITE_HEADER \
 	u32 offset = i915_mmio_reg_offset(reg); \
 	unsigned long irqflags; \
+	bool unclaimed_reg_debug; \
 	trace_i915_reg_rw(true, reg, val, sizeof(val), trace); \
 	assert_rpm_wakelock_held(uncore->rpm); \
 	spin_lock_irqsave(&uncore->lock, irqflags); \
-	unclaimed_reg_debug(uncore, reg, false, true)
+	unclaimed_reg_debug = unclaimed_reg_debug_header(uncore, reg, false)
 
 #define GEN6_WRITE_FOOTER \
-	unclaimed_reg_debug(uncore, reg, false, false); \
+	if (unclaimed_reg_debug) \
+		unclaimed_reg_debug_footer(uncore, reg, false); \
 	spin_unlock_irqrestore(&uncore->lock, irqflags)
 
 #define __gen6_write(x) \
@@ -2406,13 +2361,9 @@ static void fw_domain_fini(struct intel_uncore *uncore,
 	if (!d)
 		return;
 
-	uncore->fw_domains &= ~d->mask;
-
-	/* Sanitize and disable the domain */
-	smp_store_mb(d->active, false);
-	hrtimer_cancel(&d->timer);
-	fw_domain_put(d);
-
+	uncore->fw_domains &= ~BIT(domain_id);
+	drm_WARN_ON(&uncore->i915->drm, d->wake_count);
+	drm_WARN_ON(&uncore->i915->drm, hrtimer_cancel(&d->timer));
 	kfree(d);
 }
 
@@ -2617,7 +2568,7 @@ static int i915_pmic_bus_access_notifier(struct notifier_block *nb,
 
 static void uncore_unmap_mmio(struct drm_device *drm, void *regs)
 {
-	iounmap(regs);
+	iounmap((void __iomem *)regs);
 }
 
 int intel_uncore_setup_mmio(struct intel_uncore *uncore, phys_addr_t phys_addr)
@@ -2648,7 +2599,8 @@ int intel_uncore_setup_mmio(struct intel_uncore *uncore, phys_addr_t phys_addr)
 		return -EIO;
 	}
 
-	return drmm_add_action_or_reset(&i915->drm, uncore_unmap_mmio, uncore->regs);
+	return drmm_add_action_or_reset(&i915->drm, uncore_unmap_mmio,
+					(void __force *)uncore->regs);
 }
 
 void intel_uncore_init_early(struct intel_uncore *uncore,
@@ -2670,12 +2622,12 @@ static void uncore_raw_init(struct intel_uncore *uncore)
 	if (intel_vgpu_active(uncore->i915)) {
 		ASSIGN_RAW_WRITE_MMIO_VFUNCS(uncore, vgpu);
 		ASSIGN_RAW_READ_MMIO_VFUNCS(uncore, vgpu);
-	} else if (GRAPHICS_VER(uncore->i915) == 5) {
-		ASSIGN_RAW_WRITE_MMIO_VFUNCS(uncore, gen5);
-		ASSIGN_RAW_READ_MMIO_VFUNCS(uncore, gen5);
 	} else if (IS_SRIOV_VF(uncore->i915)) {
 		ASSIGN_RAW_WRITE_MMIO_VFUNCS(uncore, gen2);
 		ASSIGN_RAW_READ_MMIO_VFUNCS(uncore, vf);
+	} else if (GRAPHICS_VER(uncore->i915) == 5) {
+		ASSIGN_RAW_WRITE_MMIO_VFUNCS(uncore, gen5);
+		ASSIGN_RAW_READ_MMIO_VFUNCS(uncore, gen5);
 	} else {
 		ASSIGN_RAW_WRITE_MMIO_VFUNCS(uncore, gen2);
 		ASSIGN_RAW_READ_MMIO_VFUNCS(uncore, gen2);
@@ -2769,7 +2721,7 @@ static int sanity_check_mmio_access(struct intel_uncore *uncore)
 {
 	struct drm_i915_private *i915 = uncore->i915;
 
-	if (IS_SRIOV_VF(uncore->i915))
+	if (IS_SRIOV_VF(i915))
 		return 0;
 
 	if (GRAPHICS_VER(i915) < 8)
@@ -2798,46 +2750,6 @@ static int sanity_check_mmio_access(struct intel_uncore *uncore)
 	return 0;
 }
 
-static bool __lmem_is_init(struct intel_uncore *uncore)
-{
-	return __raw_uncore_read32(uncore, GU_CNTL) & LMEM_INIT;
-}
-
-int intel_uncore_wait_for_lmem(struct intel_uncore *uncore)
-{
-	struct drm_i915_private *i915 = uncore->i915;
-	unsigned long timeout, start;
-
-	if (!IS_DGFX(i915) || IS_SRIOV_VF(i915))
-		return 0;
-
-	if (__lmem_is_init(uncore))
-		return 0;
-
-	drm_info(&i915->drm, "Waiting for local memory initialisation...\n");
-
-	start = jiffies;
-	timeout = start + msecs_to_jiffies(60 * 1000); /* 60s! */
-	do { /* Wait until the user gives up, we have nothing better to do */
-		if (signal_pending(current))
-			return -EINTR;
-
-		/*
-		 * During the boot phase though, there may be no user. In which
-		 * case we have to impose a timeout.
-		 */
-		if (time_after(jiffies, timeout))
-			return -ETIME;
-
-		msleep(10);
-	} while (!__lmem_is_init(uncore));
-
-	drm_dbg(&i915->drm, "Waited %ums for lmem initialisation\n",
-		jiffies_to_msecs(jiffies - start));
-
-	return 0;
-}
-
 int intel_uncore_init_mmio(struct intel_uncore *uncore)
 {
 	struct drm_i915_private *i915 = uncore->i915;
@@ -2847,9 +2759,19 @@ int intel_uncore_init_mmio(struct intel_uncore *uncore)
 	if (ret)
 		return ret;
 
-	if (GRAPHICS_VER(i915) > 5 &&
-	    !IS_SRIOV_VF(i915) &&
-	    !intel_vgpu_active(i915))
+	/*
+	 * The boot firmware initializes local memory and assesses its health.
+	 * If memory training fails, the punit will have been instructed to
+	 * keep the GT powered down; we won't be able to communicate with it
+	 * and we should not continue with driver initialization.
+	 */
+	if (IS_DGFX(i915) &&
+	    !(__raw_uncore_read32(uncore, GU_CNTL) & LMEM_INIT)) {
+		drm_err(&i915->drm, "LMEM not initialized by firmware\n");
+		return -ENODEV;
+	}
+
+	if (!IS_SRIOV_VF(i915) && !intel_vgpu_active(i915) && GRAPHICS_VER(i915))
 		uncore->flags |= UNCORE_HAS_FORCEWAKE;
 
 	if (!intel_uncore_has_forcewake(uncore)) {
@@ -2871,7 +2793,7 @@ int intel_uncore_init_mmio(struct intel_uncore *uncore)
 	if (IS_VALLEYVIEW(i915) || IS_CHERRYVIEW(i915))
 		uncore->flags |= UNCORE_HAS_DBG_UNCLAIMED;
 
-	if (IS_GRAPHICS_VER(i915, 6, 7))
+	if (!IS_SRIOV_VF(i915) && IS_GRAPHICS_VER(i915, 6, 7))
 		uncore->flags |= UNCORE_HAS_FIFO;
 
 	/* clear out unclaimed reg detection bit */
@@ -2931,6 +2853,82 @@ void intel_uncore_prune_engine_fw_domains(struct intel_uncore *uncore,
 		if (fw_domains & BIT(domain_id))
 			fw_domain_fini(uncore, domain_id);
 	}
+
+	if ((fw_domains & BIT(FW_DOMAIN_ID_GSC)) && !HAS_ENGINE(gt, GSC0))
+		fw_domain_fini(uncore, FW_DOMAIN_ID_GSC);
+}
+
+/*
+ * The driver-initiated FLR is the highest level of reset that we can trigger
+ * from within the driver. It is different from the PCI FLR in that it doesn't
+ * fully reset the SGUnit and doesn't modify the PCI config space and therefore
+ * it doesn't require a re-enumeration of the PCI BARs. However, the
+ * driver-initiated FLR does still cause a reset of both GT and display and a
+ * memory wipe of local and stolen memory, so recovery would require a full HW
+ * re-init and saving/restoring (or re-populating) the wiped memory. Since we
+ * perform the FLR as the very last action before releasing access to the HW
+ * during the driver release flow, we don't attempt recovery at all, because
+ * if/when a new instance of i915 is bound to the device it will do a full
+ * re-init anyway.
+ */
+static void driver_initiated_flr(struct intel_uncore *uncore)
+{
+	struct drm_i915_private *i915 = uncore->i915;
+	const unsigned int flr_timeout_ms = 3000; /* specs recommend a 3s wait */
+	int ret;
+
+	drm_dbg(&i915->drm, "Triggering Driver-FLR\n");
+
+	/*
+	 * Make sure any pending FLR requests have cleared by waiting for the
+	 * FLR trigger bit to go to zero. Also clear GU_DEBUG's DRIVERFLR_STATUS
+	 * to make sure it's not still set from a prior attempt (it's a write to
+	 * clear bit).
+	 * Note that we should never be in a situation where a previous attempt
+	 * is still pending (unless the HW is totally dead), but better to be
+	 * safe in case something unexpected happens
+	 */
+	ret = intel_wait_for_register_fw(uncore, GU_CNTL, DRIVERFLR, 0, flr_timeout_ms);
+	if (ret) {
+		drm_err(&i915->drm,
+			"Failed to wait for Driver-FLR bit to clear! %d\n",
+			ret);
+		goto flr_failure;
+	}
+	intel_uncore_write_fw(uncore, GU_DEBUG, DRIVERFLR_STATUS);
+
+	/* Trigger the actual Driver-FLR */
+	intel_uncore_rmw_fw(uncore, GU_CNTL, 0, DRIVERFLR);
+
+	/* Wait for hardware teardown to complete */
+	ret = intel_wait_for_register_fw(uncore, GU_CNTL,
+					 DRIVERFLR, 0,
+					 flr_timeout_ms);
+	if (ret) {
+		drm_err(&i915->drm, "Driver-FLR-teardown wait completion failed! %d\n", ret);
+		goto flr_failure;
+	}
+
+	/* Wait for hardware/firmware re-init to complete */
+	ret = intel_wait_for_register_fw(uncore, GU_DEBUG,
+					 DRIVERFLR_STATUS, DRIVERFLR_STATUS,
+					 flr_timeout_ms);
+	if (ret) {
+		drm_err(&i915->drm, "Driver-FLR-reinit wait completion failed! %d\n", ret);
+		goto flr_failure;
+	}
+
+	/* Clear sticky completion status */
+	intel_uncore_write_fw(uncore, GU_DEBUG, DRIVERFLR_STATUS);
+
+	return;
+
+flr_failure:
+	/*
+	 * The FLR is the biggest hammer we have to reset and re-init the GPU,
+	 * so it that fails it means that we've hit an unrecoverable condition.
+	 */
+	add_taint_for_CI(i915, TAINT_WARN);
 }
 
 /* Called via drm-managed action */
@@ -2946,6 +2944,9 @@ void intel_uncore_fini_mmio(struct drm_device *dev, void *data)
 		intel_uncore_fw_domains_fini(uncore);
 		iosf_mbi_punit_release();
 	}
+
+	if (intel_uncore_needs_flr_on_fini(uncore))
+		driver_initiated_flr(uncore);
 }
 
 /**
@@ -2990,9 +2991,6 @@ int __intel_wait_for_register_fw(struct intel_uncore *uncore,
 	might_sleep_if(slow_timeout_ms);
 	GEM_BUG_ON(fast_timeout_us > 20000);
 	GEM_BUG_ON(!fast_timeout_us && !slow_timeout_ms);
-
-	if (uncore->i915->quiesce_gpu || i915_is_pci_faulted(uncore->i915))
-		return 0;
 
 	ret = -ETIMEDOUT;
 	if (fast_timeout_us && fast_timeout_us <= 20000)

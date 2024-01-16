@@ -3,6 +3,8 @@
  * Copyright © 2023 Intel Corporation
  */
 
+#include <linux/log2.h>
+#include <linux/math64.h>
 #include "i915_reg.h"
 #include "intel_cx0_phy.h"
 #include "intel_cx0_phy_regs.h"
@@ -29,7 +31,7 @@
 
 bool intel_is_c10phy(struct drm_i915_private *i915, enum phy phy)
 {
-	if (IS_METEORLAKE(i915) && (phy < PHY_C))
+	if (DISPLAY_VER_FULL(i915) == IP_VER(14, 0) && phy < PHY_C)
 		return true;
 
 	return false;
@@ -44,6 +46,22 @@ static int lane_mask_to_lane(u8 lane_mask)
 	return ilog2(lane_mask);
 }
 
+static u8 intel_cx0_get_owned_lane_mask(struct drm_i915_private *i915,
+					struct intel_encoder *encoder)
+{
+	struct intel_digital_port *dig_port = enc_to_dig_port(encoder);
+
+	if (!intel_tc_port_in_dp_alt_mode(dig_port))
+		return INTEL_CX0_BOTH_LANES;
+
+	/*
+	 * In DP-alt with pin assignment D, only PHY lane 0 is owned
+	 * by display and lane 1 is owned by USB.
+	 */
+	return intel_tc_port_max_lane_count(dig_port) > 2
+		? INTEL_CX0_BOTH_LANES : INTEL_CX0_LANE0;
+}
+
 static void
 assert_dc_off(struct drm_i915_private *i915)
 {
@@ -53,19 +71,38 @@ assert_dc_off(struct drm_i915_private *i915)
 	drm_WARN_ON(&i915->drm, !enabled);
 }
 
+static void intel_cx0_program_msgbus_timer(struct intel_encoder *encoder)
+{
+	int lane;
+	struct drm_i915_private *i915 = to_i915(encoder->base.dev);
+
+	for_each_cx0_lane_in_mask(INTEL_CX0_BOTH_LANES, lane)
+		intel_de_rmw(i915,
+			     XELPDP_PORT_MSGBUS_TIMER(encoder->port, lane),
+			     XELPDP_PORT_MSGBUS_TIMER_VAL_MASK,
+			     XELPDP_PORT_MSGBUS_TIMER_VAL);
+}
+
 /*
  * Prepare HW for CX0 phy transactions.
  *
  * It is required that PSR and DC5/6 are disabled before any CX0 message
  * bus transaction is executed.
+ *
+ * We also do the msgbus timer programming here to ensure that the timer
+ * is already programmed before any access to the msgbus.
  */
 static intel_wakeref_t intel_cx0_phy_transaction_begin(struct intel_encoder *encoder)
 {
+	intel_wakeref_t wakeref;
 	struct drm_i915_private *i915 = to_i915(encoder->base.dev);
 	struct intel_dp *intel_dp = enc_to_intel_dp(encoder);
 
 	intel_psr_pause(intel_dp);
-	return intel_display_power_get(i915, POWER_DOMAIN_DC_OFF);
+	wakeref = intel_display_power_get(i915, POWER_DOMAIN_DC_OFF);
+	intel_cx0_program_msgbus_timer(encoder);
+
+	return wakeref;
 }
 
 static void intel_cx0_phy_transaction_end(struct intel_encoder *encoder, intel_wakeref_t wakeref)
@@ -114,6 +151,14 @@ static int intel_cx0_wait_for_ack(struct drm_i915_private *i915, enum port port,
 					 XELPDP_MSGBUS_TIMEOUT_SLOW, val)) {
 		drm_dbg_kms(&i915->drm, "PHY %c Timeout waiting for message ACK. Status: 0x%x\n",
 			    phy_name(phy), *val);
+
+		if (!(intel_de_read(i915, XELPDP_PORT_MSGBUS_TIMER(port, lane)) &
+		      XELPDP_PORT_MSGBUS_TIMER_TIMED_OUT))
+			drm_dbg_kms(&i915->drm,
+				    "PHY %c Hardware did not detect a timeout\n",
+				    phy_name(phy));
+
+		intel_cx0_bus_reset(i915, port, lane);
 		return -ETIMEDOUT;
 	}
 
@@ -156,10 +201,8 @@ static int __intel_cx0_read_once(struct drm_i915_private *i915, enum port port,
 		       XELPDP_PORT_M2P_ADDRESS(addr));
 
 	ack = intel_cx0_wait_for_ack(i915, port, XELPDP_PORT_P2M_COMMAND_READ_ACK, lane, &val);
-	if (ack < 0) {
-		intel_cx0_bus_reset(i915, port, lane);
+	if (ack < 0)
 		return ack;
-	}
 
 	intel_clear_response_ready_flag(i915, port, lane);
 
@@ -200,6 +243,7 @@ static int __intel_cx0_write_once(struct drm_i915_private *i915, enum port port,
 				  int lane, u16 addr, u8 data, bool committed)
 {
 	enum phy phy = intel_port_to_phy(i915, port);
+	int ack;
 	u32 val;
 
 	if (intel_de_wait_for_clear(i915, XELPDP_PORT_M2P_MSGBUS_CTL(port, lane),
@@ -228,10 +272,9 @@ static int __intel_cx0_write_once(struct drm_i915_private *i915, enum port port,
 	}
 
 	if (committed) {
-		if (intel_cx0_wait_for_ack(i915, port, XELPDP_PORT_P2M_COMMAND_WRITE_ACK, lane, &val) < 0) {
-			intel_cx0_bus_reset(i915, port, lane);
-			return -EINVAL;
-		}
+		ack = intel_cx0_wait_for_ack(i915, port, XELPDP_PORT_P2M_COMMAND_WRITE_ACK, lane, &val);
+		if (ack < 0)
+			return ack;
 	} else if ((intel_de_read(i915, XELPDP_PORT_P2M_MSGBUS_STATUS(port, lane)) &
 		    XELPDP_PORT_P2M_ERROR_SET)) {
 		drm_dbg_kms(&i915->drm,
@@ -289,18 +332,18 @@ static void intel_c20_sram_write(struct drm_i915_private *i915, enum port port,
 static u16 intel_c20_sram_read(struct drm_i915_private *i915, enum port port,
 			       int lane, u16 addr)
 {
-       u16 val;
+	u16 val;
 
-       assert_dc_off(i915);
+	assert_dc_off(i915);
 
-       intel_cx0_write(i915, port, lane, PHY_C20_RD_ADDRESS_H, addr >> 8, 0);
-       intel_cx0_write(i915, port, lane, PHY_C20_RD_ADDRESS_L, addr & 0xff, 1);
+	intel_cx0_write(i915, port, lane, PHY_C20_RD_ADDRESS_H, addr >> 8, 0);
+	intel_cx0_write(i915, port, lane, PHY_C20_RD_ADDRESS_L, addr & 0xff, 1);
 
-       val = intel_cx0_read(i915, port, lane, PHY_C20_RD_DATA_H);
-       val <<= 8;
-       val |= intel_cx0_read(i915, port, lane, PHY_C20_RD_DATA_L);
+	val = intel_cx0_read(i915, port, lane, PHY_C20_RD_DATA_H);
+	val <<= 8;
+	val |= intel_cx0_read(i915, port, lane, PHY_C20_RD_DATA_L);
 
-        return val;
+	return val;
 }
 
 static void __intel_cx0_rmw(struct drm_i915_private *i915, enum port port,
@@ -358,6 +401,7 @@ void intel_cx0_phy_set_signal_levels(struct intel_encoder *encoder,
 	struct drm_i915_private *i915 = to_i915(encoder->base.dev);
 	const struct intel_ddi_buf_trans *trans;
 	enum phy phy = intel_port_to_phy(i915, encoder->port);
+	u8 owned_lane_mask = intel_cx0_get_owned_lane_mask(i915, encoder);
 	intel_wakeref_t wakeref;
 	int n_entries, ln;
 
@@ -370,13 +414,13 @@ void intel_cx0_phy_set_signal_levels(struct intel_encoder *encoder,
 	}
 
 	if (intel_is_c10phy(i915, phy)) {
-		intel_cx0_rmw(i915, encoder->port, INTEL_CX0_BOTH_LANES, PHY_C10_VDR_CONTROL(1),
+		intel_cx0_rmw(i915, encoder->port, owned_lane_mask, PHY_C10_VDR_CONTROL(1),
 			      0, C10_VDR_CTRL_MSGBUS_ACCESS, MB_WRITE_COMMITTED);
-		intel_cx0_rmw(i915, encoder->port, INTEL_CX0_BOTH_LANES, PHY_C10_VDR_CMN(3),
+		intel_cx0_rmw(i915, encoder->port, owned_lane_mask, PHY_C10_VDR_CMN(3),
 			      C10_CMN3_TXVBOOST_MASK,
 			      C10_CMN3_TXVBOOST(intel_c10_get_tx_vboost_lvl(crtc_state)),
 			      MB_WRITE_UNCOMMITTED);
-		intel_cx0_rmw(i915, encoder->port, INTEL_CX0_BOTH_LANES, PHY_C10_VDR_TX(1),
+		intel_cx0_rmw(i915, encoder->port, owned_lane_mask, PHY_C10_VDR_TX(1),
 			      C10_TX1_TERMCTL_MASK,
 			      C10_TX1_TERMCTL(intel_c10_get_tx_term_ctl(crtc_state)),
 			      MB_WRITE_COMMITTED);
@@ -384,32 +428,34 @@ void intel_cx0_phy_set_signal_levels(struct intel_encoder *encoder,
 
 	for (ln = 0; ln < crtc_state->lane_count; ln++) {
 		int level = intel_ddi_level(encoder, crtc_state, ln);
-		int lane, tx;
+		int lane = ln / 2;
+		int tx = ln % 2;
+		u8 lane_mask = lane == 0 ? INTEL_CX0_LANE0 : INTEL_CX0_LANE1;
 
-		lane = ln / 2;
-		tx = ln % 2;
+		if (!(lane_mask & owned_lane_mask))
+			continue;
 
-		intel_cx0_rmw(i915, encoder->port, BIT(lane), PHY_CX0_VDROVRD_CTL(lane, tx, 0),
+		intel_cx0_rmw(i915, encoder->port, lane_mask, PHY_CX0_VDROVRD_CTL(lane, tx, 0),
 			      C10_PHY_OVRD_LEVEL_MASK,
 			      C10_PHY_OVRD_LEVEL(trans->entries[level].snps.pre_cursor),
 			      MB_WRITE_COMMITTED);
-		intel_cx0_rmw(i915, encoder->port, BIT(lane), PHY_CX0_VDROVRD_CTL(lane, tx, 1),
+		intel_cx0_rmw(i915, encoder->port, lane_mask, PHY_CX0_VDROVRD_CTL(lane, tx, 1),
 			      C10_PHY_OVRD_LEVEL_MASK,
 			      C10_PHY_OVRD_LEVEL(trans->entries[level].snps.vswing),
 			      MB_WRITE_COMMITTED);
-		intel_cx0_rmw(i915, encoder->port, BIT(lane), PHY_CX0_VDROVRD_CTL(lane, tx, 2),
+		intel_cx0_rmw(i915, encoder->port, lane_mask, PHY_CX0_VDROVRD_CTL(lane, tx, 2),
 			      C10_PHY_OVRD_LEVEL_MASK,
 			      C10_PHY_OVRD_LEVEL(trans->entries[level].snps.post_cursor),
 			      MB_WRITE_COMMITTED);
 	}
 
 	/* Write Override enables in 0xD71 */
-	intel_cx0_rmw(i915, encoder->port, INTEL_CX0_BOTH_LANES, PHY_C10_VDR_OVRD,
+	intel_cx0_rmw(i915, encoder->port, owned_lane_mask, PHY_C10_VDR_OVRD,
 		      0, PHY_C10_VDR_OVRD_TX1 | PHY_C10_VDR_OVRD_TX2,
 		      MB_WRITE_COMMITTED);
 
 	if (intel_is_c10phy(i915, phy))
-		intel_cx0_rmw(i915, encoder->port, INTEL_CX0_BOTH_LANES, PHY_C10_VDR_CONTROL(1),
+		intel_cx0_rmw(i915, encoder->port, owned_lane_mask, PHY_C10_VDR_CONTROL(1),
 			      0, C10_VDR_CTRL_UPDATE_CFG, MB_WRITE_COMMITTED);
 
 	intel_cx0_phy_transaction_end(encoder, wakeref);
@@ -720,7 +766,7 @@ static const struct intel_c20pll_state mtl_c20_dp_hbr1 = {
 		0x2110,		/* mpllb cfg1 */
 		0xcc9c,		/* mpllb cfg2 */
 		0xbfc1,		/* mpllb cfg3 */
-		0x489a,         /* mpllb cfg4 */
+		0x4b9a,         /* mpllb cfg4 */
 		0x3f81,         /* mpllb cfg5 */
 		0x2000,		/* mpllb cfg6 */
 		0x0001,		/* mpllb cfg7 */
@@ -746,7 +792,7 @@ static const struct intel_c20pll_state mtl_c20_dp_hbr2 = {
 		0x2108,		/* mpllb cfg1 */
 		0xcc9c,		/* mpllb cfg2 */
 		0xbfc1,		/* mpllb cfg3 */
-		0x489a,         /* mpllb cfg4 */
+		0x4b9a,         /* mpllb cfg4 */
 		0x3f81,         /* mpllb cfg5 */
 		0x2000,		/* mpllb cfg6 */
 		0x0001,		/* mpllb cfg7 */
@@ -799,12 +845,12 @@ static const struct intel_c20pll_state mtl_c20_dp_uhbr10 = {
 		0xd105,		/* mplla cfg1 */
 		0xc025,		/* mplla cfg2 */
 		0xc025,		/* mplla cfg3 */
-		0xa6ab,		/* mplla cfg4 */
-		0x8c00,		/* mplla cfg5 */
+		0x8c00,		/* mplla cfg4 */
+		0x759a,		/* mplla cfg5 */
 		0x4000,		/* mplla cfg6 */
 		0x0003,		/* mplla cfg7 */
 		0x3555,		/* mplla cfg8 */
-		0x0000,		/* mplla cfg9 */
+		0x0001,		/* mplla cfg9 */
 		},
 };
 
@@ -855,19 +901,19 @@ static const struct intel_c20pll_state mtl_c20_dp_uhbr20 = {
 		0x4000,		/* mplla cfg6 */
 		0x0003,		/* mplla cfg7 */
 		0x3555,		/* mplla cfg8 */
-		0x0002,		/* mplla cfg9 */
+		0x0001,		/* mplla cfg9 */
 		},
 };
 
 static const struct intel_c20pll_state * const mtl_c20_dp_tables[] = {
-        &mtl_c20_dp_rbr,
-        &mtl_c20_dp_hbr1,
-        &mtl_c20_dp_hbr2,
-        &mtl_c20_dp_hbr3,
+	&mtl_c20_dp_rbr,
+	&mtl_c20_dp_hbr1,
+	&mtl_c20_dp_hbr2,
+	&mtl_c20_dp_hbr3,
 	&mtl_c20_dp_uhbr10,
 	&mtl_c20_dp_uhbr13_5,
 	&mtl_c20_dp_uhbr20,
-        NULL,
+	NULL,
 };
 
 /*
@@ -1928,17 +1974,89 @@ void intel_c10pll_dump_hw_state(struct drm_i915_private *i915,
 			    i + 2, hw_state->pll[i + 2], i + 3, hw_state->pll[i + 3]);
 }
 
+static int intel_c20_compute_hdmi_tmds_pll(u64 pixel_clock, struct intel_c20pll_state *pll_state)
+{
+	u64 datarate;
+	u64 mpll_tx_clk_div;
+	u64 vco_freq_shift;
+	u64 vco_freq;
+	u64 multiplier;
+	u64 mpll_multiplier;
+	u64 mpll_fracn_quot;
+	u64 mpll_fracn_rem;
+	u8  mpllb_ana_freq_vco;
+	u8  mpll_div_multiplier;
+
+	if (pixel_clock < 25175 || pixel_clock > 600000)
+		return -EINVAL;
+
+	datarate = ((u64)pixel_clock * 1000) * 10;
+	mpll_tx_clk_div = ilog2(div64_u64((u64)CLOCK_9999MHZ, (u64)datarate));
+	vco_freq_shift = ilog2(div64_u64((u64)CLOCK_4999MHZ * (u64)256, (u64)datarate));
+	vco_freq = (datarate << vco_freq_shift) >> 8;
+	multiplier = div64_u64((vco_freq << 28), (REFCLK_38_4_MHZ >> 4));
+	mpll_multiplier = 2 * (multiplier >> 32);
+
+	mpll_fracn_quot = (multiplier >> 16) & 0xFFFF;
+	mpll_fracn_rem  = multiplier & 0xFFFF;
+
+	mpll_div_multiplier = min_t(u8, div64_u64((vco_freq * 16 + (datarate >> 1)),
+						  datarate), 255);
+
+	if (vco_freq <= DATARATE_3000000000)
+		mpllb_ana_freq_vco = MPLLB_ANA_FREQ_VCO_3;
+	else if (vco_freq <= DATARATE_3500000000)
+		mpllb_ana_freq_vco = MPLLB_ANA_FREQ_VCO_2;
+	else if (vco_freq <= DATARATE_4000000000)
+		mpllb_ana_freq_vco = MPLLB_ANA_FREQ_VCO_1;
+	else
+		mpllb_ana_freq_vco = MPLLB_ANA_FREQ_VCO_0;
+
+	pll_state->link_bit_rate	= pixel_clock;
+	pll_state->clock	= pixel_clock;
+	pll_state->tx[0]	= 0xbe88;
+	pll_state->tx[1]	= 0x9800;
+	pll_state->tx[2]	= 0x0000;
+	pll_state->cmn[0]	= 0x0500;
+	pll_state->cmn[1]	= 0x0005;
+	pll_state->cmn[2]	= 0x0000;
+	pll_state->cmn[3]	= 0x0000;
+	pll_state->mpllb[0]	= (MPLL_TX_CLK_DIV(mpll_tx_clk_div) |
+				   MPLL_MULTIPLIER(mpll_multiplier));
+	pll_state->mpllb[1]	= (CAL_DAC_CODE(CAL_DAC_CODE_31) |
+				   WORD_CLK_DIV |
+				   MPLL_DIV_MULTIPLIER(mpll_div_multiplier));
+	pll_state->mpllb[2]	= (MPLLB_ANA_FREQ_VCO(mpllb_ana_freq_vco) |
+				   CP_PROP(CP_PROP_20) |
+				   CP_INT(CP_INT_6));
+	pll_state->mpllb[3]	= (V2I(V2I_2) |
+				   CP_PROP_GS(CP_PROP_GS_30) |
+				   CP_INT_GS(CP_INT_GS_28));
+	pll_state->mpllb[4]	= 0x0000;
+	pll_state->mpllb[5]	= 0x0000;
+	pll_state->mpllb[6]	= (C20_MPLLB_FRACEN | SSC_UP_SPREAD);
+	pll_state->mpllb[7]	= MPLL_FRACN_DEN;
+	pll_state->mpllb[8]	= mpll_fracn_quot;
+	pll_state->mpllb[9]	= mpll_fracn_rem;
+	pll_state->mpllb[10]	= HDMI_DIV(HDMI_DIV_1);
+
+	return 0;
+}
+
 static int intel_c20_phy_check_hdmi_link_rate(int clock)
 {
-        const struct intel_c20pll_state * const *tables = mtl_c20_hdmi_tables;
-        int i;
+	const struct intel_c20pll_state * const *tables = mtl_c20_hdmi_tables;
+	int i;
 
-        for (i = 0; tables[i]; i++) {
-                if (clock == tables[i]->link_bit_rate)
-                        return MODE_OK;
-        }
+	for (i = 0; tables[i]; i++) {
+		if (clock == tables[i]->link_bit_rate)
+			return MODE_OK;
+	}
 
-        return MODE_CLOCK_RANGE;
+	if (clock >= 25175 && clock <= 594000)
+		return MODE_OK;
+
+	return MODE_CLOCK_RANGE;
 }
 
 int intel_cx0_phy_check_hdmi_link_rate(struct intel_hdmi *hdmi, int clock)
@@ -1956,11 +2074,10 @@ static const struct intel_c20pll_state * const *
 intel_c20_pll_tables_get(struct intel_crtc_state *crtc_state,
 			 struct intel_encoder *encoder)
 {
-	if (intel_crtc_has_dp_encoder(crtc_state)) {
+	if (intel_crtc_has_dp_encoder(crtc_state))
 		return mtl_c20_dp_tables;
-	} else if (intel_crtc_has_type(crtc_state, INTEL_OUTPUT_HDMI)) {
+	else if (intel_crtc_has_type(crtc_state, INTEL_OUTPUT_HDMI))
 		return mtl_c20_hdmi_tables;
-	}
 
 	MISSING_CASE(encoder->type);
 	return NULL;
@@ -1971,6 +2088,13 @@ static int intel_c20pll_calc_state(struct intel_crtc_state *crtc_state,
 {
 	const struct intel_c20pll_state * const *tables;
 	int i;
+
+	/* try computed C20 HDMI tables before using consolidated tables */
+	if (intel_crtc_has_type(crtc_state, INTEL_OUTPUT_HDMI)) {
+		if (intel_c20_compute_hdmi_tmds_pll(crtc_state->port_clock,
+						    &crtc_state->cx0pll_state.c20) == 0)
+			return 0;
+	}
 
 	tables = intel_c20_pll_tables_get(crtc_state, encoder);
 	if (!tables)
@@ -1987,7 +2111,7 @@ static int intel_c20pll_calc_state(struct intel_crtc_state *crtc_state,
 }
 
 int intel_cx0pll_calc_state(struct intel_crtc_state *crtc_state,
-			 struct intel_encoder *encoder)
+			    struct intel_encoder *encoder)
 {
 	struct drm_i915_private *i915 = to_i915(encoder->base.dev);
 	enum phy phy = intel_port_to_phy(i915, encoder->port);
@@ -2010,12 +2134,14 @@ void intel_c20pll_readout_hw_state(struct intel_encoder *encoder,
 				   struct intel_c20pll_state *pll_state)
 {
 	struct drm_i915_private *i915 = to_i915(encoder->base.dev);
-	bool cntx, use_mpllb;
-	u32 val;
+	bool cntx;
+	intel_wakeref_t wakeref;
 	int i;
 
-        /* 1. Read current context selection */
-        cntx = intel_cx0_read(i915, encoder->port, INTEL_CX0_LANE0, PHY_C20_VDR_CUSTOM_SERDES_RATE) & PHY_C20_CONTEXT_TOGGLE;
+	wakeref = intel_cx0_phy_transaction_begin(encoder);
+
+	/* 1. Read current context selection */
+	cntx = intel_cx0_read(i915, encoder->port, INTEL_CX0_LANE0, PHY_C20_VDR_CUSTOM_SERDES_RATE) & PHY_C20_CONTEXT_TOGGLE;
 
 	/* Read Tx configuration */
 	for (i = 0; i < ARRAY_SIZE(pll_state->tx); i++) {
@@ -2037,20 +2163,7 @@ void intel_c20pll_readout_hw_state(struct intel_encoder *encoder,
 								PHY_C20_A_CMN_CNTX_CFG(i));
 	}
 
-	val = intel_c20_sram_read(i915, encoder->port, INTEL_CX0_LANE0, PHY_C20_A_MPLLA_CNTX_CFG(6));
-	use_mpllb = val & C20_MPLLB_FRACEN;
-
-	if (use_mpllb) {
-		/* MPLLA configuration */
-		for (i = 0; i < ARRAY_SIZE(pll_state->mplla); i++) {
-			if (cntx)
-				pll_state->mplla[i] = intel_c20_sram_read(i915, encoder->port, INTEL_CX0_LANE0,
-									  PHY_C20_B_MPLLA_CNTX_CFG(i));
-			else
-				pll_state->mplla[i] = intel_c20_sram_read(i915, encoder->port, INTEL_CX0_LANE0,
-									  PHY_C20_A_MPLLA_CNTX_CFG(i));
-		}
-	} else {
+	if (pll_state->tx[0] & C20_PHY_USE_MPLLB) {
 		/* MPLLB configuration */
 		for (i = 0; i < ARRAY_SIZE(pll_state->mpllb); i++) {
 			if (cntx)
@@ -2060,7 +2173,19 @@ void intel_c20pll_readout_hw_state(struct intel_encoder *encoder,
 				pll_state->mpllb[i] = intel_c20_sram_read(i915, encoder->port, INTEL_CX0_LANE0,
 									  PHY_C20_A_MPLLB_CNTX_CFG(i));
 		}
+	} else {
+		/* MPLLA configuration */
+		for (i = 0; i < ARRAY_SIZE(pll_state->mplla); i++) {
+			if (cntx)
+				pll_state->mplla[i] = intel_c20_sram_read(i915, encoder->port, INTEL_CX0_LANE0,
+									  PHY_C20_B_MPLLA_CNTX_CFG(i));
+			else
+				pll_state->mplla[i] = intel_c20_sram_read(i915, encoder->port, INTEL_CX0_LANE0,
+									  PHY_C20_A_MPLLA_CNTX_CFG(i));
+		}
 	}
+
+	intel_cx0_phy_transaction_end(encoder, wakeref);
 }
 
 void intel_c20pll_dump_hw_state(struct drm_i915_private *i915,
@@ -2108,6 +2233,10 @@ static u8 intel_c20_get_dp_rate(u32 clock)
 		return 9;
 	case 625000: /* 20 Gbps DP2.0*/
 		return 10;
+	case 648000: /* 6.48 Gbps eDP*/
+		return 11;
+	case 675000: /* 6.75 Gbps eDP*/
+		return 12;
 	default:
 		MISSING_CASE(clock);
 		return 0;
@@ -2116,13 +2245,10 @@ static u8 intel_c20_get_dp_rate(u32 clock)
 
 static u8 intel_c20_get_hdmi_rate(u32 clock)
 {
-	switch (clock) {
-	case 25175:
-	case 27000:
-	case 74250:
-	case 148500:
-	case 594000:
+	if (clock >= 25175 && clock <= 600000)
 		return 0;
+
+	switch (clock) {
 	case 166670: /* 3 Gbps */
 	case 333330: /* 6 Gbps */
 	case 666670: /* 12 Gbps */
@@ -2169,13 +2295,23 @@ static bool intel_c20_protocol_switch_valid(struct intel_encoder *encoder)
 	return intel_tc_port_in_legacy_mode(intel_dig_port);
 }
 
+static int intel_get_c20_custom_width(u32 clock, bool dp)
+{
+	if (dp && is_dp2(clock))
+		return 2;
+	else if (is_hdmi_frl(clock))
+		return 1;
+	else
+		return 0;
+}
+
 static void intel_c20_pll_program(struct drm_i915_private *i915,
 				  const struct intel_crtc_state *crtc_state,
 				  struct intel_encoder *encoder)
 {
 	const struct intel_c20pll_state *pll_state = &crtc_state->cx0pll_state.c20;
 	bool dp = false;
-	int lane_count = crtc_state->lane_count;
+	int lane = crtc_state->lane_count > 2 ? INTEL_CX0_BOTH_LANES : INTEL_CX0_LANE0;
 	bool cntx;
 	int i;
 
@@ -2183,22 +2319,22 @@ static void intel_c20_pll_program(struct drm_i915_private *i915,
 		dp = true;
 
 	/* 1. Read current context selection */
-	cntx = intel_cx0_read(i915, encoder->port, INTEL_CX0_LANE0, PHY_C20_VDR_CUSTOM_SERDES_RATE) &
-		PHY_C20_CONTEXT_TOGGLE;
+	cntx = intel_cx0_read(i915, encoder->port, INTEL_CX0_LANE0, PHY_C20_VDR_CUSTOM_SERDES_RATE) & BIT(0);
 
-	/* 2. If there is a protocol switch from HDMI to DP or vice versa, clear
+	/*
+	 * 2. If there is a protocol switch from HDMI to DP or vice versa, clear
 	 * the lane #0 MPLLB CAL_DONE_BANK DP2.0 10G and 20G rates enable MPLLA.
 	 * Protocol switch is only applicable for MPLLA
 	 */
 	if (intel_c20_protocol_switch_valid(encoder)) {
 		for (i = 0; i < 4; i++)
 			intel_c20_sram_write(i915, encoder->port, INTEL_CX0_LANE0, RAWLANEAONX_DIG_TX_MPLLB_CAL_DONE_BANK(i), 0);
-		msleep(4);
+		usleep_range(4000, 4100);
 	}
 
 	/* 3. Write SRAM configuration context. If A in use, write configuration to B context */
 	/* 3.1 Tx configuration */
-	for (i = 0; i < 3; i++) {
+	for (i = 0; i < ARRAY_SIZE(pll_state->tx); i++) {
 		if (cntx)
 			intel_c20_sram_write(i915, encoder->port, INTEL_CX0_LANE0, PHY_C20_A_TX_CNTX_CFG(i), pll_state->tx[i]);
 		else
@@ -2206,7 +2342,7 @@ static void intel_c20_pll_program(struct drm_i915_private *i915,
 	}
 
 	/* 3.2 common configuration */
-	for (i = 0; i < 4; i++) {
+	for (i = 0; i < ARRAY_SIZE(pll_state->cmn); i++) {
 		if (cntx)
 			intel_c20_sram_write(i915, encoder->port, INTEL_CX0_LANE0, PHY_C20_A_CMN_CNTX_CFG(i), pll_state->cmn[i]);
 		else
@@ -2215,7 +2351,7 @@ static void intel_c20_pll_program(struct drm_i915_private *i915,
 
 	/* 3.3 mpllb or mplla configuration */
 	if (intel_c20_use_mplla(pll_state->clock)) {
-		for (i = 0; i < 10; i++) {
+		for (i = 0; i < ARRAY_SIZE(pll_state->mplla); i++) {
 			if (cntx)
 				intel_c20_sram_write(i915, encoder->port, INTEL_CX0_LANE0,
 						     PHY_C20_A_MPLLA_CNTX_CFG(i),
@@ -2226,7 +2362,7 @@ static void intel_c20_pll_program(struct drm_i915_private *i915,
 						     pll_state->mplla[i]);
 		}
 	} else {
-		for (i = 0; i < 11; i++) {
+		for (i = 0; i < ARRAY_SIZE(pll_state->mpllb); i++) {
 			if (cntx)
 				intel_c20_sram_write(i915, encoder->port, INTEL_CX0_LANE0,
 						     PHY_C20_A_MPLLB_CNTX_CFG(i),
@@ -2239,39 +2375,21 @@ static void intel_c20_pll_program(struct drm_i915_private *i915,
 	}
 
 	/* 4. Program custom width to match the link protocol */
-	if (dp) {
-		intel_cx0_write(i915, encoder->port, INTEL_CX0_LANE0, PHY_C20_VDR_CUSTOM_WIDTH,
-				is_dp2(pll_state->clock) ? 2 : 0,
-				MB_WRITE_COMMITTED);
-		if (lane_count == 4)
-			intel_cx0_write(i915, encoder->port, INTEL_CX0_LANE1, PHY_C20_VDR_CUSTOM_WIDTH,
-					is_dp2(pll_state->clock) ? 2 : 0,
-					MB_WRITE_COMMITTED);
-	} else if (is_hdmi_frl(pll_state->clock)) {
-		intel_cx0_write(i915, encoder->port, INTEL_CX0_LANE0, PHY_C20_VDR_CUSTOM_WIDTH,
-				1, MB_WRITE_COMMITTED);
-		if (lane_count == 4)
-			intel_cx0_write(i915, encoder->port, INTEL_CX0_LANE1,
-					PHY_C20_VDR_CUSTOM_WIDTH, 1, MB_WRITE_COMMITTED);
-	} else
-		intel_cx0_write(i915, encoder->port, INTEL_CX0_BOTH_LANES, PHY_C20_VDR_CUSTOM_WIDTH,
-				0, MB_WRITE_COMMITTED);
+	intel_cx0_rmw(i915, encoder->port, lane, PHY_C20_VDR_CUSTOM_WIDTH,
+		      PHY_C20_CUSTOM_WIDTH_MASK,
+		      PHY_C20_CUSTOM_WIDTH(intel_get_c20_custom_width(pll_state->clock, dp)),
+		      MB_WRITE_COMMITTED);
 
 	/* 5. For DP or 6. For HDMI */
 	if (dp) {
-		intel_cx0_rmw(i915, encoder->port, INTEL_CX0_LANE0, PHY_C20_VDR_CUSTOM_SERDES_RATE,
+		intel_cx0_rmw(i915, encoder->port, lane, PHY_C20_VDR_CUSTOM_SERDES_RATE,
 			      BIT(6) | PHY_C20_CUSTOM_SERDES_MASK,
 			      BIT(6) | PHY_C20_CUSTOM_SERDES(intel_c20_get_dp_rate(pll_state->clock)),
 			      MB_WRITE_COMMITTED);
-		if (lane_count == 4)
-			intel_cx0_rmw(i915, encoder->port, INTEL_CX0_LANE1, PHY_C20_VDR_CUSTOM_SERDES_RATE,
-				      BIT(6) | PHY_C20_CUSTOM_SERDES_MASK,
-				      BIT(6) | PHY_C20_CUSTOM_SERDES(intel_c20_get_dp_rate(pll_state->clock)),
-				      MB_WRITE_COMMITTED);
 	} else {
-		intel_cx0_rmw(i915, encoder->port, INTEL_CX0_BOTH_LANES, PHY_C20_VDR_CUSTOM_SERDES_RATE,
-			      PHY_C20_IS_FRL,
-			      is_hdmi_frl(pll_state->clock) ? 1 : 0,
+		intel_cx0_rmw(i915, encoder->port, lane, PHY_C20_VDR_CUSTOM_SERDES_RATE,
+			      BIT(7) | PHY_C20_CUSTOM_SERDES_MASK,
+			      is_hdmi_frl(pll_state->clock) ? BIT(7) : 0,
 			      MB_WRITE_COMMITTED);
 
 		intel_cx0_write(i915, encoder->port, INTEL_CX0_BOTH_LANES, PHY_C20_VDR_HDMI_RATE,
@@ -2283,11 +2401,8 @@ static void intel_c20_pll_program(struct drm_i915_private *i915,
 	 * 7. Write Vendor specific registers to toggle context setting to load
 	 * the updated programming toggle context bit
 	 */
-	intel_cx0_rmw(i915, encoder->port, INTEL_CX0_LANE0, PHY_C20_VDR_CUSTOM_SERDES_RATE,
-		      PHY_C20_CONTEXT_TOGGLE, cntx ? 0 : 1, MB_WRITE_COMMITTED);
-	if (lane_count == 4)
-		intel_cx0_rmw(i915, encoder->port, INTEL_CX0_LANE1, PHY_C20_VDR_CUSTOM_SERDES_RATE,
-			      PHY_C20_CONTEXT_TOGGLE, cntx ? 0 : 1, MB_WRITE_COMMITTED);
+	intel_cx0_rmw(i915, encoder->port, lane, PHY_C20_VDR_CUSTOM_SERDES_RATE,
+		      BIT(0), cntx ? 0 : 1, MB_WRITE_COMMITTED);
 }
 
 int intel_c10pll_calc_port_clock(struct intel_encoder *encoder,
@@ -2318,7 +2433,7 @@ int intel_c10pll_calc_port_clock(struct intel_encoder *encoder,
 }
 
 int intel_c20pll_calc_port_clock(struct intel_encoder *encoder,
-                                 const struct intel_c20pll_state *pll_state)
+				 const struct intel_c20pll_state *pll_state)
 {
 	unsigned int frac, frac_en, frac_quot, frac_rem, frac_den;
 	unsigned int multiplier, refclk = 38400;
@@ -2391,7 +2506,8 @@ static void intel_program_port_clock_ctl(struct intel_encoder *encoder,
 
 	intel_de_rmw(i915, XELPDP_PORT_CLOCK_CTL(encoder->port),
 		     XELPDP_LANE1_PHY_CLOCK_SELECT | XELPDP_FORWARD_CLOCK_UNGATE |
-		     XELPDP_DDI_CLOCK_SELECT_MASK | XELPDP_SSC_ENABLE_PLLB, val);
+		     XELPDP_DDI_CLOCK_SELECT_MASK | XELPDP_SSC_ENABLE_PLLA |
+		     XELPDP_SSC_ENABLE_PLLB, val);
 }
 
 static u32 intel_cx0_get_powerdown_update(u8 lane_mask)
@@ -2484,13 +2600,21 @@ static u32 intel_cx0_get_pclk_refclk_ack(u8 lane_mask)
 	return val;
 }
 
-/* FIXME: Some Type-C cases need not reset both the lanes. Handle those cases. */
-static void intel_cx0_phy_lane_reset(struct drm_i915_private *i915, enum port port,
+static void intel_cx0_phy_lane_reset(struct drm_i915_private *i915,
+				     struct intel_encoder *encoder,
 				     bool lane_reversal)
 {
+	enum port port = encoder->port;
 	enum phy phy = intel_port_to_phy(i915, port);
-	u8 lane_mask = lane_reversal ? INTEL_CX0_LANE1 :
-				  INTEL_CX0_LANE0;
+	u8 owned_lane_mask = intel_cx0_get_owned_lane_mask(i915, encoder);
+	u8 lane_mask = lane_reversal ? INTEL_CX0_LANE1 : INTEL_CX0_LANE0;
+	u32 lane_pipe_reset = owned_lane_mask == INTEL_CX0_BOTH_LANES
+				? XELPDP_LANE_PIPE_RESET(0) | XELPDP_LANE_PIPE_RESET(1)
+				: XELPDP_LANE_PIPE_RESET(0);
+	u32 lane_phy_current_status = owned_lane_mask == INTEL_CX0_BOTH_LANES
+					? (XELPDP_LANE_PHY_CURRENT_STATUS(0) |
+					   XELPDP_LANE_PHY_CURRENT_STATUS(1))
+					: XELPDP_LANE_PHY_CURRENT_STATUS(0);
 
 	if (__intel_de_wait_for_register(i915, XELPDP_PORT_BUF_CTL1(port),
 					 XELPDP_PORT_BUF_SOC_PHY_READY,
@@ -2501,23 +2625,20 @@ static void intel_cx0_phy_lane_reset(struct drm_i915_private *i915, enum port po
 
 	intel_de_rmw(i915, XELPDP_PORT_BUF_CTL2(port),
 		     XELPDP_LANE_PIPE_RESET(0) | XELPDP_LANE_PIPE_RESET(1),
-		     XELPDP_LANE_PIPE_RESET(0) | XELPDP_LANE_PIPE_RESET(1));
+		     lane_pipe_reset);
 
 	if (__intel_de_wait_for_register(i915, XELPDP_PORT_BUF_CTL2(port),
-					 XELPDP_LANE_PHY_CURRENT_STATUS(0) |
-					 XELPDP_LANE_PHY_CURRENT_STATUS(1),
-					 XELPDP_LANE_PHY_CURRENT_STATUS(0) |
-					 XELPDP_LANE_PHY_CURRENT_STATUS(1),
+					 lane_phy_current_status, lane_phy_current_status,
 					 XELPDP_PORT_RESET_START_TIMEOUT_US, 0, NULL))
 		drm_warn(&i915->drm, "PHY %c failed to bring out of Lane reset after %dus.\n",
 			 phy_name(phy), XELPDP_PORT_RESET_START_TIMEOUT_US);
 
 	intel_de_rmw(i915, XELPDP_PORT_CLOCK_CTL(port),
-		     intel_cx0_get_pclk_refclk_request(INTEL_CX0_BOTH_LANES),
+		     intel_cx0_get_pclk_refclk_request(owned_lane_mask),
 		     intel_cx0_get_pclk_refclk_request(lane_mask));
 
 	if (__intel_de_wait_for_register(i915, XELPDP_PORT_CLOCK_CTL(port),
-					 intel_cx0_get_pclk_refclk_ack(INTEL_CX0_BOTH_LANES),
+					 intel_cx0_get_pclk_refclk_ack(owned_lane_mask),
 					 intel_cx0_get_pclk_refclk_ack(lane_mask),
 					 XELPDP_REFCLK_ENABLE_TIMEOUT_US, 0, NULL))
 		drm_warn(&i915->drm, "PHY %c failed to request refclk after %dus.\n",
@@ -2527,13 +2648,9 @@ static void intel_cx0_phy_lane_reset(struct drm_i915_private *i915, enum port po
 					    CX0_P2_STATE_RESET);
 	intel_cx0_setup_powerdown(i915, port);
 
-	intel_de_rmw(i915, XELPDP_PORT_BUF_CTL2(port),
-		     XELPDP_LANE_PIPE_RESET(0) | XELPDP_LANE_PIPE_RESET(1),
-		     0);
+	intel_de_rmw(i915, XELPDP_PORT_BUF_CTL2(port), lane_pipe_reset, 0);
 
-	if (intel_de_wait_for_clear(i915, XELPDP_PORT_BUF_CTL2(port),
-				    XELPDP_LANE_PHY_CURRENT_STATUS(0) |
-				    XELPDP_LANE_PHY_CURRENT_STATUS(1),
+	if (intel_de_wait_for_clear(i915, XELPDP_PORT_BUF_CTL2(port), lane_phy_current_status,
 				    XELPDP_PORT_RESET_END_TIMEOUT))
 		drm_warn(&i915->drm, "PHY %c failed to bring out of Lane reset after %dms.\n",
 			 phy_name(phy), XELPDP_PORT_RESET_END_TIMEOUT);
@@ -2543,79 +2660,43 @@ static void intel_cx0_program_phy_lane(struct drm_i915_private *i915,
 				       struct intel_encoder *encoder, int lane_count,
 				       bool lane_reversal)
 {
-	u8 l0t1, l0t2, l1t1, l1t2;
+	int i;
+	u8 disables;
 	bool dp_alt_mode = intel_tc_port_in_dp_alt_mode(enc_to_dig_port(encoder));
+	u8 owned_lane_mask = intel_cx0_get_owned_lane_mask(i915, encoder);
 	enum port port = encoder->port;
 
 	if (intel_is_c10phy(i915, intel_port_to_phy(i915, port)))
-		intel_cx0_rmw(i915, port, INTEL_CX0_BOTH_LANES,
+		intel_cx0_rmw(i915, port, owned_lane_mask,
 			      PHY_C10_VDR_CONTROL(1), 0,
 			      C10_VDR_CTRL_MSGBUS_ACCESS,
 			      MB_WRITE_COMMITTED);
 
-	/* TODO: DP-alt MFD case where only one PHY lane should be programmed. */
-	l0t1 = intel_cx0_read(i915, port, INTEL_CX0_LANE0, PHY_CX0_TX_CONTROL(1, 2));
-	l0t2 = intel_cx0_read(i915, port, INTEL_CX0_LANE0, PHY_CX0_TX_CONTROL(2, 2));
-	l1t1 = intel_cx0_read(i915, port, INTEL_CX0_LANE1, PHY_CX0_TX_CONTROL(1, 2));
-	l1t2 = intel_cx0_read(i915, port, INTEL_CX0_LANE1, PHY_CX0_TX_CONTROL(2, 2));
+	if (lane_reversal)
+		disables = REG_GENMASK8(3, 0) >> lane_count;
+	else
+		disables = REG_GENMASK8(3, 0) << lane_count;
 
-	l0t1 |= CONTROL2_DISABLE_SINGLE_TX;
-	l0t2 |= CONTROL2_DISABLE_SINGLE_TX;
-	l1t1 |= CONTROL2_DISABLE_SINGLE_TX;
-	l1t2 |= CONTROL2_DISABLE_SINGLE_TX;
-
-	if (lane_reversal) {
-		switch (lane_count) {
-		case 4:
-			l0t1 &= ~CONTROL2_DISABLE_SINGLE_TX;
-			fallthrough;
-		case 3:
-			l0t2 &= ~CONTROL2_DISABLE_SINGLE_TX;
-			fallthrough;
-		case 2:
-			l1t1 &= ~CONTROL2_DISABLE_SINGLE_TX;
-			fallthrough;
-		case 1:
-			l1t2 &= ~CONTROL2_DISABLE_SINGLE_TX;
-			break;
-		default:
-			MISSING_CASE(lane_count);
-		}
-	} else {
-		switch (lane_count) {
-		case 4:
-			l1t2 &= ~CONTROL2_DISABLE_SINGLE_TX;
-			fallthrough;
-		case 3:
-			l1t1 &= ~CONTROL2_DISABLE_SINGLE_TX;
-			fallthrough;
-		case 2:
-			l0t2 &= ~CONTROL2_DISABLE_SINGLE_TX;
-			l0t1 &= ~CONTROL2_DISABLE_SINGLE_TX;
-			break;
-		case 1:
-			if (dp_alt_mode)
-				l0t2 &= ~CONTROL2_DISABLE_SINGLE_TX;
-			else
-				l0t1 &= ~CONTROL2_DISABLE_SINGLE_TX;
-			break;
-		default:
-			MISSING_CASE(lane_count);
-		}
+	if (dp_alt_mode && lane_count == 1) {
+		disables &= ~REG_GENMASK8(1, 0);
+		disables |= REG_FIELD_PREP8(REG_GENMASK8(1, 0), 0x1);
 	}
 
-	/* disable MLs */
-	intel_cx0_write(i915, port, INTEL_CX0_LANE0, PHY_CX0_TX_CONTROL(1, 2),
-			l0t1, MB_WRITE_COMMITTED);
-	intel_cx0_write(i915, port, INTEL_CX0_LANE0, PHY_CX0_TX_CONTROL(2, 2),
-			l0t2, MB_WRITE_COMMITTED);
-	intel_cx0_write(i915, port, INTEL_CX0_LANE1, PHY_CX0_TX_CONTROL(1, 2),
-			l1t1, MB_WRITE_COMMITTED);
-	intel_cx0_write(i915, port, INTEL_CX0_LANE1, PHY_CX0_TX_CONTROL(2, 2),
-			l1t2, MB_WRITE_COMMITTED);
+	for (i = 0; i < 4; i++) {
+		int tx = i % 2 + 1;
+		u8 lane_mask = i < 2 ? INTEL_CX0_LANE0 : INTEL_CX0_LANE1;
+
+		if (!(owned_lane_mask & lane_mask))
+			continue;
+
+		intel_cx0_rmw(i915, port, lane_mask, PHY_CX0_TX_CONTROL(tx, 2),
+			      CONTROL2_DISABLE_SINGLE_TX,
+			      disables & BIT(i) ? CONTROL2_DISABLE_SINGLE_TX : 0,
+			      MB_WRITE_COMMITTED);
+	}
 
 	if (intel_is_c10phy(i915, intel_port_to_phy(i915, port)))
-		intel_cx0_rmw(i915, port, INTEL_CX0_BOTH_LANES,
+		intel_cx0_rmw(i915, port, owned_lane_mask,
 			      PHY_C10_VDR_CONTROL(1), 0,
 			      C10_VDR_CTRL_UPDATE_CFG,
 			      MB_WRITE_COMMITTED);
@@ -2661,7 +2742,7 @@ static void intel_cx0pll_enable(struct intel_encoder *encoder,
 	intel_program_port_clock_ctl(encoder, crtc_state, lane_reversal);
 
 	/* 2. Bring PHY out of reset. */
-	intel_cx0_phy_lane_reset(i915, encoder->port, lane_reversal);
+	intel_cx0_phy_lane_reset(i915, encoder, lane_reversal);
 
 	/*
 	 * 3. Change Phy power state to Ready.
@@ -2670,39 +2751,45 @@ static void intel_cx0pll_enable(struct intel_encoder *encoder,
 	intel_cx0_powerdown_change_sequence(i915, encoder->port, INTEL_CX0_BOTH_LANES,
 					    CX0_P2_STATE_READY);
 
-	/* 4. Program PHY internal PLL internal registers. */
+	/*
+	 * 4. Program PORT_MSGBUS_TIMER register's Message Bus Timer field to 0xA000.
+	 *    (This is done inside intel_cx0_phy_transaction_begin(), since we would need
+	 *    the right timer thresholds for readouts too.)
+	 */
+
+	/* 5. Program PHY internal PLL internal registers. */
 	if (intel_is_c10phy(i915, phy))
 		intel_c10_pll_program(i915, crtc_state, encoder);
 	else
 		intel_c20_pll_program(i915, crtc_state, encoder);
 
 	/*
-	 * 5. Program the enabled and disabled owned PHY lane
+	 * 6. Program the enabled and disabled owned PHY lane
 	 * transmitters over message bus
 	 */
 	intel_cx0_program_phy_lane(i915, encoder, crtc_state->lane_count, lane_reversal);
 
 	/*
-	 * 6. Follow the Display Voltage Frequency Switching - Sequence
+	 * 7. Follow the Display Voltage Frequency Switching - Sequence
 	 * Before Frequency Change. We handle this step in bxt_set_cdclk().
 	 */
 
 	/*
-	 * 7. Program DDI_CLK_VALFREQ to match intended DDI
+	 * 8. Program DDI_CLK_VALFREQ to match intended DDI
 	 * clock frequency.
 	 */
 	intel_de_write(i915, DDI_CLK_VALFREQ(encoder->port),
 		       crtc_state->port_clock);
 
 	/*
-	 * 8. Set PORT_CLOCK_CTL register PCLK PLL Request
+	 * 9. Set PORT_CLOCK_CTL register PCLK PLL Request
 	 * LN<Lane for maxPCLK> to "1" to enable PLL.
 	 */
 	intel_de_rmw(i915, XELPDP_PORT_CLOCK_CTL(encoder->port),
 		     intel_cx0_get_pclk_pll_request(INTEL_CX0_BOTH_LANES),
 		     intel_cx0_get_pclk_pll_request(maxpclk_lane));
 
-	/* 9. Poll on PORT_CLOCK_CTL PCLK PLL Ack LN<Lane for maxPCLK> == "1". */
+	/* 10. Poll on PORT_CLOCK_CTL PCLK PLL Ack LN<Lane for maxPCLK> == "1". */
 	if (__intel_de_wait_for_register(i915, XELPDP_PORT_CLOCK_CTL(encoder->port),
 					 intel_cx0_get_pclk_pll_ack(INTEL_CX0_BOTH_LANES),
 					 intel_cx0_get_pclk_pll_ack(maxpclk_lane),
@@ -2711,7 +2798,7 @@ static void intel_cx0pll_enable(struct intel_encoder *encoder,
 			 phy_name(phy), XELPDP_PCLK_PLL_ENABLE_TIMEOUT_US);
 
 	/*
-	 * 10. Follow the Display Voltage Frequency Switching Sequence After
+	 * 11. Follow the Display Voltage Frequency Switching Sequence After
 	 * Frequency Change. We handle this step in bxt_set_cdclk().
 	 */
 
@@ -2743,7 +2830,7 @@ int intel_mtl_tbt_calc_port_clock(struct intel_encoder *encoder)
 	default:
 		MISSING_CASE(clock);
 		return 162000;
-       }
+	}
 }
 
 static int intel_mtl_tbt_clock_select(struct drm_i915_private *i915, int clock)
@@ -2760,7 +2847,7 @@ static int intel_mtl_tbt_clock_select(struct drm_i915_private *i915, int clock)
 	default:
 		MISSING_CASE(clock);
 		return XELPDP_DDI_CLOCK_SELECT_TBT_162;
-       }
+	}
 }
 
 static void intel_mtl_tbt_pll_enable(struct intel_encoder *encoder,
@@ -2794,10 +2881,10 @@ static void intel_mtl_tbt_pll_enable(struct intel_encoder *encoder,
 	intel_de_write(i915, XELPDP_PORT_CLOCK_CTL(encoder->port), val);
 
 	/* 5. Poll on PORT_CLOCK_CTL TBT CLOCK Ack == "1". */
-	if (__intel_wait_for_register(&i915->uncore, XELPDP_PORT_CLOCK_CTL(encoder->port),
-				      XELPDP_TBT_CLOCK_ACK,
-				      XELPDP_TBT_CLOCK_ACK,
-				      100, 0, NULL))
+	if (__intel_de_wait_for_register(i915, XELPDP_PORT_CLOCK_CTL(encoder->port),
+					 XELPDP_TBT_CLOCK_ACK,
+					 XELPDP_TBT_CLOCK_ACK,
+					 100, 0, NULL))
 		drm_warn(&i915->drm, "[ENCODER:%d:%s][%c] PHY PLL not locked after 100us.\n",
 			 encoder->base.base.id, encoder->base.name, phy_name(phy));
 
@@ -2894,10 +2981,8 @@ static void intel_mtl_tbt_pll_disable(struct intel_encoder *encoder)
 		     XELPDP_TBT_CLOCK_REQUEST, 0);
 
 	/* 3. Poll on PORT_CLOCK_CTL TBT CLOCK Ack == "0". */
-	if (__intel_wait_for_register(&i915->uncore, XELPDP_PORT_CLOCK_CTL(encoder->port),
-				      XELPDP_TBT_CLOCK_ACK,
-				      ~XELPDP_TBT_CLOCK_ACK,
-				      10, 0, NULL))
+	if (__intel_de_wait_for_register(i915, XELPDP_PORT_CLOCK_CTL(encoder->port),
+					 XELPDP_TBT_CLOCK_ACK, 0, 10, 0, NULL))
 		drm_warn(&i915->drm, "[ENCODER:%d:%s][%c] PHY PLL not unlocked after 10us.\n",
 			 encoder->base.base.id, encoder->base.name, phy_name(phy));
 
@@ -2927,6 +3012,25 @@ void intel_mtl_pll_disable(struct intel_encoder *encoder)
 		intel_cx0pll_disable(encoder);
 }
 
+enum icl_port_dpll_id
+intel_mtl_port_pll_type(struct intel_encoder *encoder,
+			const struct intel_crtc_state *crtc_state)
+{
+	struct drm_i915_private *i915 = to_i915(encoder->base.dev);
+	/*
+	 * TODO: Determine the PLL type from the SW state, once MTL PLL
+	 * handling is done via the standard shared DPLL framework.
+	 */
+	u32 val = intel_de_read(i915, XELPDP_PORT_CLOCK_CTL(encoder->port));
+	u32 clock = REG_FIELD_GET(XELPDP_DDI_CLOCK_SELECT_MASK, val);
+
+	if (clock == XELPDP_DDI_CLOCK_SELECT_MAXPCLK ||
+	    clock == XELPDP_DDI_CLOCK_SELECT_DIV18CLK)
+		return ICL_PORT_DPLL_MG_PHY;
+	else
+		return ICL_PORT_DPLL_DEFAULT;
+}
+
 void intel_c10pll_state_verify(struct intel_atomic_state *state,
 			       struct intel_crtc_state *new_crtc_state)
 {
@@ -2944,6 +3048,11 @@ void intel_c10pll_state_verify(struct intel_atomic_state *state,
 	if (!new_crtc_state->hw.active)
 		return;
 
+	/* intel_get_crtc_new_encoder() only works for modeset/fastset commits */
+	if (!intel_crtc_needs_modeset(new_crtc_state) &&
+	    !intel_crtc_needs_fastset(new_crtc_state))
+		return;
+
 	encoder = intel_get_crtc_new_encoder(state, new_crtc_state);
 	phy = intel_port_to_phy(i915, encoder->port);
 
@@ -2955,18 +3064,18 @@ void intel_c10pll_state_verify(struct intel_atomic_state *state,
 	for (i = 0; i < ARRAY_SIZE(mpllb_sw_state->pll); i++) {
 		u8 expected = mpllb_sw_state->pll[i];
 
-		I915_STATE_WARN(mpllb_hw_state.pll[i] != expected,
+		I915_STATE_WARN(i915, mpllb_hw_state.pll[i] != expected,
 				"[CRTC:%d:%s] mismatch in C10MPLLB: Register[%d] (expected 0x%02x, found 0x%02x)",
-				crtc->base.base.id, crtc->base.name,
-				i, expected, mpllb_hw_state.pll[i]);
+				crtc->base.base.id, crtc->base.name, i,
+				expected, mpllb_hw_state.pll[i]);
 	}
 
-	I915_STATE_WARN(mpllb_hw_state.tx != mpllb_sw_state->tx,
+	I915_STATE_WARN(i915, mpllb_hw_state.tx != mpllb_sw_state->tx,
 			"[CRTC:%d:%s] mismatch in C10MPLLB: Register TX0 (expected 0x%02x, found 0x%02x)",
 			crtc->base.base.id, crtc->base.name,
 			mpllb_sw_state->tx, mpllb_hw_state.tx);
 
-	I915_STATE_WARN(mpllb_hw_state.cmn != mpllb_sw_state->cmn,
+	I915_STATE_WARN(i915, mpllb_hw_state.cmn != mpllb_sw_state->cmn,
 			"[CRTC:%d:%s] mismatch in C10MPLLB: Register CMN0 (expected 0x%02x, found 0x%02x)",
 			crtc->base.base.id, crtc->base.name,
 			mpllb_sw_state->cmn, mpllb_hw_state.cmn);

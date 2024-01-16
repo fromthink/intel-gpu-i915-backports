@@ -38,7 +38,7 @@
 
 #include <linux/types.h>
 
-#include "display/intel_display.h"
+#include "display/intel_display_limits.h"
 
 struct intel_vgpu;
 
@@ -159,7 +159,6 @@ struct intel_vgpu_pipe_format {
 	enum DDI_PORT ddi_port;  /* the DDI port that pipe is connected to */
 };
 
-#if IS_ENABLED(CPTCFG_DRM_I915_DISPLAY)
 struct intel_vgpu_fb_format {
 	struct intel_vgpu_pipe_format	pipes[I915_MAX_PIPES];
 };
@@ -170,13 +169,5 @@ int intel_vgpu_decode_cursor_plane(struct intel_vgpu *vgpu,
 	struct intel_vgpu_cursor_plane_format *plane);
 int intel_vgpu_decode_sprite_plane(struct intel_vgpu *vgpu,
 	struct intel_vgpu_sprite_plane_format *plane);
-#else
-static inline int intel_vgpu_decode_primary_plane(struct intel_vgpu *vgpu,
-		struct intel_vgpu_primary_plane_format *plane) { return 0; }
-static inline int intel_vgpu_decode_cursor_plane(struct intel_vgpu *vgpu,
-		struct intel_vgpu_cursor_plane_format *plane) { return 0; }
-static inline int intel_vgpu_decode_sprite_plane(struct intel_vgpu *vgpu,
-		struct intel_vgpu_sprite_plane_format *plane) { return 0; }
-#endif
 
 #endif

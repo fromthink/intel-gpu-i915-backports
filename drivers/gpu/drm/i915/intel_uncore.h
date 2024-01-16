@@ -153,6 +153,7 @@ struct intel_uncore {
 #define UNCORE_HAS_FPGA_DBG_UNCLAIMED	BIT(1)
 #define UNCORE_HAS_DBG_UNCLAIMED	BIT(2)
 #define UNCORE_HAS_FIFO			BIT(3)
+#define UNCORE_NEEDS_FLR_ON_FINI	BIT(4)
 
 	const struct intel_forcewake_range *fw_domains_table;
 	unsigned int fw_domains_table_entries;
@@ -223,11 +224,22 @@ intel_uncore_has_fifo(const struct intel_uncore *uncore)
 	return uncore->flags & UNCORE_HAS_FIFO;
 }
 
+static inline bool
+intel_uncore_needs_flr_on_fini(const struct intel_uncore *uncore)
+{
+	return uncore->flags & UNCORE_NEEDS_FLR_ON_FINI;
+}
+
+static inline bool
+intel_uncore_set_flr_on_fini(struct intel_uncore *uncore)
+{
+	return uncore->flags |= UNCORE_NEEDS_FLR_ON_FINI;
+}
+
 void intel_uncore_mmio_debug_init_early(struct drm_i915_private *i915);
 void intel_uncore_init_early(struct intel_uncore *uncore,
 			     struct intel_gt *gt);
 int intel_uncore_setup_mmio(struct intel_uncore *uncore, phys_addr_t phys_addr);
-int intel_uncore_wait_for_lmem(struct intel_uncore *uncore);
 int intel_uncore_init_mmio(struct intel_uncore *uncore);
 void intel_uncore_prune_engine_fw_domains(struct intel_uncore *uncore,
 					  struct intel_gt *gt);
@@ -247,9 +259,8 @@ const char *intel_uncore_forcewake_domain_to_str(const enum forcewake_domain_id 
 enum forcewake_domains
 intel_uncore_forcewake_for_reg(struct intel_uncore *uncore,
 			       i915_reg_t reg, unsigned int op);
-#define FW_REG_READ  BIT(0)
-#define FW_REG_WRITE BIT(1)
-#define FW_REG_WRITE_MULTICAST BIT(2)
+#define FW_REG_READ  (1)
+#define FW_REG_WRITE (2)
 
 void intel_uncore_forcewake_get(struct intel_uncore *uncore,
 				enum forcewake_domains domains);
@@ -384,20 +395,6 @@ __uncore_write(write_notrace, 32, l, false)
  */
 __uncore_read(read64, 64, q, true)
 
-static inline u64
-intel_uncore_read64_2x32(struct intel_uncore *uncore,
-			 i915_reg_t lower_reg, i915_reg_t upper_reg)
-{
-	u32 upper, lower, old_upper, loop = 0;
-	upper = intel_uncore_read(uncore, upper_reg);
-	do {
-		old_upper = upper;
-		lower = intel_uncore_read(uncore, lower_reg);
-		upper = intel_uncore_read(uncore, upper_reg);
-	} while (upper != old_upper && loop++ < 2);
-	return (u64)upper << 32 | lower;
-}
-
 #define intel_uncore_posting_read(...) ((void)intel_uncore_read_notrace(__VA_ARGS__))
 #define intel_uncore_posting_read16(...) ((void)intel_uncore_read16_notrace(__VA_ARGS__))
 
@@ -457,6 +454,36 @@ static inline void intel_uncore_rmw_fw(struct intel_uncore *uncore,
 		intel_uncore_write_fw(uncore, reg, val);
 }
 
+static inline u64
+intel_uncore_read64_2x32(struct intel_uncore *uncore,
+			 i915_reg_t lower_reg, i915_reg_t upper_reg)
+{
+	u32 upper, lower, old_upper, loop = 0;
+	enum forcewake_domains fw_domains;
+	unsigned long flags;
+
+	fw_domains = intel_uncore_forcewake_for_reg(uncore, lower_reg,
+						    FW_REG_READ);
+
+	fw_domains |= intel_uncore_forcewake_for_reg(uncore, upper_reg,
+						    FW_REG_READ);
+
+	spin_lock_irqsave(&uncore->lock, flags);
+	intel_uncore_forcewake_get__locked(uncore, fw_domains);
+
+	upper = intel_uncore_read_fw(uncore, upper_reg);
+	do {
+		old_upper = upper;
+		lower = intel_uncore_read_fw(uncore, lower_reg);
+		upper = intel_uncore_read_fw(uncore, upper_reg);
+	} while (upper != old_upper && loop++ < 2);
+
+	intel_uncore_forcewake_put__locked(uncore, fw_domains);
+	spin_unlock_irqrestore(&uncore->lock, flags);
+
+	return (u64)upper << 32 | lower;
+}
+
 static inline int intel_uncore_write_and_verify(struct intel_uncore *uncore,
 						i915_reg_t reg, u32 val,
 						u32 mask, u32 expected_val)
@@ -467,6 +494,11 @@ static inline int intel_uncore_write_and_verify(struct intel_uncore *uncore,
 	reg_val = intel_uncore_read(uncore, reg);
 
 	return (reg_val & mask) != expected_val ? -EINVAL : 0;
+}
+
+static inline void __iomem *intel_uncore_regs(struct intel_uncore *uncore)
+{
+	return uncore->regs;
 }
 
 /*

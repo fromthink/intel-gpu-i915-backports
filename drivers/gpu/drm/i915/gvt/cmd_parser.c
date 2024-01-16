@@ -37,6 +37,7 @@
 #include <linux/slab.h>
 
 #include "i915_drv.h"
+#include "i915_reg.h"
 #include "gt/intel_engine_regs.h"
 #include "gt/intel_gpu_commands.h"
 #include "gt/intel_gt_regs.h"
@@ -48,6 +49,7 @@
 #include "i915_pvinfo.h"
 #include "trace.h"
 
+#include "display/intel_display.h"
 #include "gem/i915_gem_context.h"
 #include "gem/i915_gem_pm.h"
 #include "gt/intel_context.h"
@@ -1011,7 +1013,7 @@ static int cmd_reg_handler(struct parser_exec_state *s,
 	if (GRAPHICS_VER(s->engine->i915) == 9 &&
 	    intel_gvt_mmio_is_sr_in_ctx(gvt, offset) &&
 	    !strncmp(cmd, "lri", 3)) {
-		intel_gvt_hypervisor_read_gpa(s->vgpu,
+		intel_gvt_read_gpa(s->vgpu,
 			s->workload->ring_context_gpa + 12, &ctx_sr_ctl, 4);
 		/* check inhibit context */
 		if (ctx_sr_ctl & 1) {
@@ -1146,7 +1148,7 @@ struct cmd_interrupt_event {
 	int mi_user_interrupt;
 };
 
-static struct cmd_interrupt_event cmd_interrupt_events[] = {
+static const struct cmd_interrupt_event cmd_interrupt_events[] = {
 	[RCS0] = {
 		.pipe_control_notify = RCS_PIPE_CONTROL,
 		.mi_flush_dw = INTEL_GVT_EVENT_RESERVED,
@@ -1775,7 +1777,7 @@ static int copy_gma_to_hva(struct intel_vgpu *vgpu, struct intel_vgpu_mm *mm,
 		copy_len = (end_gma - gma) >= (I915_GTT_PAGE_SIZE - offset) ?
 			I915_GTT_PAGE_SIZE - offset : end_gma - gma;
 
-		intel_gvt_hypervisor_read_gpa(vgpu, gpa, va + len, copy_len);
+		intel_gvt_read_gpa(vgpu, gpa, va + len, copy_len);
 
 		len += copy_len;
 		gma += copy_len;
@@ -2742,11 +2744,9 @@ static int cmd_parser_exec(struct parser_exec_state *s)
 
 	s->info = info;
 
-#ifndef BPM_DISABLE_TRACES
 	trace_gvt_command(vgpu->id, s->engine->id, s->ip_gma, s->ip_va,
 			  cmd_length(s), s->buf_type, s->buf_addr_type,
 			  s->workload, info->name);
-#endif
 
 	if ((info->flag & F_LEN_MASK) == F_LEN_VAR_FIXED) {
 		ret = gvt_check_valid_cmd_length(cmd_length(s),
@@ -2833,7 +2833,7 @@ static int command_scan(struct parser_exec_state *s,
 
 static int scan_workload(struct intel_vgpu_workload *workload)
 {
-	unsigned long gma_head, gma_tail, gma_bottom;
+	unsigned long gma_head, gma_tail;
 	struct parser_exec_state s;
 	int ret = 0;
 
@@ -2843,7 +2843,6 @@ static int scan_workload(struct intel_vgpu_workload *workload)
 
 	gma_head = workload->rb_start + workload->rb_head;
 	gma_tail = workload->rb_start + workload->rb_tail;
-	gma_bottom = workload->rb_start +  _RING_CTL_BUF_SIZE(workload->rb_ctl);
 
 	s.buf_type = RING_BUFFER_INSTRUCTION;
 	s.buf_addr_type = GTT_BUFFER;
@@ -2874,7 +2873,7 @@ out:
 static int scan_wa_ctx(struct intel_shadow_wa_ctx *wa_ctx)
 {
 
-	unsigned long gma_head, gma_tail, gma_bottom, ring_size, ring_tail;
+	unsigned long gma_head, gma_tail, ring_size, ring_tail;
 	struct parser_exec_state s;
 	int ret = 0;
 	struct intel_vgpu_workload *workload = container_of(wa_ctx,
@@ -2891,7 +2890,6 @@ static int scan_wa_ctx(struct intel_shadow_wa_ctx *wa_ctx)
 			PAGE_SIZE);
 	gma_head = wa_ctx->indirect_ctx.guest_gma;
 	gma_tail = wa_ctx->indirect_ctx.guest_gma + ring_tail;
-	gma_bottom = wa_ctx->indirect_ctx.guest_gma + ring_size;
 
 	s.buf_type = RING_BUFFER_INSTRUCTION;
 	s.buf_addr_type = GTT_BUFFER;
@@ -3019,16 +3017,23 @@ static int shadow_indirect_ctx(struct intel_shadow_wa_ctx *wa_ctx)
 		goto put_obj;
 	}
 
+	i915_gem_object_lock(obj, NULL);
+	ret = i915_gem_object_set_to_cpu_domain(obj, false);
+	i915_gem_object_unlock(obj);
+	if (ret) {
+		gvt_vgpu_err("failed to set shadow indirect ctx to CPU\n");
+		goto unmap_src;
+	}
+
 	ret = copy_gma_to_hva(workload->vgpu,
-			      workload->vgpu->gtt.ggtt_mm,
-			      guest_gma, guest_gma + ctx_size,
-			      map);
+				workload->vgpu->gtt.ggtt_mm,
+				guest_gma, guest_gma + ctx_size,
+				map);
 	if (ret < 0) {
 		gvt_vgpu_err("fail to copy guest indirect ctx\n");
 		goto unmap_src;
 	}
 
-	i915_gem_object_flush_map(obj);
 	wa_ctx->indirect_ctx.obj = obj;
 	wa_ctx->indirect_ctx.shadow_va = map;
 	return 0;

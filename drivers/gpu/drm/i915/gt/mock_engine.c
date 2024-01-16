@@ -17,7 +17,7 @@ static int mock_timeline_pin(struct intel_timeline *tl)
 {
 	int err;
 
-	if (WARN_ON(!i915_gem_object_trylock(tl->hwsp_ggtt->obj)))
+	if (WARN_ON(!i915_gem_object_trylock(tl->hwsp_ggtt->obj, NULL)))
 		return -EBUSY;
 
 	err = intel_timeline_pin_map(tl);
@@ -35,9 +35,31 @@ static void mock_timeline_unpin(struct intel_timeline *tl)
 	atomic_dec(&tl->pin_count);
 }
 
+static struct i915_vma *create_ring_vma(struct i915_ggtt *ggtt, int size)
+{
+	struct i915_address_space *vm = &ggtt->vm;
+	struct drm_i915_private *i915 = vm->i915;
+	struct drm_i915_gem_object *obj;
+	struct i915_vma *vma;
+
+	obj = i915_gem_object_create_internal(i915, size);
+	if (IS_ERR(obj))
+		return ERR_CAST(obj);
+
+	vma = i915_vma_instance(obj, vm, NULL);
+	if (IS_ERR(vma))
+		goto err;
+
+	return vma;
+
+err:
+	i915_gem_object_put(obj);
+	return vma;
+}
+
 static struct intel_ring *mock_ring(struct intel_engine_cs *engine)
 {
-	const unsigned long sz = PAGE_SIZE / 2;
+	const unsigned long sz = PAGE_SIZE;
 	struct intel_ring *ring;
 
 	ring = kzalloc(sizeof(*ring) + sz, GFP_KERNEL);
@@ -50,15 +72,11 @@ static struct intel_ring *mock_ring(struct intel_engine_cs *engine)
 	ring->vaddr = (void *)(ring + 1);
 	atomic_set(&ring->pin_count, 1);
 
-	ring->vma = i915_vma_alloc();
-	if (!ring->vma) {
+	ring->vma = create_ring_vma(engine->gt->ggtt, PAGE_SIZE);
+	if (IS_ERR(ring->vma)) {
 		kfree(ring);
 		return NULL;
 	}
-	i915_active_init(&ring->vma->active, NULL, NULL, 0);
-	__set_bit(I915_VMA_GGTT_BIT, __i915_vma_flags(ring->vma));
-	__set_bit(DRM_MM_NODE_ALLOCATED_BIT, &ring->vma->node.flags);
-	ring->vma->node.size = sz;
 
 	intel_ring_update_space(ring);
 
@@ -67,8 +85,7 @@ static struct intel_ring *mock_ring(struct intel_engine_cs *engine)
 
 static void mock_ring_free(struct intel_ring *ring)
 {
-	i915_active_fini(&ring->vma->active);
-	i915_vma_free(ring->vma);
+	i915_vma_put(ring->vma);
 
 	kfree(ring);
 }
@@ -125,6 +142,7 @@ static void mock_context_unpin(struct intel_context *ce)
 
 static void mock_context_post_unpin(struct intel_context *ce)
 {
+	i915_vma_unpin(ce->ring->vma);
 }
 
 static void mock_context_destroy(struct kref *ref)
@@ -163,14 +181,13 @@ static int mock_context_alloc(struct intel_context *ce)
 		return err;
 	}
 
-	__set_bit(CONTEXT_BARRIER_BIT, &ce->flags);
 	return 0;
 }
 
 static int mock_context_pre_pin(struct intel_context *ce,
 				struct i915_gem_ww_ctx *ww, void **unused)
 {
-	return 0;
+	return i915_vma_pin_ww(ce->ring->vma, ww, 0, 0, PIN_GLOBAL | PIN_HIGH);
 }
 
 static int mock_context_pin(struct intel_context *ce, void *unused)
@@ -236,6 +253,34 @@ static void mock_submit_request(struct i915_request *request)
 	spin_unlock_irqrestore(&engine->hw_lock, flags);
 }
 
+static void mock_add_to_engine(struct i915_request *rq)
+{
+	lockdep_assert_held(&rq->engine->sched_engine->lock);
+	list_move_tail(&rq->sched.link, &rq->engine->sched_engine->requests);
+}
+
+static void mock_remove_from_engine(struct i915_request *rq)
+{
+	struct intel_engine_cs *engine, *locked;
+
+	/*
+	 * Virtual engines complicate acquiring the engine timeline lock,
+	 * as their rq->engine pointer is not stable until under that
+	 * engine lock. The simple ploy we use is to take the lock then
+	 * check that the rq still belongs to the newly locked engine.
+	 */
+
+	locked = READ_ONCE(rq->engine);
+	spin_lock_irq(&locked->sched_engine->lock);
+	while (unlikely(locked != (engine = READ_ONCE(rq->engine)))) {
+		spin_unlock(&locked->sched_engine->lock);
+		spin_lock(&engine->sched_engine->lock);
+		locked = engine;
+	}
+	list_del_init(&rq->sched.link);
+	spin_unlock_irq(&locked->sched_engine->lock);
+}
+
 static void mock_reset_prepare(struct intel_engine_cs *engine)
 {
 }
@@ -287,6 +332,9 @@ static void mock_engine_release(struct intel_engine_cs *engine)
 	i915_sched_engine_put(engine->sched_engine);
 	intel_breadcrumbs_put(engine->breadcrumbs);
 
+	intel_context_unpin(engine->kernel_context);
+	intel_context_put(engine->kernel_context);
+
 	intel_engine_fini_retire(engine);
 }
 
@@ -319,6 +367,8 @@ struct intel_engine_cs *mock_engine(struct drm_i915_private *i915,
 	engine->base.emit_flush = mock_emit_flush;
 	engine->base.emit_fini_breadcrumb = mock_emit_breadcrumb;
 	engine->base.submit_request = mock_submit_request;
+	engine->base.add_active_request = mock_add_to_engine;
+	engine->base.remove_active_request = mock_remove_from_engine;
 
 	engine->base.reset.prepare = mock_reset_prepare;
 	engine->base.reset.rewind = mock_reset_rewind;
@@ -344,15 +394,13 @@ int mock_engine_init(struct intel_engine_cs *engine)
 {
 	struct intel_context *ce;
 
-	spin_lock_init(&engine->barrier_lock);
-	INIT_LIST_HEAD(&engine->barrier_tasks);
+	INIT_LIST_HEAD(&engine->pinned_contexts_list);
 
 	engine->sched_engine = i915_sched_engine_create(ENGINE_MOCK);
 	if (!engine->sched_engine)
 		return -ENOMEM;
-#ifndef BPM_TASKLET_STRUCT_CALLBACK_NOT_PRESENT
 	engine->sched_engine->private_data = engine;
-#endif
+
 	intel_engine_init_execlists(engine);
 	intel_engine_init__pm(engine);
 	intel_engine_init_retire(engine);
@@ -360,7 +408,6 @@ int mock_engine_init(struct intel_engine_cs *engine)
 	engine->breadcrumbs = intel_breadcrumbs_create(NULL);
 	if (!engine->breadcrumbs)
 		goto err_schedule;
-	engine->breadcrumbs->irq_enabled++;
 
 	ce = create_kernel_context(engine);
 	if (IS_ERR(ce))

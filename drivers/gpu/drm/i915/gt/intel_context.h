@@ -12,7 +12,6 @@
 
 #include "i915_active.h"
 #include "i915_drv.h"
-#include "i915_suspend_fence.h"
 #include "intel_context_types.h"
 #include "intel_engine_types.h"
 #include "intel_gt_pm.h"
@@ -27,13 +26,9 @@
 		     ##__VA_ARGS__);					\
 } while (0)
 
-struct i915_address_space;
-struct i915_gem_ww_ctx;
+#define INTEL_CONTEXT_BANNED_PREEMPT_TIMEOUT_MS (1)
 
-void intel_context_update_schedule_policy(struct intel_context *ce);
-void intel_context_init_schedule_policy(struct intel_context *ce);
-void intel_context_reset_preemption_timeout(struct intel_context *ce);
-void intel_context_disable_preemption_timeout(struct intel_context *ce);
+struct i915_gem_ww_ctx;
 
 void intel_context_init(struct intel_context *ce,
 			struct intel_engine_cs *engine);
@@ -51,8 +46,6 @@ void intel_context_free(struct intel_context *ce);
 
 int intel_context_reconfigure_sseu(struct intel_context *ce,
 				   const struct intel_sseu sseu);
-int intel_context_reconfigure_vm(struct intel_context *ce,
-				 struct i915_address_space *vm);
 
 #define PARENT_SCRATCH_SIZE	PAGE_SIZE
 
@@ -104,7 +97,7 @@ void intel_context_bind_parent_child(struct intel_context *parent,
 
 /**
  * intel_context_lock_pinned - Stablises the 'pinned' status of the HW context
- * @ce - the context
+ * @ce: the context
  *
  * Acquire a lock on the pinned status of the HW context, such that the context
  * can neither be bound to the GPU or unbound whilst the lock is held, i.e.
@@ -118,7 +111,7 @@ static inline int intel_context_lock_pinned(struct intel_context *ce)
 
 /**
  * intel_context_is_pinned - Reports the 'pinned' status
- * @ce - the context
+ * @ce: the context
  *
  * While in use by the GPU, the context, along with its ring and page
  * tables is pinned into memory and the GTT.
@@ -140,7 +133,7 @@ static inline void intel_context_cancel_request(struct intel_context *ce,
 
 /**
  * intel_context_unlock_pinned - Releases the earlier locking of 'pinned' status
- * @ce - the context
+ * @ce: the context
  *
  * Releases the lock earlier acquired by intel_context_unlock_pinned().
  */
@@ -212,11 +205,6 @@ static inline void intel_context_unpin(struct intel_context *ce)
 void intel_context_enter_engine(struct intel_context *ce);
 void intel_context_exit_engine(struct intel_context *ce);
 
-static inline bool intel_context_is_active(const struct intel_context *ce)
-{
-	return READ_ONCE(ce->active_count);
-}
-
 static inline void intel_context_enter(struct intel_context *ce)
 {
 	lockdep_assert_held(&ce->timeline->mutex);
@@ -224,12 +212,13 @@ static inline void intel_context_enter(struct intel_context *ce)
 		return;
 
 	ce->ops->enter(ce);
-	ce->wakeref = intel_gt_pm_get(ce->vm->gt);
+	intel_gt_pm_get(ce->vm->gt);
 }
 
 static inline void intel_context_mark_active(struct intel_context *ce)
 {
-	lockdep_assert_held(&ce->timeline->mutex);
+	lockdep_assert(lockdep_is_held(&ce->timeline->mutex) ||
+		       test_bit(CONTEXT_IS_PARKING, &ce->flags));
 	++ce->active_count;
 }
 
@@ -240,59 +229,14 @@ static inline void intel_context_exit(struct intel_context *ce)
 	if (--ce->active_count)
 		return;
 
-	if (ce->sfence) {
-		i915_suspend_fence_retire_dma_fence(&ce->sfence->base.rq.fence);
-		ce->sfence = NULL;
-	}
-
-	intel_gt_pm_put_async(ce->vm->gt, ce->wakeref);
+	intel_gt_pm_put_async(ce->vm->gt);
 	ce->ops->exit(ce);
-}
-
-int intel_context_throttle(const struct intel_context *ce, long timeout);
-
-static inline void intel_context_suspend_fence_set(struct intel_context *ce,
-						   struct dma_fence *fence)
-{
-	struct i915_suspend_fence *sfence =
-		container_of(fence, typeof(*sfence), base.rq.fence);
-
-	lockdep_assert_held(&ce->timeline->mutex);
-
-	GEM_BUG_ON(ce->sfence);
-	dma_fence_get(fence);
-	ce->sfence = sfence;
-}
-
-static inline void
-intel_context_suspend_fence_replace(struct intel_context *ce,
-				    struct dma_fence *fence)
-{
-	struct i915_suspend_fence *sfence =
-		container_of(fence, typeof(*sfence), base.rq.fence);
-	struct dma_fence *prev;
-
-	lockdep_assert_held(&ce->timeline->mutex);
-	GEM_BUG_ON(!ce->sfence);
-
-	prev = &ce->sfence->base.rq.fence;
-	dma_fence_get(fence);
-	ce->sfence = sfence;
-	dma_fence_put(prev);
 }
 
 static inline struct intel_context *intel_context_get(struct intel_context *ce)
 {
 	kref_get(&ce->ref);
 	return ce;
-}
-
-static inline struct intel_context *intel_context_get_rcu(struct intel_context *ce)
-{
-	if (kref_get_unless_zero(&ce->ref))
-		return ce;
-	else
-		return NULL;
 }
 
 static inline void intel_context_put(struct intel_context *ce)
@@ -307,7 +251,13 @@ intel_context_timeline_lock(struct intel_context *ce)
 	struct intel_timeline *tl = ce->timeline;
 	int err;
 
-	err = mutex_lock_interruptible(&tl->mutex);
+	if (intel_context_is_parent(ce))
+		err = mutex_lock_interruptible_nested(&tl->mutex, 0);
+	else if (intel_context_is_child(ce))
+		err = mutex_lock_interruptible_nested(&tl->mutex,
+						      ce->parallel.child_index + 1);
+	else
+		err = mutex_lock_interruptible(&tl->mutex);
 	if (err)
 		return ERR_PTR(err);
 
@@ -325,21 +275,7 @@ int intel_context_prepare_remote_request(struct intel_context *ce,
 
 struct i915_request *intel_context_create_request(struct intel_context *ce);
 
-struct i915_request *
-__intel_context_find_active_request(struct intel_context *ce,
-				    bool rq_get_ref);
-
-static inline struct i915_request *
-intel_context_find_active_request(struct intel_context *ce)
-{
-	return __intel_context_find_active_request(ce, false);
-}
-
-static inline struct i915_request *
-intel_context_get_active_request(struct intel_context *ce)
-{
-	return __intel_context_find_active_request(ce, true);
-}
+struct i915_request *intel_context_get_active_request(struct intel_context *ce);
 
 static inline bool intel_context_is_barrier(const struct intel_context *ce)
 {
@@ -391,49 +327,23 @@ static inline bool intel_context_set_banned(struct intel_context *ce)
 
 bool intel_context_ban(struct intel_context *ce, struct i915_request *rq);
 
-void intel_context_revert_ring_heads(struct intel_context *ce);
-
-/**
- * intel_context_suspend - suspend a context
- * @ce: The context to suspend
- * @atomic: Perform the suspend without sleeping.
- *
- * Return: A pointer to a struct i915_sw_fence that, when signaled,
- * indicates that the suspension is complete. If the function is called
- * with @atomic == true, and the suspend can't be performed
- * without sleeping, return ERR_PTR(-EBUSY);
- *
- * The function may be called from reclaim.
- *
- * It is safe to recursively suspend the context multiple times.
- * In that case a corresponding number of calls to
- * intel_context_resume is needed to resume it.
- *
- * The returned i915_sw_fence is guaranteed to be valid until
- * a paired i915_context_resume is called. In addition the
- * paired i915_context_resume may not be called unless the
- * returned fence is complete.
- */
-static inline struct i915_sw_fence *
-intel_context_suspend(struct intel_context *ce, bool atomic)
+static inline bool intel_context_is_schedulable(const struct intel_context *ce)
 {
-	GEM_BUG_ON(!ce->ops->suspend);
-	return ce->ops->suspend(ce, atomic);
+	return !test_bit(CONTEXT_EXITING, &ce->flags) &&
+	       !test_bit(CONTEXT_BANNED, &ce->flags);
 }
 
-/**
- * intel_context_resume - Resume a context
- * @ce: The context to resume
- *
- * Resume the context previously suspended using intel_context_suspend().
- * The i915_sw_fence returned from intel_context_suspend() must be
- * complete.
- */
-static inline void intel_context_resume(struct intel_context *ce)
+static inline bool intel_context_is_exiting(const struct intel_context *ce)
 {
-	GEM_BUG_ON(!ce->ops->resume);
-	ce->ops->resume(ce);
+	return test_bit(CONTEXT_EXITING, &ce->flags);
 }
+
+static inline bool intel_context_set_exiting(struct intel_context *ce)
+{
+	return test_and_set_bit(CONTEXT_EXITING, &ce->flags);
+}
+
+bool intel_context_revoke(struct intel_context *ce);
 
 static inline bool
 intel_context_force_single_submission(const struct intel_context *ce)
@@ -465,25 +375,7 @@ intel_context_clear_nopreempt(struct intel_context *ce)
 	clear_bit(CONTEXT_NOPREEMPT, &ce->flags);
 }
 
-static inline bool
-intel_context_debug(const struct intel_context *ce)
-{
-	return test_bit(CONTEXT_DEBUG, &ce->flags);
-}
-
-static inline void
-intel_context_set_debug(struct intel_context *ce)
-{
-	set_bit(CONTEXT_DEBUG, &ce->flags);
-}
-
-static inline void
-intel_context_clear_debug(struct intel_context *ce)
-{
-	clear_bit(CONTEXT_DEBUG, &ce->flags);
-}
-
-u64 intel_context_get_total_runtime_ns(const struct intel_context *ce);
+u64 intel_context_get_total_runtime_ns(struct intel_context *ce);
 u64 intel_context_get_avg_runtime_ns(struct intel_context *ce);
 
 static inline u64 intel_context_clock(void)

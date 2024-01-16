@@ -6,7 +6,6 @@
 #include <linux/hwmon.h>
 #include <linux/hwmon-sysfs.h>
 #include <linux/types.h>
-#include <linux/version.h>
 
 #include "i915_drv.h"
 #include "i915_hwmon.h"
@@ -122,7 +121,7 @@ hwm_field_read_and_scale(struct hwm_drvdata *ddat, i915_reg_t rgadr,
  * hwmon->scl_shift_energy of 14 bits we have 57 (63 - 20 + 14) bits before
  * energy1_input overflows. This at 1000 W is an overflow duration of 278 years.
  */
-static int
+static void
 hwm_energy(struct hwm_drvdata *ddat, long *energy)
 {
 	struct intel_uncore *uncore = ddat->uncore;
@@ -136,9 +135,6 @@ hwm_energy(struct hwm_drvdata *ddat, long *energy)
 		rgaddr = hwmon->rg.energy_status_tile;
 	else
 		rgaddr = hwmon->rg.energy_status_all;
-
-	if (!i915_mmio_reg_valid(rgaddr))
-		return -EOPNOTSUPP;
 
 	mutex_lock(&hwmon->hwmon_lock);
 
@@ -154,38 +150,7 @@ hwm_energy(struct hwm_drvdata *ddat, long *energy)
 	*energy = mul_u64_u32_shr(ei->accum_energy, SF_ENERGY,
 				  hwmon->scl_shift_energy);
 	mutex_unlock(&hwmon->hwmon_lock);
-
-	return 0;
 }
-
-int
-i915_hwmon_energy_status_get(struct drm_i915_private *i915, long *energy)
-{
-	struct i915_hwmon *hwmon = i915->hwmon;
-	struct hwm_drvdata *ddat = &hwmon->ddat;
-
-	return hwm_energy(ddat, energy);
-}
-
-#if LINUX_VERSION_CODE < KERNEL_VERSION(5,10,0)
-static ssize_t
-hwm_power1_rated_max_show(struct device *dev, struct device_attribute *attr,
-			  char *buf)
-{
-	struct hwm_drvdata *ddat = dev_get_drvdata(dev);
-	struct i915_hwmon *hwmon = ddat->hwmon;
-	u64 val = hwm_field_read_and_scale(ddat,
-					   hwmon->rg.pkg_power_sku,
-					   PKG_PKG_TDP,
-					   hwmon->scl_shift_power,
-					   SF_POWER);
-
-	return sysfs_emit(buf, "%llu\n", val);
-}
-
-static SENSOR_DEVICE_ATTR(power1_rated_max, 0444,
-			  hwm_power1_rated_max_show, NULL, 0);
-#endif
 
 static ssize_t
 hwm_power1_max_interval_show(struct device *dev, struct device_attribute *attr,
@@ -225,7 +190,6 @@ hwm_power1_max_interval_store(struct device *dev,
 	struct hwm_drvdata *ddat = dev_get_drvdata(dev);
 	struct i915_hwmon *hwmon = ddat->hwmon;
 	u32 x, y, rxy, x_w = 2; /* 2 bits */
-	intel_wakeref_t wakeref;
 	u64 tau4, r, max_win;
 	unsigned long val;
 	int ret;
@@ -240,24 +204,11 @@ hwm_power1_max_interval_store(struct device *dev,
 	 */
 #define PKG_MAX_WIN_DEFAULT 0x12ull
 
-	/* val must be < max in hwmon interface units */
-	if (i915_mmio_reg_valid(hwmon->rg.pkg_power_sku)) {
-		with_intel_runtime_pm(ddat->uncore->rpm, wakeref)
-			r = intel_uncore_read64(ddat->uncore, hwmon->rg.pkg_power_sku);
-		/*
-		 * FIXME
-		 * Wa_22015381490:pvc rg.pkg_power_sku value is incorrect on PVC
-		 * at least. The following seems to work:
-		 *	r <<= 8;
-		 * However for now to be safe just use the default value
-		 * below. Once issue is resolved remove the one line below.
-		 */
-		r = FIELD_PREP(PKG_MAX_WIN, PKG_MAX_WIN_DEFAULT);
-	} else {
-		r = FIELD_PREP(PKG_MAX_WIN, PKG_MAX_WIN_DEFAULT);
-	}
-
-	/* Steps below are explained in i915_power1_max_interval_show() */
+	/*
+	 * val must be < max in hwmon interface units. The steps below are
+	 * explained in i915_power1_max_interval_show()
+	 */
+	r = FIELD_PREP(PKG_MAX_WIN, PKG_MAX_WIN_DEFAULT);
 	x = REG_FIELD_GET(PKG_MAX_WIN_X, r);
 	y = REG_FIELD_GET(PKG_MAX_WIN_Y, r);
 	tau4 = ((1 << x_w) | x) << y;
@@ -291,9 +242,6 @@ static SENSOR_DEVICE_ATTR(power1_max_interval, 0664,
 			  hwm_power1_max_interval_store, 0);
 
 static struct attribute *hwm_attributes[] = {
-#if LINUX_VERSION_CODE < KERNEL_VERSION(5,10,0)
-	&sensor_dev_attr_power1_rated_max.dev_attr.attr,
-#endif
 	&sensor_dev_attr_power1_max_interval.dev_attr.attr,
 	NULL
 };
@@ -307,10 +255,6 @@ static umode_t hwm_attributes_visible(struct kobject *kobj,
 
 	if (attr == &sensor_dev_attr_power1_max_interval.dev_attr.attr)
 		return i915_mmio_reg_valid(hwmon->rg.pkg_rapl_limit) ? attr->mode : 0;
-#if LINUX_VERSION_CODE < KERNEL_VERSION(5,10,0)
-	else if (attr == &sensor_dev_attr_power1_rated_max.dev_attr.attr)
-		return i915_mmio_reg_valid(hwmon->rg.pkg_power_sku) ? attr->mode : 0;
-#endif
 
 	return 0;
 }
@@ -325,79 +269,19 @@ static const struct attribute_group *hwm_groups[] = {
 	NULL
 };
 
-#ifdef BPM_HWMON_CHANNEL_INFO_NOT_PRESENT
-static const u32 hwmon_in_config[] = {
-        HWMON_I_INPUT,
-        0
-};
-static const struct hwmon_channel_info hwm_in = {
-        .type = hwmon_in,
-        .config = hwmon_in_config,
-};
-#ifdef POWER1_RATED_MAX_NOT_PRESENT
-static const u32 hwmon_power_config[] = {
-        HWMON_P_MAX | HWMON_P_CRIT,
-        0
-};
-static const struct hwmon_channel_info hwm_power = {
-        .type = hwmon_power,
-        .config = hwmon_power_config,
-};
-#else
-static const u32 hwmon_power_config[] = {
-        HWMON_P_MAX | HWMON_P_CRIT | HWMON_P_CRIT,
-        0
-};
-static const struct hwmon_channel_info hwm_power = {
-        .type = hwmon_power,
-        .config = hwmon_power_config,
-};
-#endif
-static const u32 hwmon_energy_config[] = {
-        HWMON_E_INPUT,
-        0
-};
-static const struct hwmon_channel_info hwm_energy_test = {
-        .type = hwmon_energy,
-        .config = hwmon_energy_config,
-};
-static const u32 hwmon_curr_config[] = {
-        HWMON_C_CRIT,
-        0
-};
-static const struct hwmon_channel_info hwm_curr = {
-        .type = hwmon_curr,
-        .config = hwmon_curr_config,
-};
-static const struct hwmon_channel_info *hwm_info[] = {
-        &hwm_in,
-        &hwm_power,
-        &hwm_energy_test,
-        &hwm_curr,
-        NULL
-};
-static const struct hwmon_channel_info *hwm_gt_info[] = {
-        &hwm_energy_test,
-        NULL
-};
-#else
-static const struct hwmon_channel_info *hwm_info[] = {
+static const struct hwmon_channel_info * const hwm_info[] = {
 	HWMON_CHANNEL_INFO(in, HWMON_I_INPUT),
-#ifdef POWER1_RATED_MAX_NOT_PRESENT
-	HWMON_CHANNEL_INFO(power, HWMON_P_MAX | HWMON_P_CRIT),
-#else
 	HWMON_CHANNEL_INFO(power, HWMON_P_MAX | HWMON_P_RATED_MAX | HWMON_P_CRIT),
-#endif
 	HWMON_CHANNEL_INFO(energy, HWMON_E_INPUT),
 	HWMON_CHANNEL_INFO(curr, HWMON_C_CRIT),
 	NULL
 };
 
-static const struct hwmon_channel_info *hwm_gt_info[] = {
+static const struct hwmon_channel_info * const hwm_gt_info[] = {
 	HWMON_CHANNEL_INFO(energy, HWMON_E_INPUT),
 	NULL
 };
-#endif
+
 /* I1 is exposed as power_crit or as curr_crit depending on bit 31 */
 static int hwm_pcode_read_i1(struct drm_i915_private *i915, u32 *uval)
 {
@@ -457,10 +341,8 @@ hwm_power_is_visible(const struct hwm_drvdata *ddat, u32 attr, int chan)
 	switch (attr) {
 	case hwmon_power_max:
 		return i915_mmio_reg_valid(hwmon->rg.pkg_rapl_limit) ? 0664 : 0;
-#ifndef POWER1_RATED_MAX_NOT_PRESENT
 	case hwmon_power_rated_max:
 		return i915_mmio_reg_valid(hwmon->rg.pkg_power_sku) ? 0444 : 0;
-#endif
 	case hwmon_power_crit:
 		return (hwm_pcode_read_i1(i915, &uval) ||
 			!(uval & POWER_SETUP_I1_WATTS)) ? 0 : 0644;
@@ -571,16 +453,13 @@ unlock:
 static int
 hwm_power_read(struct hwm_drvdata *ddat, u32 attr, int chan, long *val)
 {
-#ifndef POWER1_RATED_MAX_NOT_PRESENT
 	struct i915_hwmon *hwmon = ddat->hwmon;
-#endif
 	int ret;
 	u32 uval;
 
 	switch (attr) {
 	case hwmon_power_max:
 		return hwm_power_max_read(ddat, val);
-#ifndef POWER1_RATED_MAX_NOT_PRESENT
 	case hwmon_power_rated_max:
 		*val = hwm_field_read_and_scale(ddat,
 						hwmon->rg.pkg_power_sku,
@@ -588,7 +467,6 @@ hwm_power_read(struct hwm_drvdata *ddat, u32 attr, int chan, long *val)
 						hwmon->scl_shift_power,
 						SF_POWER);
 		return 0;
-#endif
 	case hwmon_power_crit:
 		ret = hwm_pcode_read_i1(ddat->uncore->i915, &uval);
 		if (ret)
@@ -677,7 +555,8 @@ hwm_energy_read(struct hwm_drvdata *ddat, u32 attr, long *val)
 {
 	switch (attr) {
 	case hwmon_energy_input:
-		return hwm_energy(ddat, val);
+		hwm_energy(ddat, val);
+		return 0;
 	default:
 		return -EOPNOTSUPP;
 	}
@@ -865,12 +744,6 @@ hwm_get_preregistration_info(struct drm_i915_private *i915)
 		hwmon->rg.pkg_rapl_limit = GT0_PACKAGE_RAPL_LIMIT;
 		hwmon->rg.energy_status_all = GT0_PLATFORM_ENERGY_STATUS;
 		hwmon->rg.energy_status_tile = GT0_PACKAGE_ENERGY_STATUS;
-	} else if (IS_PONTEVECCHIO(i915)) {
-		hwmon->rg.pkg_power_sku_unit = PVC_GT0_PACKAGE_POWER_SKU_UNIT;
-		hwmon->rg.pkg_power_sku = PVC_GT0_PACKAGE_POWER_SKU;
-		hwmon->rg.pkg_rapl_limit = PVC_GT0_PACKAGE_RAPL_LIMIT;
-		hwmon->rg.energy_status_all = PVC_GT0_PLATFORM_ENERGY_STATUS;
-		hwmon->rg.energy_status_tile = PVC_GT0_PACKAGE_ENERGY_STATUS;
 	} else {
 		hwmon->rg.pkg_power_sku_unit = INVALID_MMIO_REG;
 		hwmon->rg.pkg_power_sku = INVALID_MMIO_REG;

@@ -670,12 +670,10 @@ static int pf_guc_accepts_extended_update_config_hxg(void *arg)
 #define IOV_VF_CFG_KLVS(config) \
 	config(GGTT_START) \
 	config(GGTT_SIZE) \
-	config(LMEM_SIZE) \
 	config(NUM_CONTEXTS) \
 	config(BEGIN_CONTEXT_ID) \
 	config(NUM_DOORBELLS) \
 	config(BEGIN_DOORBELL_ID) \
-	config(TILE_MASK) \
 	config(EXEC_QUANTUM) \
 	config(PREEMPT_TIMEOUT) \
 	IOV_THRESHOLDS(config_threshold) \
@@ -761,11 +759,6 @@ static int pf_update_vf_klvs(struct intel_iov *iov, u32 vfid,
 		u32 key = FIELD_GET(GUC_KLV_0_KEY, klv->keylen);
 		u32 len = FIELD_GET(GUC_KLV_0_LEN, klv->keylen);
 
-		if (key == GUC_KLV_VF_CFG_LMEM_SIZE_KEY && !HAS_LMEM(iov_to_i915(iov)))
-			continue;
-		if (key == GUC_KLV_VF_CFG_TILE_MASK_KEY && !HAS_REMOTE_TILES(iov_to_i915(iov)))
-			continue;
-
 		switch (len) {
 		case 1:
 			ret = guc_update_vf_klv32(guc, vfid, key, klv->value32);
@@ -798,8 +791,6 @@ static int pf_guc_accepts_config_zero(void *arg)
 		{ MAKE_GUC_KLV(VF_CFG_NUM_CONTEXTS), .value32 = 0 },
 		{ MAKE_GUC_KLV(VF_CFG_BEGIN_DOORBELL_ID), .value32 = 0 },
 		{ MAKE_GUC_KLV(VF_CFG_NUM_DOORBELLS), .value32 = 0 },
-		{ MAKE_GUC_KLV(VF_CFG_LMEM_SIZE), .value64 = 0 },
-		{ MAKE_GUC_KLV(VF_CFG_TILE_MASK), .value32 = 0 },
 #define make_threshold_klv(K, ...) \
 		{ MAKE_GUC_KLV(VF_CFG_THRESHOLD_##K), .value32 = 0 },
 		IOV_THRESHOLDS(make_threshold_klv)
@@ -841,9 +832,6 @@ static int pf_guc_accepts_config_resets(void *arg)
 	u32 vfid = max_t(u32, 1, i915_prandom_u32_max_state(pf_get_totalvfs(iov), &prng));
 	static const struct klv empty[] = { };
 	static const struct klv second_empty[] = { };
-	struct klv tile_mask_only[] = {
-		{ MAKE_GUC_KLV(VF_CFG_TILE_MASK), .value32 = 1 },
-	};
 	struct klv incomplete[] = {
 		{ MAKE_GUC_KLV(VF_CFG_BEGIN_DOORBELL_ID), .value32 = 0 },
 		{ MAKE_GUC_KLV(VF_CFG_NUM_DOORBELLS), .value32 = 1 },
@@ -856,15 +844,6 @@ static int pf_guc_accepts_config_resets(void *arg)
 		{ MAKE_GUC_KLV(VF_CFG_BEGIN_DOORBELL_ID), .value32 = 0 },
 		{ MAKE_GUC_KLV(VF_CFG_NUM_DOORBELLS), .value32 = 1 },
 	};
-	struct klv complete_with_tile_mask[] = {
-		{ MAKE_GUC_KLV(VF_CFG_GGTT_START), .value64 = GUC_GGTT_TOP - SZ_4K },
-		{ MAKE_GUC_KLV(VF_CFG_GGTT_SIZE), .value64 = SZ_4K },
-		{ MAKE_GUC_KLV(VF_CFG_BEGIN_CONTEXT_ID), .value32 = GUC_MAX_CONTEXT_ID - 1 },
-		{ MAKE_GUC_KLV(VF_CFG_NUM_CONTEXTS), .value32 = 1 },
-		{ MAKE_GUC_KLV(VF_CFG_BEGIN_DOORBELL_ID), .value32 = 0 },
-		{ MAKE_GUC_KLV(VF_CFG_NUM_DOORBELLS), .value32 = 1 },
-		{ MAKE_GUC_KLV(VF_CFG_TILE_MASK), .value32 = 1 },
-	};
 	struct {
 		const char *name;
 		const struct klv *klvs;
@@ -873,10 +852,8 @@ static int pf_guc_accepts_config_resets(void *arg)
 	} testcases[] = {
 #define TC(X, C) { .name = #X, .klvs = X, .num_klvs = ARRAY_SIZE(X), .valid = C }
 		TC(empty, true),
-		TC(tile_mask_only, HAS_REMOTE_TILES(iov_to_i915(iov))),
 		TC(incomplete, true),
 		TC(complete, true),
-		TC(complete_with_tile_mask, HAS_REMOTE_TILES(iov_to_i915(iov))),
 		TC(second_empty, true),
 #undef TC
 		{ }
@@ -920,8 +897,6 @@ static int pf_guc_accepts_config_updates(void *arg)
 		{ MAKE_GUC_KLV(VF_CFG_NUM_CONTEXTS), .value32 = 1 },
 		{ MAKE_GUC_KLV(VF_CFG_BEGIN_DOORBELL_ID), .value32 = 0 },
 		{ MAKE_GUC_KLV(VF_CFG_NUM_DOORBELLS), .value32 = 1 },
-		{ MAKE_GUC_KLV(VF_CFG_LMEM_SIZE), .value64 = SZ_2M },
-		{ MAKE_GUC_KLV(VF_CFG_TILE_MASK), .value32 = 1 },
 	};
 	struct klv update[] = {
 		{ MAKE_GUC_KLV(VF_CFG_GGTT_START), .value64 = GUC_GGTT_TOP - SZ_1M },
@@ -930,8 +905,6 @@ static int pf_guc_accepts_config_updates(void *arg)
 		{ MAKE_GUC_KLV(VF_CFG_NUM_CONTEXTS), .value32 = 2 },
 		{ MAKE_GUC_KLV(VF_CFG_BEGIN_DOORBELL_ID), .value32 = 1 },
 		{ MAKE_GUC_KLV(VF_CFG_NUM_DOORBELLS), .value32 = 2 },
-		{ MAKE_GUC_KLV(VF_CFG_LMEM_SIZE), .value64 = SZ_4M },
-		{ MAKE_GUC_KLV(VF_CFG_TILE_MASK), .value32 = 2 },
 	};
 	struct klv zero[] = {
 		{ MAKE_GUC_KLV(VF_CFG_GGTT_START), .value64 = 0 },
@@ -940,8 +913,6 @@ static int pf_guc_accepts_config_updates(void *arg)
 		{ MAKE_GUC_KLV(VF_CFG_NUM_CONTEXTS), .value32 = 0 },
 		{ MAKE_GUC_KLV(VF_CFG_BEGIN_DOORBELL_ID), .value32 = 0 },
 		{ MAKE_GUC_KLV(VF_CFG_NUM_DOORBELLS), .value32 = 0 },
-		{ MAKE_GUC_KLV(VF_CFG_LMEM_SIZE), .value64 = 0 },
-		{ MAKE_GUC_KLV(VF_CFG_TILE_MASK), .value32 = 0 },
 	};
 	struct {
 		const char *name;
@@ -954,50 +925,6 @@ static int pf_guc_accepts_config_updates(void *arg)
 		TC(config),
 		TC(zero),
 		TC(zero),
-#undef TC
-		{ }
-	}, *tc = testcases, *prev = NULL;
-	int ret;
-
-	for (; tc->name; prev = tc++) {
-		ret = pf_update_vf_klvs(iov, vfid, tc->klvs, tc->num_klvs);
-		if (ret) {
-			IOV_SELFTEST_ERROR(iov, "Failed to update config %s to %s, %d\n",
-					   prev ? prev->name : "default", tc->name, ret);
-			break;
-		}
-	}
-
-	return ret;
-}
-
-static int pf_guc_accepts_tilemask_changes(void *arg)
-{
-	I915_RND_STATE(prng);
-	struct intel_iov *iov = arg;
-	u32 vfid = max_t(u32, 1, i915_prandom_u32_max_state(pf_get_totalvfs(iov), &prng));
-	struct klv tilemask_none[] = {
-		{ MAKE_GUC_KLV(VF_CFG_TILE_MASK), .value32 = 0 },
-	};
-	struct klv tilemask_root[] = {
-		{ MAKE_GUC_KLV(VF_CFG_TILE_MASK), .value32 = 1 },
-	};
-	struct klv tilemask_other[] = {
-		{ MAKE_GUC_KLV(VF_CFG_TILE_MASK), .value32 = 2 },
-	};
-	struct {
-		const char *name;
-		const struct klv *klvs;
-		unsigned int num_klvs;
-	} testcases[] = {
-#define TC(X) { .name = #X, .klvs = X, .num_klvs = ARRAY_SIZE(X) }
-		TC(tilemask_none),
-		TC(tilemask_root),
-		TC(tilemask_other),
-		TC(tilemask_none),
-		TC(tilemask_other),
-		TC(tilemask_none),
-		TC(tilemask_none),
 #undef TC
 		{ }
 	}, *tc = testcases, *prev = NULL;
@@ -1039,7 +966,6 @@ int selftest_live_iov_provisioning(struct drm_i915_private *i915)
 		SUBTEST(pf_guc_accepts_config_zero),
 		SUBTEST(pf_guc_accepts_config_resets),
 		SUBTEST(pf_guc_accepts_config_updates),
-		SUBTEST(pf_guc_accepts_tilemask_changes),
 	};
 	intel_wakeref_t wakeref;
 	int err = 0;

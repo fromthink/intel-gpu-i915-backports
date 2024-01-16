@@ -20,7 +20,7 @@ __igt_reset_stolen(struct intel_gt *gt,
 		   const char *msg)
 {
 	struct i915_ggtt *ggtt = gt->ggtt;
-	const struct resource *dsm = &gt->i915->dsm;
+	const struct resource *dsm = &gt->i915->dsm.stolen;
 	resource_size_t num_pages, page;
 	struct intel_engine_cs *engine;
 	intel_wakeref_t wakeref;
@@ -261,12 +261,11 @@ static int igt_atomic_reset(void *arg)
 {
 	struct intel_gt *gt = arg;
 	const typeof(*igt_atomic_phases) *p;
-	intel_wakeref_t wakeref;
 	int err = 0;
 
 	/* Check that the resets are usable from atomic context */
 
-	wakeref = intel_gt_pm_get(gt);
+	intel_gt_pm_get(gt);
 	igt_global_reset_lock(gt);
 
 	/* Flush any requests before we get started and check basics */
@@ -297,7 +296,7 @@ static int igt_atomic_reset(void *arg)
 
 unlock:
 	igt_global_reset_unlock(gt);
-	intel_gt_pm_put(gt, wakeref);
+	intel_gt_pm_put(gt);
 
 	return err;
 }
@@ -308,7 +307,6 @@ static int igt_atomic_engine_reset(void *arg)
 	const typeof(*igt_atomic_phases) *p;
 	struct intel_engine_cs *engine;
 	enum intel_engine_id id;
-	intel_wakeref_t wakeref;
 	int err = 0;
 
 	/* Check that the resets are usable from atomic context */
@@ -319,7 +317,7 @@ static int igt_atomic_engine_reset(void *arg)
 	if (intel_uc_uses_guc_submission(&gt->uc))
 		return 0;
 
-	wakeref = intel_gt_pm_get(gt);
+	intel_gt_pm_get(gt);
 	igt_global_reset_lock(gt);
 
 	/* Flush any requests before we get started and check basics */
@@ -367,7 +365,7 @@ static int igt_atomic_engine_reset(void *arg)
 
 out_unlock:
 	igt_global_reset_unlock(gt);
-	intel_gt_pm_put(gt, wakeref);
+	intel_gt_pm_put(gt);
 
 	return err;
 }
@@ -382,20 +380,13 @@ int intel_reset_live_selftests(struct drm_i915_private *i915)
 		SUBTEST(igt_atomic_reset),
 		SUBTEST(igt_atomic_engine_reset),
 	};
-	struct intel_gt *gt;
-	unsigned int i;
-	int ret = 0;
+	struct intel_gt *gt = to_gt(i915);
 
-	for_each_gt(gt, i915, i) {
-		if (!intel_has_gpu_reset(gt))
-			continue;
-		if (intel_gt_is_wedged(gt))
-			ret |= -EIO;
-		else
-			ret |= intel_gt_live_subtests(tests, gt);
-		if (ret)
-			break;
-	}
+	if (!intel_has_gpu_reset(gt))
+		return 0;
 
-	return ret;
+	if (intel_gt_is_wedged(gt))
+		return -EIO; /* we're long past hope of a successful reset */
+
+	return intel_gt_live_subtests(tests, gt);
 }

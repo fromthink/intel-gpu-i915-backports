@@ -6,13 +6,77 @@
 #ifndef __INTEL_GT__
 #define __INTEL_GT__
 
+#include "i915_drv.h"
 #include "intel_engine_types.h"
 #include "intel_gt_types.h"
 #include "intel_reset.h"
-#include "i915_drv.h"
+#include "i915_irq.h"
 
 struct drm_i915_private;
 struct drm_printer;
+
+/*
+ * Check that the GT is a graphics GT and has an IP version within the
+ * specified range (inclusive).
+ */
+#define IS_GFX_GT_IP_RANGE(gt, from, until) ( \
+	BUILD_BUG_ON_ZERO((from) < IP_VER(2, 0)) + \
+	BUILD_BUG_ON_ZERO((until) < (from)) + \
+	((gt)->type != GT_MEDIA && \
+	 GRAPHICS_VER_FULL((gt)->i915) >= (from) && \
+	 GRAPHICS_VER_FULL((gt)->i915) <= (until)))
+
+/*
+ * Check that the GT is a media GT and has an IP version within the
+ * specified range (inclusive).
+ *
+ * Only usable on platforms with a standalone media design (i.e., IP version 13
+ * and higher).
+ */
+#define IS_MEDIA_GT_IP_RANGE(gt, from, until) ( \
+	BUILD_BUG_ON_ZERO((from) < IP_VER(13, 0)) + \
+	BUILD_BUG_ON_ZERO((until) < (from)) + \
+	((gt) && (gt)->type == GT_MEDIA && \
+	 MEDIA_VER_FULL((gt)->i915) >= (from) && \
+	 MEDIA_VER_FULL((gt)->i915) <= (until)))
+
+/*
+ * Check that the GT is a graphics GT with a specific IP version and has
+ * a stepping in the range [from, until).  The lower stepping bound is
+ * inclusive, the upper bound is exclusive.  The most common use-case of this
+ * macro is for checking bounds for workarounds, which usually have a stepping
+ * ("from") at which the hardware issue is first present and another stepping
+ * ("until") at which a hardware fix is present and the software workaround is
+ * no longer necessary.  E.g.,
+ *
+ *    IS_GFX_GT_IP_STEP(gt, IP_VER(12, 70), STEP_A0, STEP_B0)
+ *    IS_GFX_GT_IP_STEP(gt, IP_VER(12, 71), STEP_B1, STEP_FOREVER)
+ *
+ * "STEP_FOREVER" can be passed as "until" for workarounds that have no upper
+ * stepping bound for the specified IP version.
+ */
+#define IS_GFX_GT_IP_STEP(gt, ipver, from, until) ( \
+	BUILD_BUG_ON_ZERO((until) <= (from)) + \
+	(IS_GFX_GT_IP_RANGE((gt), (ipver), (ipver)) && \
+	 IS_GRAPHICS_STEP((gt)->i915, (from), (until))))
+
+/*
+ * Check that the GT is a media GT with a specific IP version and has
+ * a stepping in the range [from, until).  The lower stepping bound is
+ * inclusive, the upper bound is exclusive.  The most common use-case of this
+ * macro is for checking bounds for workarounds, which usually have a stepping
+ * ("from") at which the hardware issue is first present and another stepping
+ * ("until") at which a hardware fix is present and the software workaround is
+ * no longer necessary.  "STEP_FOREVER" can be passed as "until" for
+ * workarounds that have no upper stepping bound for the specified IP version.
+ *
+ * This macro may only be used to match on platforms that have a standalone
+ * media design (i.e., media version 13 or higher).
+ */
+#define IS_MEDIA_GT_IP_STEP(gt, ipver, from, until) ( \
+	BUILD_BUG_ON_ZERO((until) <= (from)) + \
+	(IS_MEDIA_GT_IP_RANGE((gt), (ipver), (ipver)) && \
+	 IS_MEDIA_STEP((gt)->i915, (from), (until))))
 
 #define GT_TRACE(gt, fmt, ...) do {					\
 	const struct intel_gt *gt__ __maybe_unused = (gt);		\
@@ -23,6 +87,11 @@ struct drm_printer;
 static inline bool gt_is_root(struct intel_gt *gt)
 {
 	return !gt->info.id;
+}
+
+static inline bool intel_gt_needs_wa_22016122933(struct intel_gt *gt)
+{
+	return MEDIA_VER_FULL(gt->i915) == IP_VER(13, 0) && gt->type == GT_MEDIA;
 }
 
 static inline struct intel_gt *uc_to_gt(struct intel_uc *uc)
@@ -52,9 +121,9 @@ static inline struct intel_gt *gsc_to_gt(struct intel_gsc *gsc)
 
 void intel_gt_common_init_early(struct intel_gt *gt);
 int intel_root_gt_init_early(struct drm_i915_private *i915);
+int intel_gt_assign_ggtt(struct intel_gt *gt);
 int intel_gt_init_mmio(struct intel_gt *gt);
 int __must_check intel_gt_init_hw(struct intel_gt *gt);
-void intel_gt_init_ggtt(struct intel_gt *gt, struct i915_ggtt *ggtt);
 int intel_gt_init(struct intel_gt *gt);
 void intel_gt_driver_register(struct intel_gt *gt);
 
@@ -63,20 +132,15 @@ void intel_gt_driver_remove(struct intel_gt *gt);
 void intel_gt_driver_release(struct intel_gt *gt);
 void intel_gt_driver_late_release_all(struct drm_i915_private *i915);
 
-void intel_gt_shutdown(struct intel_gt *gt);
-
 int intel_gt_wait_for_idle(struct intel_gt *gt, long timeout);
 
 void intel_gt_check_and_clear_faults(struct intel_gt *gt);
+i915_reg_t intel_gt_perf_limit_reasons_reg(struct intel_gt *gt);
 void intel_gt_clear_error_registers(struct intel_gt *gt,
 				    intel_engine_mask_t engine_mask);
 
 void intel_gt_flush_ggtt_writes(struct intel_gt *gt);
-
-static inline void intel_gt_chipset_flush(struct intel_gt *gt)
-{
-	wmb(); /* flush any chipset caches */
-}
+void intel_gt_chipset_flush(struct intel_gt *gt);
 
 static inline u32 intel_gt_scratch_offset(const struct intel_gt *gt,
 					  enum intel_gt_scratch_field field)
@@ -98,20 +162,17 @@ static inline bool intel_gt_is_wedged(const struct intel_gt *gt)
 	return unlikely(test_bit(I915_WEDGED, &gt->reset.flags));
 }
 
-static inline
-i915_reg_t intel_gt_perf_limit_reasons_reg(struct intel_gt *gt)
+static inline bool intel_gt_is_enabled(const struct intel_gt *gt)
 {
-	if (gt->type == GT_MEDIA)
-		return MTL_MEDIA_PERF_LIMIT_REASONS;
-
-	return GT0_PERF_LIMIT_REASONS;
+	/* Check if GT is wedged or suspended */
+	if (intel_gt_is_wedged(gt) || !intel_irqs_enabled(gt->i915))
+		return false;
+	return true;
 }
-
-int intel_count_l3_banks(struct drm_i915_private *i915,
-			 struct intel_engine_cs *engine);
 
 int intel_gt_probe_all(struct drm_i915_private *i915);
 int intel_gt_tiles_init(struct drm_i915_private *i915);
+void intel_gt_release_all(struct drm_i915_private *i915);
 
 #define for_each_gt(gt__, i915__, id__) \
 	for ((id__) = 0; \
@@ -119,66 +180,11 @@ int intel_gt_tiles_init(struct drm_i915_private *i915);
 	     (id__)++) \
 		for_each_if(((gt__) = (i915__)->gt[(id__)]))
 
-static inline bool pvc_needs_rc6_wa(struct drm_i915_private *i915)
-{
-	if (!i915->params.enable_rc6)
-		return false;
-
-	if (IS_SRIOV_VF(i915))
-		return false;
-
-	if (i915->quiesce_gpu)
-		return false;
-	/*
-	 * Lets not break the dpc recovery, which will be hindered
-	 * by rpm resume caused by RC6 Wa
-	 */
-	if (i915_is_pci_faulted(i915))
-		return false;
-
-	return (IS_PVC_BD_STEP(i915, STEP_B0, STEP_FOREVER) && i915->remote_tiles > 0);
-}
-
-/* Wa_16015496043 Hold forcewake on GT0 & GT1 to disallow rc6 */
-static inline void
-_pvc_wa_disallow_rc6(struct drm_i915_private *i915,
-		     void (*fn)(struct intel_uncore *uncore,
-				enum forcewake_domains fw_domains))
-{
-	intel_wakeref_t wakeref;
-	struct intel_gt *gt;
-	unsigned int id;
-
-	if (!pvc_needs_rc6_wa(i915))
-		return;
-
-	with_intel_runtime_pm(&i915->runtime_pm, wakeref) {
-		for_each_gt(gt, i915, id)
-			fn(gt->uncore, FORCEWAKE_GT);
-	}
-}
-
-static inline void pvc_wa_disallow_rc6(struct drm_i915_private *i915)
-{
-	_pvc_wa_disallow_rc6(i915, intel_uncore_forcewake_get);
-}
-
-static inline void pvc_wa_allow_rc6(struct drm_i915_private *i915)
-{
-	_pvc_wa_disallow_rc6(i915, intel_uncore_forcewake_put);
-}
-
 void intel_gt_info_print(const struct intel_gt_info *info,
 			 struct drm_printer *p);
 
-void intel_boost_fake_int_timer(struct intel_gt *gt, bool on_off);
+void intel_gt_watchdog_work(struct work_struct *work);
 
-void intel_gt_silent_driver_error(struct intel_gt *gt,
-				  const enum intel_gt_driver_errors error);
-
-__printf(3, 4)
-void intel_gt_log_driver_error(struct intel_gt *gt,
-			       const enum intel_gt_driver_errors error,
-			       const char *fmt, ...);
-
+void intel_gt_bind_context_set_ready(struct intel_gt *gt, bool ready);
+bool intel_gt_is_bind_context_ready(struct intel_gt *gt);
 #endif /* __INTEL_GT_H__ */

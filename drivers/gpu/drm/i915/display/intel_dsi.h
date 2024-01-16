@@ -24,7 +24,6 @@
 #ifndef _INTEL_DSI_H
 #define _INTEL_DSI_H
 
-#if IS_ENABLED(CPTCFG_DRM_I915_DISPLAY)
 #include <drm/drm_crtc.h>
 #include <drm/drm_mipi_dsi.h>
 
@@ -45,12 +44,10 @@ struct intel_dsi {
 
 	struct intel_dsi_host *dsi_hosts[I915_MAX_PORTS];
 	intel_wakeref_t io_wakeref[I915_MAX_PORTS];
-#ifndef BPM_PINCTRL_UNREGISTER_MAPPINGS_NOT_PRESENT
+
 	/* GPIO Desc for panel and backlight control */
-	struct gpio_desc *gpio_backlight;
-#endif
-	/* GPIO Desc for CRC based Panel control */
 	struct gpio_desc *gpio_panel;
+	struct gpio_desc *gpio_backlight;
 
 	struct intel_connector *attached_connector;
 
@@ -176,6 +173,7 @@ enum drm_mode_status intel_dsi_mode_valid(struct drm_connector *connector,
 struct intel_dsi_host *intel_dsi_host_init(struct intel_dsi *intel_dsi,
 					   const struct mipi_dsi_host_ops *funcs,
 					   enum port port);
+void intel_dsi_wait_panel_power_cycle(struct intel_dsi *intel_dsi);
+void intel_dsi_shutdown(struct intel_encoder *encoder);
 
-#endif /* CPTCFG_DRM_I915_DISPLAY */
 #endif /* _INTEL_DSI_H */

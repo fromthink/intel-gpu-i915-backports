@@ -13,6 +13,7 @@
 #include "gt/intel_gt.h"
 #include "i915_drv.h"
 #include "i915_gem_object.h"
+#include "i915_gem_object_frontbuffer.h"
 #include "i915_gem_region.h"
 #include "i915_gem_tiling.h"
 #include "i915_scatterlist.h"
@@ -82,8 +83,8 @@ static int i915_gem_object_get_pages_phys(struct drm_i915_gem_object *obj)
 	intel_gt_chipset_flush(to_gt(i915));
 
 	/* We're no longer struct page backed */
-	obj->flags &= ~I915_BO_STRUCT_PAGE;
-	__i915_gem_object_set_pages(obj, st, sg->length);
+	obj->mem_flags &= ~I915_BO_FLAG_STRUCT_PAGE;
+	__i915_gem_object_set_pages(obj, st);
 
 	return 0;
 
@@ -96,7 +97,7 @@ err_pci:
 	return -ENOMEM;
 }
 
-int
+void
 i915_gem_object_put_pages_phys(struct drm_i915_gem_object *obj,
 			       struct sg_table *pages)
 {
@@ -105,7 +106,7 @@ i915_gem_object_put_pages_phys(struct drm_i915_gem_object *obj,
 
 	__i915_gem_object_release_shmem(obj, pages, false);
 
-	if (obj->mm.madv == I915_MADV_WILLNEED) {
+	if (obj->mm.dirty) {
 		struct address_space *mapping = obj->base.filp->f_mapping;
 		void *src = vaddr;
 		int i;
@@ -130,6 +131,7 @@ i915_gem_object_put_pages_phys(struct drm_i915_gem_object *obj,
 
 			src += PAGE_SIZE;
 		}
+		obj->mm.dirty = false;
 	}
 
 	sg_free_table(pages);
@@ -138,7 +140,6 @@ i915_gem_object_put_pages_phys(struct drm_i915_gem_object *obj,
 	dma_free_coherent(obj->base.dev->dev,
 			  roundup_pow_of_two(obj->base.size),
 			  vaddr, dma);
-	return 0;
 }
 
 int i915_gem_object_pwrite_phys(struct drm_i915_gem_object *obj,
@@ -206,21 +207,15 @@ static int i915_gem_object_shmem_to_phys(struct drm_i915_gem_object *obj)
 	/* Perma-pin (until release) the physical set of pages */
 	__i915_gem_object_pin_pages(obj);
 
-	if (!IS_ERR_OR_NULL(pages)) {
-		err = i915_gem_object_put_pages_shmem(obj, pages);
-		if (err)
-			goto err_xfer;
-	}
+	if (!IS_ERR_OR_NULL(pages))
+		i915_gem_object_put_pages_shmem(obj, pages);
 
 	i915_gem_object_release_memory_region(obj);
 	return 0;
 
 err_xfer:
-	if (!IS_ERR_OR_NULL(pages)) {
-		unsigned int sg_page_sizes = i915_sg_dma_sizes(pages->sgl);
-
-		__i915_gem_object_set_pages(obj, pages, sg_page_sizes);
-	}
+	if (!IS_ERR_OR_NULL(pages))
+		__i915_gem_object_set_pages(obj, pages);
 	return err;
 }
 
@@ -239,7 +234,7 @@ int i915_gem_object_attach_phys(struct drm_i915_gem_object *obj, int align)
 	if (!i915_gem_object_has_struct_page(obj))
 		return 0;
 
-	err = i915_gem_object_unbind(obj, NULL, I915_GEM_OBJECT_UNBIND_ACTIVE);
+	err = i915_gem_object_unbind(obj, I915_GEM_OBJECT_UNBIND_ACTIVE);
 	if (err)
 		return err;
 

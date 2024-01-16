@@ -21,24 +21,32 @@ static int cmp_u32(const void *A, const void *B)
 	return *a - *b;
 }
 
-static intel_wakeref_t perf_begin(struct intel_gt *gt)
+static void perf_begin(struct intel_gt *gt)
 {
-	intel_wakeref_t wakeref = intel_gt_pm_get(gt);
+	intel_gt_pm_get(gt);
 
 	/* Boost gpufreq to max [waitboost] and keep it fixed */
 	atomic_inc(&gt->rps.num_waiters);
-	schedule_work(&gt->rps.work);
+	queue_work(gt->i915->unordered_wq, &gt->rps.work);
 	flush_work(&gt->rps.work);
-
-	return wakeref;
 }
 
-static int perf_end(struct intel_gt *gt, intel_wakeref_t wakeref)
+static int perf_end(struct intel_gt *gt)
 {
 	atomic_dec(&gt->rps.num_waiters);
-	intel_gt_pm_put(gt, wakeref);
+	intel_gt_pm_put(gt);
 
 	return igt_flush_test(gt->i915);
+}
+
+static i915_reg_t timestamp_reg(struct intel_engine_cs *engine)
+{
+	struct drm_i915_private *i915 = engine->i915;
+
+	if (GRAPHICS_VER(i915) == 5 || IS_G4X(i915))
+		return RING_TIMESTAMP_UDW(engine->mmio_base);
+	else
+		return RING_TIMESTAMP(engine->mmio_base);
 }
 
 static int write_timestamp(struct i915_request *rq, int slot)
@@ -57,7 +65,7 @@ static int write_timestamp(struct i915_request *rq, int slot)
 	if (GRAPHICS_VER(rq->engine->i915) >= 8)
 		cmd++;
 	*cs++ = cmd;
-	*cs++ = i915_mmio_reg_offset(RING_TIMESTAMP(rq->engine->mmio_base));
+	*cs++ = i915_mmio_reg_offset(timestamp_reg(rq->engine));
 	*cs++ = tl->hwsp_offset + slot * sizeof(u32);
 	*cs++ = 0;
 
@@ -93,7 +101,7 @@ static struct i915_vma *create_empty_batch(struct intel_context *ce)
 		goto err_unpin;
 	}
 
-	err = i915_vma_pin(vma, 0, 0, PIN_USER | PIN_ZONE_48);
+	err = i915_vma_pin(vma, 0, 0, PIN_USER);
 	if (err)
 		goto err_unpin;
 
@@ -125,18 +133,20 @@ static int perf_mi_bb_start(void *arg)
 	struct intel_gt *gt = arg;
 	struct intel_engine_cs *engine;
 	enum intel_engine_id id;
-	intel_wakeref_t wakeref;
 	int err = 0;
 
-	if (GRAPHICS_VER(gt->i915) < 7) /* for per-engine CS_TIMESTAMP */
+	if (GRAPHICS_VER(gt->i915) < 4) /* Any CS_TIMESTAMP? */
 		return 0;
 
-	wakeref = perf_begin(gt);
+	perf_begin(gt);
 	for_each_engine(engine, gt, id) {
 		struct intel_context *ce = engine->kernel_context;
 		struct i915_vma *batch;
 		u32 cycles[COUNT];
 		int i;
+
+		if (GRAPHICS_VER(engine->i915) < 7 && engine->id != RCS0)
+			continue;
 
 		intel_engine_pm_get(engine);
 
@@ -168,8 +178,8 @@ static int perf_mi_bb_start(void *arg)
 				goto out;
 
 			err = rq->engine->emit_bb_start(rq,
-							i915_vma_offset(batch),
-							8, 0);
+							i915_vma_offset(batch), 8,
+							0);
 			if (err)
 				goto out;
 
@@ -197,7 +207,7 @@ out:
 		pr_info("%s: MI_BB_START cycles: %u\n",
 			engine->name, trifilter(cycles));
 	}
-	if (perf_end(gt, wakeref))
+	if (perf_end(gt))
 		err = -EIO;
 
 	return err;
@@ -231,7 +241,7 @@ static struct i915_vma *create_nop_batch(struct intel_context *ce)
 		goto err_unpin;
 	}
 
-	err = i915_vma_pin(vma, 0, 0, PIN_USER | PIN_ZONE_48);
+	err = i915_vma_pin(vma, 0, 0, PIN_USER);
 	if (err)
 		goto err_unpin;
 
@@ -250,18 +260,20 @@ static int perf_mi_noop(void *arg)
 	struct intel_gt *gt = arg;
 	struct intel_engine_cs *engine;
 	enum intel_engine_id id;
-	intel_wakeref_t wakeref;
 	int err = 0;
 
-	if (GRAPHICS_VER(gt->i915) < 7) /* for per-engine CS_TIMESTAMP */
+	if (GRAPHICS_VER(gt->i915) < 4) /* Any CS_TIMESTAMP? */
 		return 0;
 
-	wakeref = perf_begin(gt);
+	perf_begin(gt);
 	for_each_engine(engine, gt, id) {
 		struct intel_context *ce = engine->kernel_context;
 		struct i915_vma *base, *nop;
 		u32 cycles[COUNT];
 		int i;
+
+		if (GRAPHICS_VER(engine->i915) < 7 && engine->id != RCS0)
+			continue;
 
 		intel_engine_pm_get(engine);
 
@@ -309,8 +321,8 @@ static int perf_mi_noop(void *arg)
 				goto out;
 
 			err = rq->engine->emit_bb_start(rq,
-							i915_vma_offset(base),
-							8, 0);
+							i915_vma_offset(base), 8,
+							0);
 			if (err)
 				goto out;
 
@@ -352,7 +364,7 @@ out:
 		pr_info("%s: 16K MI_NOOP cycles: %u\n",
 			engine->name, trifilter(cycles));
 	}
-	if (perf_end(gt, wakeref))
+	if (perf_end(gt))
 		err = -EIO;
 
 	return err;

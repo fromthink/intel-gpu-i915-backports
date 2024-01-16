@@ -41,8 +41,6 @@
 #define  GEN8_OA_REPORT_FORMAT_SHIFT	    2
 #define  GEN8_OA_SPECIFIC_CONTEXT_ENABLE    (1 << 1)
 #define  GEN8_OA_COUNTER_ENABLE             (1 << 0)
-#define  GEN12_OAG_OACONTROL_OA_CCS_SELECT_MASK      (0x3)
-#define  GEN12_OAG_OACONTROL_OA_CCS_SELECT_SHIFT     (16)
 
 #define GEN8_OACTXCONTROL _MMIO(0x2360)
 #define  GEN8_OA_TIMER_PERIOD_MASK	    0x3F
@@ -59,25 +57,16 @@
 #define GEN8_OABUFFER_UDW _MMIO(0x23b4)
 #define GEN8_OABUFFER _MMIO(0x2b14)
 #define  GEN8_OABUFFER_MEM_SELECT_GGTT      (1 << 0)  /* 0: PPGTT, 1: GGTT */
-#define  GEN8_OABUFFER_BUFFER_SIZE_SHIFT    3
 
 #define GEN7_OASTATUS1 _MMIO(0x2364)
 #define  GEN7_OASTATUS1_TAIL_MASK	    0xffffffc0
 #define  GEN7_OASTATUS1_COUNTER_OVERFLOW    (1 << 2)
 #define  GEN7_OASTATUS1_OABUFFER_OVERFLOW   (1 << 1)
 #define  GEN7_OASTATUS1_REPORT_LOST	    (1 << 0)
-#define  GEN7_OASTATUS1_BUFFER_SIZE_SHIFT   3
 
 #define GEN7_OASTATUS2 _MMIO(0x2368)
 #define  GEN7_OASTATUS2_HEAD_MASK           0xffffffc0
 #define  GEN7_OASTATUS2_MEM_SELECT_GGTT     (1 << 0) /* 0: PPGTT, 1: GGTT */
-
-#define OAREPORTTRIG2 _MMIO(0x2744)
-#define OAREPORTTRIG6 _MMIO(0x2754)
-
-/* Performance counters registers */
-#define OA_PERF_COUNTER_A(idx)			_MMIO(0x2800 + 8 * (idx))
-#define OA_PERF_COUNTER_A_UPPER(idx)		_MMIO(0x2800 + 8 * (idx) + 4)
 
 #define GEN8_OASTATUS _MMIO(0x2b08)
 #define  GEN8_OASTATUS_TAIL_POINTER_WRAP    (1 << 17)
@@ -111,15 +100,6 @@
 #define GEN12_OACTXCONTROL(base) _MMIO((base) + 0x360)
 #define GEN12_OAR_OASTATUS _MMIO(0x2968)
 
-#define GEN12_OAG_OAREPORTTRIG2 _MMIO(0xd924)
-#define GEN12_OAG_OAREPORTTRIG6 _MMIO(0xd934)
-
-/* Gen12 Performance counters registers */
-#define GEN12_OAG_PERF_COUNTER_A(idx)		_MMIO(0xD980 + 8 * (idx))
-#define GEN12_OAG_PERF_COUNTER_A_UPPER(idx)	_MMIO(0xD980 + 8 * (idx) + 4)
-
-#define GEN12_OAG_PERF_COUNTER_B(idx)		_MMIO(0xda94 + 4 * (idx))
-
 /* Gen12 OAG unit */
 #define GEN12_OAG_OAHEADPTR _MMIO(0xdb00)
 #define  GEN12_OAG_OAHEADPTR_MASK 0xffffffc0
@@ -145,32 +125,14 @@
 #define  GEN12_OAG_OA_DEBUG_DISABLE_CLK_RATIO_REPORTS  (1 << 5)
 #define  GEN12_OAG_OA_DEBUG_DISABLE_GO_1_0_REPORTS     (1 << 2)
 #define  GEN12_OAG_OA_DEBUG_DISABLE_CTX_SWITCH_REPORTS (1 << 1)
-#define  XEHPSDV_OAG_OA_DEBUG_BUFFER_SIZE_SELECT           (1 << 12)
-#define  XEHPSDV_OAG_OA_DEBUG_DISABLE_MMIO_TRG             (1 << 14)
 
 #define GEN12_OAG_OASTATUS _MMIO(0xdafc)
 #define  GEN12_OAG_OASTATUS_COUNTER_OVERFLOW (1 << 2)
 #define  GEN12_OAG_OASTATUS_BUFFER_OVERFLOW  (1 << 1)
 #define  GEN12_OAG_OASTATUS_REPORT_LOST      (1 << 0)
-#define  XEHPSDV_OAG_OASTATUS_MMIO_TRG_Q_FULL    (1 << 6)
-
-#define XEHPSDV_OAG_MMIOTRIGGER _MMIO(0xdb1c)
-
-/* Engine busyness counters
- *
- * This register are used to measures the total wall time of engine group
- */
-#define GEN12_OAG_RENDER_BUSY_FREE		_MMIO(0xdbdc)
-#define GEN12_OAG_BLT_BUSY_FREE			_MMIO(0xdbbc)
-#define GEN12_OAG_ANY_MEDIA_FF_BUSY_FREE	_MMIO(0xdba0)
-#define GEN12_OAG_RC0_ANY_ENGINE_BUSY_FREE	_MMIO(0xdb80)
 
 #define GDT_CHICKEN_BITS    _MMIO(0x9840)
 #define   GT_NOA_ENABLE	    0x00000080
-
-#define GEN12_SQCNT1				_MMIO(0x8718)
-#define   GEN12_SQCNT1_PMON_ENABLE		REG_BIT(30)
-#define   GEN12_SQCNT1_OABPC			REG_BIT(29)
 
 /* Gen12 OAM unit */
 #define GEN12_OAM_HEAD_POINTER_OFFSET   (0x1a0)
@@ -249,8 +211,5 @@
 #define GEN12_OAM_PERF_COUNTER_B0_OFFSET	(0x84)
 #define GEN12_OAM_PERF_COUNTER_B(base, idx) \
 	_MMIO((base) + GEN12_OAM_PERF_COUNTER_B0_OFFSET + 4 * (idx))
-
-/* Gen12 OAC unit */
-#define GEN12_OAC_OACONTROL		_MMIO(0x15114)
 
 #endif /* __INTEL_PERF_OA_REGS__ */

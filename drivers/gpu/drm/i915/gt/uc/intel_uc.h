@@ -23,9 +23,8 @@ struct intel_uc_ops {
 	int (*init)(struct intel_uc *uc);
 	void (*fini)(struct intel_uc *uc);
 	int (*init_hw)(struct intel_uc *uc);
-	int (*init_hw_late)(struct intel_uc *uc);
 	void (*fini_hw)(struct intel_uc *uc);
-	void (*resume_early)(struct intel_uc *uc);
+	void (*resume_mappings)(struct intel_uc *uc);
 };
 
 struct intel_uc {
@@ -54,19 +53,6 @@ void intel_uc_suspend(struct intel_uc *uc);
 void intel_uc_runtime_suspend(struct intel_uc *uc);
 int intel_uc_resume(struct intel_uc *uc);
 int intel_uc_runtime_resume(struct intel_uc *uc);
-
-static inline
-int intel_uc_idle_engines_start(struct intel_uc *uc, bool enable)
-{
-	return intel_guc_modify_scheduling_start(&uc->guc, enable);
-}
-
-static inline
-int intel_uc_idle_engines_wait(struct intel_uc *uc)
-{
-
-	return intel_guc_modify_scheduling_wait(&uc->guc);
-}
 
 /*
  * We need to know as early as possible if we're going to use GuC or not to
@@ -128,9 +114,8 @@ intel_uc_ops_function(cleanup_firmwares, fini_fw, void, );
 intel_uc_ops_function(init, init, int, 0);
 intel_uc_ops_function(fini, fini, void, );
 intel_uc_ops_function(init_hw, init_hw, int, 0);
-intel_uc_ops_function(init_hw_late, init_hw_late, int, 0);
 intel_uc_ops_function(fini_hw, fini_hw, void, );
-intel_uc_ops_function(resume_early, resume_early, void, );
+intel_uc_ops_function(resume_mappings, resume_mappings, void, );
 #undef intel_uc_ops_function
 
 #endif

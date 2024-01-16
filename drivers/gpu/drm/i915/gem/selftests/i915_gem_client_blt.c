@@ -13,6 +13,7 @@
 #include "gt/intel_gt_regs.h"
 #include "gem/i915_gem_lmem.h"
 
+#include "gem/selftests/igt_gem_utils.h"
 #include "selftests/igt_flush_test.h"
 #include "selftests/mock_drm.h"
 #include "selftests/i915_random.h"
@@ -82,8 +83,7 @@ static int linear_x_y_to_ftiled_pos(int x, int y, u32 stride, int bpp)
 enum client_tiling {
 	CLIENT_TILING_LINEAR,
 	CLIENT_TILING_X,
-	CLIENT_TILING_Y,
-	CLIENT_TILING_4,
+	CLIENT_TILING_Y,  /* Y-major, either Tile4 (Xe_HP and beyond) or legacy TileY */
 	CLIENT_NUM_TILING_TYPES
 };
 
@@ -164,11 +164,10 @@ static int prepare_blit(const struct tiled_blits *t,
 			 BLIT_CCTL_DST_MOCS(gt->mocs.uc_index));
 
 		src_pitch = t->width; /* in dwords */
-		if (src->tiling == CLIENT_TILING_4) {
+		if (src->tiling == CLIENT_TILING_Y) {
 			src_tiles = XY_FAST_COPY_BLT_D0_SRC_TILE_MODE(YMAJOR);
-			src_4t = XY_FAST_COPY_BLT_D1_SRC_TILE4;
-		} else if (src->tiling == CLIENT_TILING_Y) {
-			src_tiles = XY_FAST_COPY_BLT_D0_SRC_TILE_MODE(YMAJOR);
+			if (GRAPHICS_VER_FULL(to_i915(batch->base.dev)) >= IP_VER(12, 50))
+				src_4t = XY_FAST_COPY_BLT_D1_SRC_TILE4;
 		} else if (src->tiling == CLIENT_TILING_X) {
 			src_tiles = XY_FAST_COPY_BLT_D0_SRC_TILE_MODE(TILE_X);
 		} else {
@@ -176,11 +175,10 @@ static int prepare_blit(const struct tiled_blits *t,
 		}
 
 		dst_pitch = t->width; /* in dwords */
-		if (dst->tiling == CLIENT_TILING_4) {
+		if (dst->tiling == CLIENT_TILING_Y) {
 			dst_tiles = XY_FAST_COPY_BLT_D0_DST_TILE_MODE(YMAJOR);
-			dst_4t = XY_FAST_COPY_BLT_D1_DST_TILE4;
-		} else if (dst->tiling == CLIENT_TILING_Y) {
-			dst_tiles = XY_FAST_COPY_BLT_D0_DST_TILE_MODE(YMAJOR);
+			if (GRAPHICS_VER_FULL(to_i915(batch->base.dev)) >= IP_VER(12, 50))
+				dst_4t = XY_FAST_COPY_BLT_D1_DST_TILE4;
 		} else if (dst->tiling == CLIENT_TILING_X) {
 			dst_tiles = XY_FAST_COPY_BLT_D0_DST_TILE_MODE(TILE_X);
 		} else {
@@ -325,16 +323,6 @@ static int tiled_blits_create_buffers(struct tiled_blits *t,
 		t->buffers[i].vma = vma;
 		t->buffers[i].tiling =
 			i915_prandom_u32_max_state(CLIENT_NUM_TILING_TYPES, prng);
-
-		/* Platforms support either TileY or Tile4, not both */
-		if (HAS_4TILE(i915) && t->buffers[i].tiling == CLIENT_TILING_Y)
-			t->buffers[i].tiling = CLIENT_TILING_4;
-		else if (!HAS_4TILE(i915) && t->buffers[i].tiling == CLIENT_TILING_4)
-			t->buffers[i].tiling = CLIENT_TILING_Y;
-
-		/* PVC also does not support X-tile */
-		if (IS_PONTEVECCHIO(i915) && t->buffers[i].tiling == CLIENT_TILING_X)
-			t->buffers[i].tiling = CLIENT_TILING_4;
 	}
 
 	return 0;
@@ -370,18 +358,19 @@ static u64 tiled_offset(const struct intel_gt *gt,
 
 	y = div64_u64_rem(v, stride, &x);
 
-	if (tiling == CLIENT_TILING_4) {
-		v = linear_x_y_to_ftiled_pos(x_pos, y_pos, stride, 32);
-
-		/* no swizzling for f-tiling */
-		swizzle = I915_BIT_6_SWIZZLE_NONE;
-	} else if (tiling == CLIENT_TILING_X) {
+	if (tiling == CLIENT_TILING_X) {
 		v = div64_u64_rem(y, 8, &y) * stride * 8;
 		v += y * 512;
 		v += div64_u64_rem(x, 512, &x) << 12;
 		v += x;
 
 		swizzle = gt->ggtt->bit_6_swizzle_x;
+	} else if (GRAPHICS_VER_FULL(gt->i915) >= IP_VER(12, 50)) {
+		/* Y-major tiling layout is Tile4 for Xe_HP and beyond */
+		v = linear_x_y_to_ftiled_pos(x_pos, y_pos, stride, 32);
+
+		/* no swizzling for f-tiling */
+		swizzle = I915_BIT_6_SWIZZLE_NONE;
 	} else {
 		const unsigned int ytile_span = 16;
 		const unsigned int ytile_height = 512;
@@ -417,8 +406,7 @@ static const char *repr_tiling(enum client_tiling tiling)
 	switch (tiling) {
 	case CLIENT_TILING_LINEAR: return "linear";
 	case CLIENT_TILING_X: return "X";
-	case CLIENT_TILING_Y: return "Y";
-	case CLIENT_TILING_4: return "F";
+	case CLIENT_TILING_Y: return "Y / 4";
 	default: return "unknown";
 	}
 }
@@ -460,27 +448,12 @@ static int verify_buffer(const struct tiled_blits *t,
 	return ret;
 }
 
-static int move_to_active(struct i915_vma *vma,
-			  struct i915_request *rq,
-			  unsigned int flags)
-{
-	int err;
-
-	i915_vma_lock(vma);
-	err = i915_request_await_object(rq, vma->obj, false);
-	if (err == 0)
-		err = i915_vma_move_to_active(vma, rq, flags);
-	i915_vma_unlock(vma);
-
-	return err;
-}
-
 static int pin_buffer(struct i915_vma *vma, u64 addr)
 {
 	int err;
 
 	if (drm_mm_node_allocated(&vma->node) && i915_vma_offset(vma) != addr) {
-		err = i915_vma_unbind(vma);
+		err = i915_vma_unbind_unlocked(vma);
 		if (err)
 			return err;
 	}
@@ -513,7 +486,7 @@ tiled_blit(struct tiled_blits *t,
 		goto err_src;
 	}
 
-	err = i915_vma_pin(t->batch, 0, 0, PIN_USER | PIN_ZONE_48);
+	err = i915_vma_pin(t->batch, 0, 0, PIN_USER | PIN_HIGH);
 	if (err) {
 		pr_err("cannot pin batch\n");
 		goto err_dst;
@@ -529,11 +502,11 @@ tiled_blit(struct tiled_blits *t,
 		goto err_bb;
 	}
 
-	err = move_to_active(t->batch, rq, 0);
+	err = igt_vma_move_to_active_unlocked(t->batch, rq, 0);
 	if (!err)
-		err = move_to_active(src->vma, rq, 0);
+		err = igt_vma_move_to_active_unlocked(src->vma, rq, 0);
 	if (!err)
-		err = move_to_active(dst->vma, rq, 0);
+		err = igt_vma_move_to_active_unlocked(dst->vma, rq, 0);
 	if (!err)
 		err = rq->engine->emit_bb_start(rq,
 						i915_vma_offset(t->batch),
@@ -573,9 +546,7 @@ tiled_blits_create(struct intel_engine_cs *engine, struct rnd_state *prng)
 		goto err_free;
 	}
 
-	t->align = I915_GTT_PAGE_SIZE_2M; /* XXX worst case, derive from vm! */
-	t->align = max(t->align,
-		       i915_vm_min_alignment(t->ce->vm, INTEL_MEMORY_LOCAL));
+	t->align = i915_vm_min_alignment(t->ce->vm, INTEL_MEMORY_LOCAL);
 	t->align = max(t->align,
 		       i915_vm_min_alignment(t->ce->vm, INTEL_MEMORY_SYSTEM));
 

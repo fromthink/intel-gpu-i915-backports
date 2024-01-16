@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
 /*
- * Copyright © 2020 Intel Corporation
+ * Copyright © 2022 Intel Corporation
  */
 
 #include <drm/drm_device.h>
@@ -12,66 +12,20 @@
 #include "i915_drv.h"
 #include "i915_sysfs.h"
 #include "intel_gt.h"
+#include "intel_gt_print.h"
+#include "intel_gt_sysfs.h"
+#include "intel_gt_sysfs_pm.h"
 #include "intel_gt_types.h"
 #include "intel_rc6.h"
 
-#include "intel_sysfs_mem_health.h"
-#include "intel_gt_sysfs.h"
-#include "intel_gt_sysfs_pm.h"
-#include "sysfs_gt_errors.h"
-
-#ifdef BPM_DEVICE_ATTR_NOT_PRESENT
-typedef ssize_t (*show)(struct kobject *kobj, struct kobj_attribute *attr, char *buf);
-#else
-typedef ssize_t (*show)(struct device *dev, struct device_attribute *attr, char *buf);
-#endif
-
-
-struct i915_ext_attr {
-#ifdef BPM_DEVICE_ATTR_NOT_PRESENT
-	struct kobj_attribute attr;
-#else
-	struct device_attribute attr;
-#endif
-	show i915_show;
-};
-
-static ssize_t
-#ifdef BPM_DEVICE_ATTR_NOT_PRESENT
-i915_sysfs_show(struct kobject *kobj, struct kobj_attribute *attr, char *buf)
-#else
-i915_sysfs_show(struct device *dev, struct device_attribute *attr, char *buf)
-#endif
-
+bool is_object_gt(struct kobject *kobj)
 {
-	ssize_t value;
-#ifdef BPM_DEVICE_ATTR_NOT_PRESENT
-	struct device *dev = kobj_to_dev(kobj);
-#endif
-	struct i915_ext_attr *ea = container_of(attr, struct i915_ext_attr, attr);
-	struct intel_gt *gt = intel_gt_sysfs_get_drvdata(dev, attr->attr.name);
-	pvc_wa_disallow_rc6(gt->i915);
-
-#ifdef BPM_DEVICE_ATTR_NOT_PRESENT
-	value = ea->i915_show(kobj, attr, buf);
-#else
-	value = ea->i915_show(dev, attr, buf);
-#endif
-
-	pvc_wa_allow_rc6(gt->i915);
-
-	return value;
+	return !strncmp(kobj->name, "gt", 2);
 }
 
-#define I915_DEVICE_ATTR_RO(_name, _show) \
-	struct i915_ext_attr dev_attr_##_name = \
-	{ __ATTR(_name, 0444, i915_sysfs_show, NULL), _show}
-
-struct intel_gt *intel_gt_sysfs_get_drvdata(struct device *dev,
+struct intel_gt *intel_gt_sysfs_get_drvdata(struct kobject *kobj,
 					    const char *name)
 {
-	struct kobject *kobj = &dev->kobj;
-
 	/*
 	 * We are interested at knowing from where the interface
 	 * has been called, whether it's called from gt/ or from
@@ -83,49 +37,13 @@ struct intel_gt *intel_gt_sysfs_get_drvdata(struct device *dev,
 	 * "struct drm_i915_private *" type.
 	 */
 	if (!is_object_gt(kobj)) {
+		struct device *dev = kobj_to_dev(kobj);
 		struct drm_i915_private *i915 = kdev_minor_to_i915(dev);
 
-		pr_devel_ratelimited(DEPRECATED
-			"%s (pid %d) is trying to access deprecated %s "
-			"sysfs control, please use use gt/gt<n>/%s instead\n",
-			current->comm, task_pid_nr(current), name, name);
 		return to_gt(i915);
 	}
 
 	return kobj_to_gt(kobj);
-}
-
-static ssize_t
-#ifdef BPM_DEVICE_ATTR_NOT_PRESENT
-addr_range_show(struct kobject *kobj, struct kobj_attribute *attr, char *buf)
-#else
-addr_range_show(struct device *kdev, struct device_attribute *attr, char *buf)
-#endif
-{
-#ifdef BPM_DEVICE_ATTR_NOT_PRESENT
-	struct intel_gt *gt = kobj_to_gt(kobj);
-#else
-	struct intel_gt *gt = kobj_to_gt(&kdev->kobj);
-#endif
-
-	return sysfs_emit(buf, "%pa\n", &gt->lmem->actual_physical_mem);
-}
-
-static I915_DEVICE_ATTR_RO(addr_range, addr_range_show);
-
-static const struct attribute *addr_range_attrs[] = {
-	/* TODO: Report any other HBM Sparing sysfs per gt? */
-	&dev_attr_addr_range.attr.attr,
-	NULL
-};
-
-void intel_gt_sysfs_register_mem(struct intel_gt *gt, struct kobject *parent)
-{
-	if (!HAS_MEM_SPARING_SUPPORT(gt->i915))
-		return;
-
-	if (sysfs_create_files(parent, addr_range_attrs))
-		drm_err(&gt->i915->drm, "Setting up sysfs to read total physical memory per tile failed\n");
 }
 
 static struct kobject *gt_get_parent_obj(struct intel_gt *gt)
@@ -133,95 +51,35 @@ static struct kobject *gt_get_parent_obj(struct intel_gt *gt)
 	return &gt->i915->drm.primary->kdev->kobj;
 }
 
-int intel_gt_sysfs_reset(struct intel_gt *gt)
-{
-	/* Check if already wedged, if not then reset */
-	if (intel_gt_terminally_wedged(gt))
-		return -EIO;
-
-	/* The string is appended to "Resetting chip for..." */
-	intel_gt_handle_error(gt, ALL_ENGINES, I915_ERROR_CAPTURE,
-			      "GT%u manually from sysfs", gt->info.id);
-
-	return 0;
-}
-
-static ssize_t prelim_reset_store(struct device *dev,
-				  struct device_attribute *attr,
-				  const char *buf, size_t count)
-{
-	struct intel_gt *gt = intel_gt_sysfs_get_drvdata(dev, attr->attr.name);
-	bool val;
-	int ret;
-
-	ret = kstrtobool(buf, &val);
-	if (ret)
-		return ret;
-
-	if (!val)
-		return count;
-
-	return intel_gt_sysfs_reset(gt) ?: count;
-}
-
-static DEVICE_ATTR_WO(prelim_reset);
-
-#ifdef BPM_DEVICE_ATTR_NOT_PRESENT
 static ssize_t id_show(struct kobject *kobj,
-		struct kobj_attribute *attr,
-		char *buf)
-#else
-static ssize_t id_show(struct device *dev,
-                      struct device_attribute *attr,
-                      char *buf)
-#endif
+		       struct kobj_attribute *attr,
+		       char *buf)
 {
-#ifdef BPM_DEVICE_ATTR_NOT_PRESENT
-	struct device *dev = kobj_to_dev(kobj);
-#endif
-	struct intel_gt *gt = intel_gt_sysfs_get_drvdata(dev, attr->attr.name);
+	struct intel_gt *gt = intel_gt_sysfs_get_drvdata(kobj, attr->attr.name);
 
 	return sysfs_emit(buf, "%u\n", gt->info.id);
 }
+static struct kobj_attribute attr_id = __ATTR_RO(id);
 
-static I915_DEVICE_ATTR_RO(id, id_show);
+static struct attribute *id_attrs[] = {
+	&attr_id.attr,
+	NULL,
+};
+ATTRIBUTE_GROUPS(id);
 
+/* A kobject needs a release() method even if it does nothing */
 static void kobj_gt_release(struct kobject *kobj)
 {
-	kfree(kobj);
 }
 
-static struct kobj_type kobj_gt_type = {
+static const struct kobj_type kobj_gt_type = {
 	.release = kobj_gt_release,
-	.sysfs_ops = &kobj_sysfs_ops
+	.sysfs_ops = &kobj_sysfs_ops,
+	.default_groups = id_groups,
 };
-
-struct kobject *
-intel_gt_create_kobj(struct intel_gt *gt, struct kobject *dir, const char *name)
-{
-	struct kobj_gt *kg;
-
-	kg = kzalloc(sizeof(*kg), GFP_KERNEL);
-	if (!kg)
-		return NULL;
-
-	kobject_init(&kg->base, &kobj_gt_type);
-	kg->gt = gt;
-
-	/* xfer ownership to sysfs tree */
-	if (kobject_add(&kg->base, dir, "%s", name)) {
-		kobject_put(&kg->base);
-		return NULL;
-	}
-
-	return &kg->base; /* borrowed ref */
-}
 
 void intel_gt_sysfs_register(struct intel_gt *gt)
 {
-	struct kobject *dir;
-	char name[80];
-
 	/*
 	 * We need to make things right with the
 	 * ABI compatibility. The files were originally
@@ -230,37 +88,29 @@ void intel_gt_sysfs_register(struct intel_gt *gt)
 	 * We generate the files only for gt 0
 	 * to avoid duplicates.
 	 */
-	if (!gt->info.id)
+	if (gt_is_root(gt))
 		intel_gt_sysfs_pm_init(gt, gt_get_parent_obj(gt));
 
-	snprintf(name, sizeof(name), "gt%d", gt->info.id);
+	/* init and xfer ownership to sysfs tree */
+	if (kobject_init_and_add(&gt->sysfs_gt, &kobj_gt_type,
+				 gt->i915->sysfs_gt, "gt%d", gt->info.id))
+		goto exit_fail;
 
-	dir = intel_gt_create_kobj(gt, gt->i915->sysfs_gt, name);
-	if (!dir) {
-		drm_err(&gt->i915->drm,
-			"failed to initialize %s sysfs root\n", name);
-		return;
-	}
+	gt->sysfs_defaults = kobject_create_and_add(".defaults", &gt->sysfs_gt);
+	if (!gt->sysfs_defaults)
+		goto exit_fail;
 
-	gt->sysfs_defaults = kobject_create_and_add(".defaults", dir);
-	if (!gt->sysfs_defaults) {
-		drm_err(&gt->i915->drm, "failed to create gt sysfs .defaults\n");
-		return;
-	}
+	intel_gt_sysfs_pm_init(gt, &gt->sysfs_gt);
 
-	if (sysfs_create_file(dir, &dev_attr_id.attr.attr))
-		drm_err(&gt->i915->drm,
-			"failed to create sysfs %s info files\n", name);
+	return;
 
-	if (sysfs_create_file(dir, &dev_attr_prelim_reset.attr))
-		drm_warn(&gt->i915->drm,
-			 "failed to create sysfs %s reset files\n", name);
-
-	intel_gt_sysfs_pm_init(gt, dir);
-	intel_gt_sysfs_register_errors(gt, dir);
-	intel_gt_sysfs_register_mem(gt, dir);
+exit_fail:
+	kobject_put(&gt->sysfs_gt);
+	gt_warn(gt, "failed to initialize sysfs root\n");
 }
 
 void intel_gt_sysfs_unregister(struct intel_gt *gt)
 {
+	kobject_put(gt->sysfs_defaults);
+	kobject_put(&gt->sysfs_gt);
 }

@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: MIT */
 /*
- * Copyright © 2021 Intel Corporation
+ * Copyright © 2022 Intel Corporation
  */
 
 #ifndef _INTEL_GSC_FW_H_
@@ -9,13 +9,12 @@
 #include <linux/types.h>
 
 struct intel_gsc_uc;
+struct intel_uc_fw;
 struct intel_uncore;
 
-int intel_gsc_fw_upload(struct intel_gsc_uc *gsc);
-
-int intel_gsc_fw_heci_send(struct intel_gsc_uc *gsc, u64 addr_in, u32 size_in,
-			   u64 addr_out, u32 size_out);
-
-bool intel_gsc_uc_fw_init_done(struct intel_uncore *uncore);
+int intel_gsc_fw_get_binary_info(struct intel_uc_fw *gsc_fw, const void *data, size_t size);
+int intel_gsc_uc_fw_upload(struct intel_gsc_uc *gsc);
+bool intel_gsc_uc_fw_init_done(struct intel_gsc_uc *gsc);
+bool intel_gsc_uc_fw_proxy_init_done(struct intel_gsc_uc *gsc, bool needs_wakeref);
 
 #endif

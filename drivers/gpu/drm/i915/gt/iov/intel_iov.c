@@ -3,9 +3,8 @@
  * Copyright © 2022 Intel Corporation
  */
 
-#include "gt/intel_gt_pm.h"
-
 #include "intel_iov.h"
+#include "intel_iov_ggtt.h"
 #include "intel_iov_memirq.h"
 #include "intel_iov_provisioning.h"
 #include "intel_iov_query.h"
@@ -13,6 +12,9 @@
 #include "intel_iov_service.h"
 #include "intel_iov_state.h"
 #include "intel_iov_utils.h"
+#include "gt/intel_gt_pm.h"
+
+#include "i915_reg.h"
 
 /**
  * intel_iov_init_early - Prepare IOV data.
@@ -26,6 +28,8 @@ void intel_iov_init_early(struct intel_iov *iov)
 		intel_iov_provisioning_init_early(iov);
 		intel_iov_service_init_early(iov);
 		intel_iov_state_init_early(iov);
+	} else if (intel_iov_is_vf(iov)) {
+		intel_iov_ggtt_vf_init_early(iov);
 	}
 
 	intel_iov_relay_init_early(&iov->relay);
@@ -43,6 +47,8 @@ void intel_iov_release(struct intel_iov *iov)
 		intel_iov_state_release(iov);
 		intel_iov_service_release(iov);
 		intel_iov_provisioning_release(iov);
+	} else if (intel_iov_is_vf(iov)) {
+		intel_iov_ggtt_vf_release(iov);
 	}
 }
 
@@ -104,17 +110,14 @@ int intel_iov_init(struct intel_iov *iov)
 {
 	int err;
 
-	if (intel_iov_is_pf(iov)) {
-		err = intel_lmtt_init(&iov->pf.lmtt);
-		if (unlikely(err)) {
-			pf_update_status(iov, err, "lmtt");
-			return err;
-		}
-
+	if (intel_iov_is_pf(iov))
 		intel_iov_provisioning_init(iov);
-	}
 
 	if (intel_iov_is_vf(iov)) {
+		err = intel_iov_query_bootstrap(iov);
+		if (unlikely(err))
+			return err;
+
 		vf_tweak_guc_submission(iov);
 
 		err = intel_iov_memirq_init(iov);
@@ -133,10 +136,8 @@ int intel_iov_init(struct intel_iov *iov)
  */
 void intel_iov_fini(struct intel_iov *iov)
 {
-	if (intel_iov_is_pf(iov)) {
+	if (intel_iov_is_pf(iov))
 		intel_iov_provisioning_fini(iov);
-		intel_lmtt_fini(&iov->pf.lmtt);
-	}
 
 	if (intel_iov_is_vf(iov))
 		intel_iov_memirq_fini(iov);
@@ -186,11 +187,6 @@ static void vf_deballoon_ggtt(struct intel_iov *iov)
 	i915_ggtt_deballoon(ggtt, &iov->vf.ggtt_balloon[0]);
 }
 
-#if IS_ENABLED(CPTCFG_DRM_I915_SELFTEST)
-static void init_defaults_pte_io(struct intel_iov *iov);
-static int igt_vf_iov_own_ggtt(struct intel_iov *iov, bool sanitycheck);
-#endif
-
 /**
  * intel_iov_init_ggtt - Initialize GGTT for SR-IOV.
  * @iov: the IOV struct
@@ -208,10 +204,6 @@ int intel_iov_init_ggtt(struct intel_iov *iov)
 		err = vf_balloon_ggtt(iov);
 		if (unlikely(err))
 			return err;
-#if IS_ENABLED(CPTCFG_DRM_I915_SELFTEST)
-		init_defaults_pte_io(iov);
-		igt_vf_iov_own_ggtt(iov, true);
-#endif
 	}
 
 	return 0;
@@ -243,8 +235,6 @@ static void pf_enable_ggtt_guest_update(struct intel_iov *iov)
  * PF must configure hardware to enable VF's access to GGTT.
  * PF also updates here runtime info (snapshot of registers values)
  * that will be shared with VFs.
- * On platforms with LMEM, PF setups the initial (top-level non-present)
- * LMTT.
  *
  * Return: 0 on success or a negative error code on failure.
  */
@@ -253,7 +243,6 @@ int intel_iov_init_hw(struct intel_iov *iov)
 	int err;
 
 	if (intel_iov_is_pf(iov)) {
-		intel_lmtt_init_hw(&iov->pf.lmtt);
 		pf_enable_ggtt_guest_update(iov);
 		intel_iov_service_update(iov);
 		intel_iov_provisioning_restart(iov);
@@ -321,6 +310,34 @@ int intel_iov_init_late(struct intel_iov *iov)
 	return 0;
 }
 
-#if IS_ENABLED(CPTCFG_DRM_I915_SELFTEST)
-#include "selftests/selftest_live_iov_ggtt.c"
-#endif
+void intel_iov_pf_get_pm_vfs(struct intel_iov *iov)
+{
+	GEM_BUG_ON(!intel_iov_is_pf(iov));
+
+	intel_gt_pm_get(iov_to_gt(iov));
+}
+
+void intel_iov_pf_put_pm_vfs(struct intel_iov *iov)
+{
+	GEM_BUG_ON(!intel_iov_is_pf(iov));
+
+	intel_gt_pm_put(iov_to_gt(iov));
+}
+
+void intel_iov_suspend(struct intel_iov *iov)
+{
+	if (!intel_iov_is_pf(iov))
+		return;
+
+	if (pci_num_vf(to_pci_dev(iov_to_i915(iov)->drm.dev)) != 0)
+		intel_iov_pf_put_pm_vfs(iov);
+}
+
+void intel_iov_resume(struct intel_iov *iov)
+{
+	if (!intel_iov_is_pf(iov))
+		return;
+
+	if (pci_num_vf(to_pci_dev(iov_to_i915(iov)->drm.dev)) != 0)
+		intel_iov_pf_get_pm_vfs(iov);
+}

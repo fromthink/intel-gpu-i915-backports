@@ -18,6 +18,7 @@
  *  |   |       |   - `GuC Self Config KLVs`_                                  |
  *  |   |       |   - `GuC VGT Policy KLVs`_                                   |
  *  |   |       |   - `GuC VF Configuration KLVs`_                             |
+ *  |   |       |   - `GuC Global Config KLVs`_                                |
  *  |   |       |                                                              |
  *  |   +-------+--------------------------------------------------------------+
  *  |   |  15:0 | **LEN** - length of VALUE (in 32bit dwords)                  |
@@ -117,6 +118,13 @@ enum {
 	GUC_CONTEXT_POLICIES_KLV_NUM_IDS = 5,
 };
 
+/*
+ * Workaround keys:
+ */
+enum {
+	GUC_WORKAROUND_KLV_SERIALIZED_RA_MODE                           = 0x9001,
+};
+
 /**
  * DOC: GuC VGT Policy KLVs
  *
@@ -125,7 +133,7 @@ enum {
  * _`GUC_KLV_VGT_POLICY_SCHED_IF_IDLE` : 0x8001
  *      This config sets whether strict scheduling is enabled whereby any VF
  *      that doesn’t have work to submit is still allocated a fixed execution
- *      time-slice to ensure active VFs execution is always consitent even
+ *      time-slice to ensure active VFs execution is always consistent even
  *      during other VF reprovisiong / rebooting events. Changing this KLV
  *      impacts all VFs and takes effect on the next VF-Switch event.
  *
@@ -170,23 +178,11 @@ enum {
  *      A 4K aligned size of GGTT assigned to VF.
  *      Value is 64 bits.
  *
- * _`GUC_KLV_VF_CFG_LMEM_SIZE` : 0x0003
- *      A 2M aligned size of local memory assigned to VF.
- *      Value is 64 bits.
- *
  * _`GUC_KLV_VF_CFG_NUM_CONTEXTS` : 0x0004
  *      Refers to the number of contexts allocated to this VF.
  *
  *      :0: no contexts (default)
  *      :1-65535: number of contexts (Gen12)
- *
- * _`GUC_KLV_VF_CFG_TILE_MASK` : 0x0005
- *      For multi-tiled products, this field contains the bitwise-OR of tiles
- *      assigned to the VF. Bit-0-set means VF has access to Tile-0,
- *      Bit-31-set means VF has access to Tile-31, and etc.
- *      At least one tile will always be allocated.
- *      If all bits are zero, VF KMD should treat this as a fatal error.
- *      For, single-tile products this KLV config is ignored.
  *
  * _`GUC_KLV_VF_CFG_NUM_DOORBELLS` : 0x0006
  *      Refers to the number of doorbells allocated to this VF.
@@ -200,7 +196,7 @@ enum {
  *      of and this will never be perfectly-exact (accumulated nano-second
  *      granularity) since the GPUs clock time runs off a different crystal
  *      from the CPUs clock. Changing this KLV on a VF that is currently
- *      running a context wont take effect until a new context is scheduled in.
+ *      running a context won't take effect until a new context is scheduled in.
  *      That said, when the PF is changing this value from 0xFFFFFFFF to
  *      something else, it might never take effect if the VF is running an
  *      inifinitely long compute or shader kernel. In such a scenario, the
@@ -216,7 +212,7 @@ enum {
  *      HW is capable and this will never be perfectly-exact (accumulated
  *      nano-second granularity) since the GPUs clock time runs off a
  *      different crystal from the CPUs clock. Changing this KLV on a VF
- *      that is currently running a context wont take effect until a new
+ *      that is currently running a context won't take effect until a new
  *      context is scheduled in.
  *      That said, when the PF is changing this value from 0xFFFFFFFF to
  *      something else, it might never take effect if the VF is running an
@@ -284,14 +280,8 @@ enum {
 #define GUC_KLV_VF_CFG_GGTT_SIZE_KEY		0x0002
 #define GUC_KLV_VF_CFG_GGTT_SIZE_LEN		2u
 
-#define GUC_KLV_VF_CFG_LMEM_SIZE_KEY		0x0003
-#define GUC_KLV_VF_CFG_LMEM_SIZE_LEN		2u
-
 #define GUC_KLV_VF_CFG_NUM_CONTEXTS_KEY		0x0004
 #define GUC_KLV_VF_CFG_NUM_CONTEXTS_LEN		1u
-
-#define GUC_KLV_VF_CFG_TILE_MASK_KEY		0x0005
-#define GUC_KLV_VF_CFG_TILE_MASK_LEN		1u
 
 #define GUC_KLV_VF_CFG_NUM_DOORBELLS_KEY	0x0006
 #define GUC_KLV_VF_CFG_NUM_DOORBELLS_LEN	1u
@@ -325,5 +315,19 @@ enum {
 
 #define GUC_KLV_VF_CFG_BEGIN_CONTEXT_ID_KEY	0x8a0b
 #define GUC_KLV_VF_CFG_BEGIN_CONTEXT_ID_LEN	1u
+
+/**
+ * DOC: GuC Global Config KLVs
+ *
+ * Additional `GuC KLV`_ keys available for use with HOST2GUC_SELF_CFG_.
+ *
+ * _`GUC_KLV_GLOBAL_CFG_GMD_ID` : 0x3000
+ *      Contains raw value of the GMD_ID register (0xd8c or 0x380d8c).
+ *      Supported only on platforms with GMD (MTL+).
+ *      Requires VF ABI version 1.2+.
+ */
+
+#define GUC_KLV_GLOBAL_CFG_GMD_ID_KEY			0x3000
+#define GUC_KLV_GLOBAL_CFG_GMD_ID_LEN			1u
 
 #endif /* _ABI_GUC_KLVS_ABI_H */

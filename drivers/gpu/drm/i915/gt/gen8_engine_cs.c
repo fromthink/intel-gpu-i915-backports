@@ -4,9 +4,9 @@
  */
 
 #include "gen8_engine_cs.h"
-#include "i915_drv.h"
 #include "intel_engine_regs.h"
 #include "intel_gpu_commands.h"
+#include "intel_gt.h"
 #include "intel_lrc.h"
 #include "intel_ring.h"
 
@@ -43,7 +43,7 @@ int gen8_emit_flush_rcs(struct i915_request *rq, u32 mode)
 			vf_flush_wa = true;
 
 		/* WaForGAMHang:kbl */
-		if (IS_KBL_GRAPHICS_STEP(rq->engine->i915, 0, STEP_C0))
+		if (IS_KABYLAKE(rq->i915) && IS_GRAPHICS_STEP(rq->i915, 0, STEP_C0))
 			dc_flush_wa = true;
 	}
 
@@ -165,58 +165,151 @@ static u32 preparser_disable(bool state)
 	return MI_ARB_CHECK | 1 << 8 | state;
 }
 
-u32 *gen12_emit_aux_table_inv(struct intel_gt *gt, u32 *cs, const i915_reg_t inv_reg)
+static i915_reg_t gen12_get_aux_inv_reg(struct intel_engine_cs *engine)
 {
-	u32 gsi_offset = gt->uncore->gsi_offset;
+	switch (engine->id) {
+	case RCS0:
+		return GEN12_CCS_AUX_INV;
+	case BCS0:
+		return GEN12_BCS0_AUX_INV;
+	case VCS0:
+		return GEN12_VD0_AUX_INV;
+	case VCS2:
+		return GEN12_VD2_AUX_INV;
+	case VECS0:
+		return GEN12_VE0_AUX_INV;
+	case CCS0:
+		return GEN12_CCS0_AUX_INV;
+	default:
+		return INVALID_MMIO_REG;
+	}
+}
+
+static bool gen12_needs_ccs_aux_inv(struct intel_engine_cs *engine)
+{
+	i915_reg_t reg = gen12_get_aux_inv_reg(engine);
+
+	if (IS_PONTEVECCHIO(engine->i915))
+		return false;
+
+	/*
+	 * So far platforms supported by i915 having flat ccs do not require
+	 * AUX invalidation. Check also whether the engine requires it.
+	 */
+	return i915_mmio_reg_valid(reg) && !HAS_FLAT_CCS(engine->i915);
+}
+
+u32 *gen12_emit_aux_table_inv(struct intel_engine_cs *engine, u32 *cs)
+{
+	i915_reg_t inv_reg = gen12_get_aux_inv_reg(engine);
+	u32 gsi_offset = engine->gt->uncore->gsi_offset;
+
+	if (!gen12_needs_ccs_aux_inv(engine))
+		return cs;
 
 	*cs++ = MI_LOAD_REGISTER_IMM(1) | MI_LRI_MMIO_REMAP_EN;
 	*cs++ = i915_mmio_reg_offset(inv_reg) + gsi_offset;
 	*cs++ = AUX_INV;
-	*cs++ = MI_NOOP;
+
+	*cs++ = MI_SEMAPHORE_WAIT_TOKEN |
+		MI_SEMAPHORE_REGISTER_POLL |
+		MI_SEMAPHORE_POLL |
+		MI_SEMAPHORE_SAD_EQ_SDD;
+	*cs++ = 0;
+	*cs++ = i915_mmio_reg_offset(inv_reg) + gsi_offset;
+	*cs++ = 0;
+	*cs++ = 0;
 
 	return cs;
+}
+
+static int mtl_dummy_pipe_control(struct i915_request *rq)
+{
+	/* Wa_14016712196 */
+	if (IS_GFX_GT_IP_RANGE(rq->engine->gt, IP_VER(12, 70), IP_VER(12, 74)) ||
+	    IS_DG2(rq->i915)) {
+		u32 *cs;
+
+		/* dummy PIPE_CONTROL + depth flush */
+		cs = intel_ring_begin(rq, 6);
+		if (IS_ERR(cs))
+			return PTR_ERR(cs);
+		cs = gen12_emit_pipe_control(cs,
+					     0,
+					     PIPE_CONTROL_DEPTH_CACHE_FLUSH,
+					     LRC_PPHWSP_SCRATCH_ADDR);
+		intel_ring_advance(rq, cs);
+	}
+
+	return 0;
 }
 
 int gen12_emit_flush_rcs(struct i915_request *rq, u32 mode)
 {
 	struct intel_engine_cs *engine = rq->engine;
 
-	if (mode & EMIT_FLUSH) {
-		u32 flags = 0;
+	/*
+	 * On Aux CCS platforms the invalidation of the Aux
+	 * table requires quiescing memory traffic beforehand
+	 */
+	if (mode & EMIT_FLUSH || gen12_needs_ccs_aux_inv(engine)) {
+		u32 bit_group_0 = 0;
+		u32 bit_group_1 = 0;
+		int err;
 		u32 *cs;
 
-		flags |= PIPE_CONTROL_TILE_CACHE_FLUSH;
-		flags |= PIPE_CONTROL_FLUSH_L3;
-		flags |= PIPE_CONTROL_RENDER_TARGET_CACHE_FLUSH;
-		flags |= PIPE_CONTROL_DEPTH_CACHE_FLUSH;
+		err = mtl_dummy_pipe_control(rq);
+		if (err)
+			return err;
+
+		bit_group_0 |= PIPE_CONTROL0_HDC_PIPELINE_FLUSH;
+
+		/*
+		 * When required, in MTL and beyond platforms we
+		 * need to set the CCS_FLUSH bit in the pipe control
+		 */
+		if (GRAPHICS_VER_FULL(rq->i915) >= IP_VER(12, 70))
+			bit_group_0 |= PIPE_CONTROL_CCS_FLUSH;
+
+		bit_group_1 |= PIPE_CONTROL_TILE_CACHE_FLUSH;
+
+		if (GRAPHICS_VER_FULL(rq->i915) < IP_VER(12, 70))
+			bit_group_1 |= PIPE_CONTROL_FLUSH_L3;
+
+		bit_group_1 |= PIPE_CONTROL_RENDER_TARGET_CACHE_FLUSH;
+		bit_group_1 |= PIPE_CONTROL_DEPTH_CACHE_FLUSH;
 		/* Wa_1409600907:tgl,adl-p */
-		flags |= PIPE_CONTROL_DEPTH_STALL;
-		flags |= PIPE_CONTROL_DC_FLUSH_ENABLE;
-		flags |= PIPE_CONTROL_FLUSH_ENABLE;
+		bit_group_1 |= PIPE_CONTROL_DEPTH_STALL;
+		bit_group_1 |= PIPE_CONTROL_DC_FLUSH_ENABLE;
+		bit_group_1 |= PIPE_CONTROL_FLUSH_ENABLE;
 
-		flags |= PIPE_CONTROL_STORE_DATA_INDEX;
-		flags |= PIPE_CONTROL_QW_WRITE;
+		bit_group_1 |= PIPE_CONTROL_STORE_DATA_INDEX;
+		bit_group_1 |= PIPE_CONTROL_QW_WRITE;
 
-		flags |= PIPE_CONTROL_CS_STALL;
+		bit_group_1 |= PIPE_CONTROL_CS_STALL;
 
 		if (!HAS_3D_PIPELINE(engine->i915))
-			flags &= ~PIPE_CONTROL_3D_ARCH_FLAGS;
+			bit_group_1 &= ~PIPE_CONTROL_3D_ARCH_FLAGS;
 		else if (engine->class == COMPUTE_CLASS)
-			flags &= ~PIPE_CONTROL_3D_ENGINE_FLAGS;
+			bit_group_1 &= ~PIPE_CONTROL_3D_ENGINE_FLAGS;
 
 		cs = intel_ring_begin(rq, 6);
 		if (IS_ERR(cs))
 			return PTR_ERR(cs);
 
-		cs = gen12_emit_pipe_control(cs,
-					     PIPE_CONTROL0_HDC_PIPELINE_FLUSH,
-					     flags, LRC_PPHWSP_SCRATCH_ADDR);
+		cs = gen12_emit_pipe_control(cs, bit_group_0, bit_group_1,
+					     LRC_PPHWSP_SCRATCH_ADDR);
 		intel_ring_advance(rq, cs);
 	}
 
 	if (mode & EMIT_INVALIDATE) {
 		u32 flags = 0;
 		u32 *cs, count;
+		int err;
+
+		err = mtl_dummy_pipe_control(rq);
+		if (err)
+			return err;
 
 		flags |= PIPE_CONTROL_COMMAND_CACHE_INVALIDATE;
 		flags |= PIPE_CONTROL_TLB_INVALIDATE;
@@ -236,10 +329,9 @@ int gen12_emit_flush_rcs(struct i915_request *rq, u32 mode)
 		else if (engine->class == COMPUTE_CLASS)
 			flags &= ~PIPE_CONTROL_3D_ENGINE_FLAGS;
 
-		if (!HAS_FLAT_CCS(rq->engine->i915))
-			count = 8 + 4;
-		else
-			count = 8;
+		count = 8;
+		if (gen12_needs_ccs_aux_inv(rq->engine))
+			count += 8;
 
 		cs = intel_ring_begin(rq, count);
 		if (IS_ERR(cs))
@@ -254,11 +346,7 @@ int gen12_emit_flush_rcs(struct i915_request *rq, u32 mode)
 
 		cs = gen8_emit_pipe_control(cs, flags, LRC_PPHWSP_SCRATCH_ADDR);
 
-		if (!HAS_FLAT_CCS(rq->engine->i915)) {
-			/* hsdes: 1809175790 */
-			cs = gen12_emit_aux_table_inv(rq->engine->gt,
-						      cs, GEN12_GFX_CCS_AUX_NV);
-		}
+		cs = gen12_emit_aux_table_inv(engine, cs);
 
 		*cs++ = preparser_disable(false);
 		intel_ring_advance(rq, cs);
@@ -269,22 +357,14 @@ int gen12_emit_flush_rcs(struct i915_request *rq, u32 mode)
 
 int gen12_emit_flush_xcs(struct i915_request *rq, u32 mode)
 {
-	intel_engine_mask_t aux_inv = 0;
-	u32 cmd, *cs;
+	u32 cmd = 4;
+	u32 *cs;
 
-	cmd = 4;
 	if (mode & EMIT_INVALIDATE) {
 		cmd += 2;
 
-		if (!HAS_FLAT_CCS(rq->engine->i915) &&
-		    (rq->engine->class == VIDEO_DECODE_CLASS ||
-		     rq->engine->class == VIDEO_ENHANCEMENT_CLASS)) {
-			aux_inv = rq->execution_mask &
-				~GENMASK(_BCS(I915_MAX_BCS - 1), BCS0) &
-				~BIT(GSC0);
-			if (aux_inv)
-				cmd += 4;
-		}
+		if (gen12_needs_ccs_aux_inv(rq->engine))
+			cmd += 8;
 	}
 
 	cs = intel_ring_begin(rq, cmd);
@@ -308,6 +388,10 @@ int gen12_emit_flush_xcs(struct i915_request *rq, u32 mode)
 		cmd |= MI_INVALIDATE_TLB;
 		if (rq->engine->class == VIDEO_DECODE_CLASS)
 			cmd |= MI_INVALIDATE_BSD;
+
+		if (gen12_needs_ccs_aux_inv(rq->engine) &&
+		    rq->engine->class == COPY_ENGINE_CLASS)
+			cmd |= MI_FLUSH_DW_CCS;
 	}
 
 	*cs++ = cmd;
@@ -315,14 +399,7 @@ int gen12_emit_flush_xcs(struct i915_request *rq, u32 mode)
 	*cs++ = 0; /* upper addr */
 	*cs++ = 0; /* value */
 
-	if (aux_inv) { /* hsdes: 1809175790 */
-		if (rq->engine->class == VIDEO_DECODE_CLASS)
-			cs = gen12_emit_aux_table_inv(rq->engine->gt,
-						      cs, GEN12_VD0_AUX_NV);
-		else
-			cs = gen12_emit_aux_table_inv(rq->engine->gt,
-						      cs, GEN12_VE0_AUX_NV);
-	}
+	cs = gen12_emit_aux_table_inv(rq->engine, cs);
 
 	if (mode & EMIT_INVALIDATE)
 		*cs++ = preparser_disable(false);
@@ -355,7 +432,7 @@ int gen8_emit_init_breadcrumb(struct i915_request *rq)
 	u32 *cs;
 
 	GEM_BUG_ON(i915_request_has_initial_breadcrumb(rq));
-	if (!intel_timeline_has_initial_breadcrumb(i915_request_timeline(rq)))
+	if (!i915_request_timeline(rq)->has_initial_breadcrumb)
 		return 0;
 
 	cs = intel_ring_begin(rq, 6);
@@ -365,7 +442,7 @@ int gen8_emit_init_breadcrumb(struct i915_request *rq)
 	*cs++ = MI_STORE_DWORD_IMM_GEN4 | MI_USE_GGTT;
 	*cs++ = hwsp_offset(rq);
 	*cs++ = 0;
-	*cs++ = i915_request_seqno(rq) - 1;
+	*cs++ = rq->fence.seqno - 1;
 
 	/*
 	 * Check if we have been preempted before we even get started.
@@ -408,7 +485,7 @@ static int __xehp_emit_bb_start(struct i915_request *rq,
 
 	GEM_BUG_ON(!ce->wa_bb_page);
 
-	cs = intel_ring_begin(rq, 14);
+	cs = intel_ring_begin(rq, 12);
 	if (IS_ERR(cs))
 		return PTR_ERR(cs);
 
@@ -426,19 +503,12 @@ static int __xehp_emit_bb_start(struct i915_request *rq,
 	*cs++ = lower_32_bits(offset);
 	*cs++ = upper_32_bits(offset);
 
-	if (HAS_MEM_FENCE_SUPPORT(rq->engine->i915) &&
-	    rq->context->vm->mfence.vma)
-		*cs++ = MI_MEM_FENCE | MI_ACQUIRE_ENABLE;
-	else
-		*cs++ = MI_NOOP;
-
 	/* Fixup stray MI_SET_PREDICATE as it prevents us executing the ring */
 	*cs++ = MI_BATCH_BUFFER_START_GEN8;
 	*cs++ = wa_offset + DG2_PREDICATE_RESULT_BB;
 	*cs++ = 0;
 
 	*cs++ = MI_ARB_ON_OFF | MI_ARB_DISABLE;
-	*cs++ = MI_NOOP;
 
 	intel_ring_advance(rq, cs);
 
@@ -564,63 +634,9 @@ static u32 *emit_preempt_busywait(struct i915_request *rq, u32 *cs)
 	return cs;
 }
 
-static u32 *emit_user_fence_store(struct i915_request *rq, u32 *cs)
-{
-	if (rq->has_user_fence) {
-		*cs++ = MI_STORE_QWORD_IMM_GEN8;
-		*cs++ = lower_32_bits(rq->user_fence.addr);
-		*cs++ = upper_32_bits(rq->user_fence.addr);
-		*cs++ = lower_32_bits(rq->user_fence.value);
-		*cs++ = upper_32_bits(rq->user_fence.value);
-	} else {
-		/* user fence space is reserved regardless whether this
-		 * request has user fence or not. See func measure_breadcrumb_dw
-		 * fill the hole if there is no user fence.
-		 */
-		*cs++ = MI_NOOP;
-		*cs++ = MI_NOOP;
-		*cs++ = MI_NOOP;
-		*cs++ = MI_NOOP;
-		*cs++ = MI_NOOP;
-	}
-	*cs++ = MI_NOOP;
-	return cs;
-}
-
-static u32 *emit_breadcrumb(struct i915_request *rq, u32 *cs)
-{
-	struct intel_timeline *tl = rcu_dereference_protected(rq->timeline, 1);
-	u32 offset = hwsp_offset(rq);
-
-	/* Signal the user fence first (after flushing memory/GO) */
-	cs = emit_user_fence_store(rq, cs);
-
-	/* so that the user fence itself can be guarded by the completion. */
-	if (intel_timeline_is_relative(tl)) {
-		u32 cmd;
-
-		cmd = MI_STORE_DWORD_INDEX;
-		if (intel_timeline_in_context(tl))
-			cmd |= MI_USE_PPHWSP;
-
-		*cs++ = cmd;
-		*cs++ = offset_in_page(offset);
-		*cs++ = i915_request_seqno(rq);
-		*cs++ = MI_NOOP;
-	} else {
-		*cs++ = MI_STORE_DWORD_IMM_GEN4 | MI_USE_GGTT | MI_POSTED;
-		*cs++ = offset;
-		*cs++ = 0;
-		*cs++ = i915_request_seqno(rq);
-	}
-
-	return cs;
-}
-
 static __always_inline u32*
 gen8_emit_fini_breadcrumb_tail(struct i915_request *rq, u32 *cs)
 {
-	cs = emit_breadcrumb(rq, cs);
 	*cs++ = MI_USER_INTERRUPT;
 
 	*cs++ = MI_ARB_ON_OFF | MI_ARB_ENABLE;
@@ -634,14 +650,18 @@ gen8_emit_fini_breadcrumb_tail(struct i915_request *rq, u32 *cs)
 	return gen8_emit_wa_tail(rq, cs);
 }
 
+static u32 *emit_xcs_breadcrumb(struct i915_request *rq, u32 *cs)
+{
+	return gen8_emit_ggtt_write(cs, rq->fence.seqno, hwsp_offset(rq), 0);
+}
+
 u32 *gen8_emit_fini_breadcrumb_xcs(struct i915_request *rq, u32 *cs)
 {
-	return gen8_emit_fini_breadcrumb_tail(rq, cs);
+	return gen8_emit_fini_breadcrumb_tail(rq, emit_xcs_breadcrumb(rq, cs));
 }
 
 u32 *gen8_emit_fini_breadcrumb_rcs(struct i915_request *rq, u32 *cs)
 {
-	/* XXX flush+write+CS_STALL all in one upsets gem_concurrent_blt:kbl */
 	cs = gen8_emit_pipe_control(cs,
 				    PIPE_CONTROL_CS_STALL |
 				    PIPE_CONTROL_TLB_INVALIDATE |
@@ -649,6 +669,13 @@ u32 *gen8_emit_fini_breadcrumb_rcs(struct i915_request *rq, u32 *cs)
 				    PIPE_CONTROL_DEPTH_CACHE_FLUSH |
 				    PIPE_CONTROL_DC_FLUSH_ENABLE,
 				    0);
+
+	/* XXX flush+write+CS_STALL all in one upsets gem_concurrent_blt:kbl */
+	cs = gen8_emit_ggtt_write_rcs(cs,
+				      rq->fence.seqno,
+				      hwsp_offset(rq),
+				      PIPE_CONTROL_FLUSH_ENABLE |
+				      PIPE_CONTROL_CS_STALL);
 
 	return gen8_emit_fini_breadcrumb_tail(rq, cs);
 }
@@ -663,6 +690,13 @@ u32 *gen11_emit_fini_breadcrumb_rcs(struct i915_request *rq, u32 *cs)
 				    PIPE_CONTROL_DEPTH_CACHE_FLUSH |
 				    PIPE_CONTROL_DC_FLUSH_ENABLE,
 				    0);
+
+	/*XXX: Look at gen8_emit_fini_breadcrumb_rcs */
+	cs = gen8_emit_ggtt_write_rcs(cs,
+				      rq->fence.seqno,
+				      hwsp_offset(rq),
+				      PIPE_CONTROL_FLUSH_ENABLE |
+				      PIPE_CONTROL_CS_STALL);
 
 	return gen8_emit_fini_breadcrumb_tail(rq, cs);
 }
@@ -702,21 +736,25 @@ static u32 *gen12_emit_preempt_busywait(struct i915_request *rq, u32 *cs)
 }
 
 /* Wa_14014475959:dg2 */
-#define CCS_SEMAPHORE_PPHWSP_OFFSET	0x540
-static u32 ccs_semaphore_offset(struct i915_request *rq)
+/* Wa_16019325821 */
+/* Wa_14019159160 */
+#define HOLD_SWITCHOUT_SEMAPHORE_PPHWSP_OFFSET	0x540
+static u32 hold_switchout_semaphore_offset(struct i915_request *rq)
 {
 	return i915_ggtt_offset(rq->context->state) +
-		(LRC_PPHWSP_PN * PAGE_SIZE) + CCS_SEMAPHORE_PPHWSP_OFFSET;
+		(LRC_PPHWSP_PN * PAGE_SIZE) + HOLD_SWITCHOUT_SEMAPHORE_PPHWSP_OFFSET;
 }
 
 /* Wa_14014475959:dg2 */
-static u32 *ccs_emit_wa_busywait(struct i915_request *rq, u32 *cs)
+/* Wa_16019325821 */
+/* Wa_14019159160 */
+static u32 *hold_switchout_emit_wa_busywait(struct i915_request *rq, u32 *cs)
 {
 	int i;
 
 	*cs++ = MI_ATOMIC_INLINE | MI_ATOMIC_GLOBAL_GTT | MI_ATOMIC_CS_STALL |
 		MI_ATOMIC_MOVE;
-	*cs++ = ccs_semaphore_offset(rq);
+	*cs++ = hold_switchout_semaphore_offset(rq);
 	*cs++ = 0;
 	*cs++ = 1;
 
@@ -732,7 +770,7 @@ static u32 *ccs_emit_wa_busywait(struct i915_request *rq, u32 *cs)
 		MI_SEMAPHORE_POLL |
 		MI_SEMAPHORE_SAD_EQ_SDD;
 	*cs++ = 0;
-	*cs++ = ccs_semaphore_offset(rq);
+	*cs++ = hold_switchout_semaphore_offset(rq);
 	*cs++ = 0;
 
 	return cs;
@@ -741,7 +779,6 @@ static u32 *ccs_emit_wa_busywait(struct i915_request *rq, u32 *cs)
 static __always_inline u32*
 gen12_emit_fini_breadcrumb_tail(struct i915_request *rq, u32 *cs)
 {
-	cs = emit_breadcrumb(rq, cs);
 	*cs++ = MI_USER_INTERRUPT;
 
 	*cs++ = MI_ARB_ON_OFF | MI_ARB_ENABLE;
@@ -750,8 +787,10 @@ gen12_emit_fini_breadcrumb_tail(struct i915_request *rq, u32 *cs)
 		cs = gen12_emit_preempt_busywait(rq, cs);
 
 	/* Wa_14014475959:dg2 */
-	if (intel_engine_uses_wa_hold_ccs_switchout(rq->engine))
-		cs = ccs_emit_wa_busywait(rq, cs);
+	/* Wa_16019325821 */
+	/* Wa_14019159160 */
+	if (intel_engine_uses_wa_hold_switchout(rq->engine))
+		cs = hold_switchout_emit_wa_busywait(rq, cs);
 
 	rq->tail = intel_ring_offset(rq, cs);
 	assert_ring_tail_valid(rq->ring, rq->tail);
@@ -762,7 +801,7 @@ gen12_emit_fini_breadcrumb_tail(struct i915_request *rq, u32 *cs)
 u32 *gen12_emit_fini_breadcrumb_xcs(struct i915_request *rq, u32 *cs)
 {
 	/* XXX Stalling flush before seqno write; post-sync not */
-	cs = __gen8_emit_flush_dw(cs, 0, 0, 0);
+	cs = emit_xcs_breadcrumb(rq, __gen8_emit_flush_dw(cs, 0, 0, 0));
 	return gen12_emit_fini_breadcrumb_tail(rq, cs);
 }
 
@@ -773,11 +812,19 @@ u32 *gen12_emit_fini_breadcrumb_rcs(struct i915_request *rq, u32 *cs)
 	u32 flags = (PIPE_CONTROL_CS_STALL |
 		     PIPE_CONTROL_TLB_INVALIDATE |
 		     PIPE_CONTROL_TILE_CACHE_FLUSH |
-		     PIPE_CONTROL_FLUSH_L3 |
 		     PIPE_CONTROL_RENDER_TARGET_CACHE_FLUSH |
 		     PIPE_CONTROL_DEPTH_CACHE_FLUSH |
 		     PIPE_CONTROL_DC_FLUSH_ENABLE |
 		     PIPE_CONTROL_FLUSH_ENABLE);
+
+	if (GRAPHICS_VER_FULL(i915) < IP_VER(12, 70))
+		flags |= PIPE_CONTROL_FLUSH_L3;
+
+	/* Wa_14016712196 */
+	if (IS_GFX_GT_IP_RANGE(gt, IP_VER(12, 70), IP_VER(12, 74)) || IS_DG2(i915))
+		/* dummy PIPE_CONTROL + depth flush */
+		cs = gen12_emit_pipe_control(cs, 0,
+					     PIPE_CONTROL_DEPTH_CACHE_FLUSH, 0);
 
 	if (GRAPHICS_VER(i915) == 12 && GRAPHICS_VER_FULL(i915) < IP_VER(12, 50))
 		/* Wa_1409600907 */
@@ -788,30 +835,15 @@ u32 *gen12_emit_fini_breadcrumb_rcs(struct i915_request *rq, u32 *cs)
 	else if (rq->engine->class == COMPUTE_CLASS)
 		flags &= ~PIPE_CONTROL_3D_ENGINE_FLAGS;
 
-	/*
-	 * Wa_14015275368:pvc
-	 * Add an additional pipe control with CS stall when
-	 * EU stall sampling is enabled
-	 */
-	if (IS_PONTEVECCHIO(i915)) {
-		if (gt->eu_stall_cntr.stream) {
-			cs = gen12_emit_pipe_control(cs, 0, PIPE_CONTROL_CS_STALL, 0);
-		} else {
-			/*
-			 * Reserve space for an additional pipe control as
-			 * EU stall sampling isn't enabled during driver load.
-			 * See measure_breadcrumb_dw()
-			 */
-			*cs++ = MI_NOOP;
-			*cs++ = MI_NOOP;
-			*cs++ = MI_NOOP;
-			*cs++ = MI_NOOP;
-			*cs++ = MI_NOOP;
-			*cs++ = MI_NOOP;
-		}
-	}
-
 	cs = gen12_emit_pipe_control(cs, PIPE_CONTROL0_HDC_PIPELINE_FLUSH, flags, 0);
+
+	/*XXX: Look at gen8_emit_fini_breadcrumb_rcs */
+	cs = gen12_emit_ggtt_write_rcs(cs,
+				       rq->fence.seqno,
+				       hwsp_offset(rq),
+				       0,
+				       PIPE_CONTROL_FLUSH_ENABLE |
+				       PIPE_CONTROL_CS_STALL);
 
 	return gen12_emit_fini_breadcrumb_tail(rq, cs);
 }

@@ -27,10 +27,8 @@
 #include <linux/gpio/consumer.h>
 #include <linux/gpio/machine.h>
 #include <linux/mfd/intel_soc_pmic.h>
-#ifndef BPM_PINCTRL_UNREGISTER_MAPPINGS_NOT_PRESENT
 #include <linux/pinctrl/consumer.h>
 #include <linux/pinctrl/machine.h>
-#endif
 #include <linux/slab.h>
 #include <linux/string_helpers.h>
 
@@ -43,9 +41,12 @@
 
 #include "i915_drv.h"
 #include "i915_reg.h"
+#include "intel_de.h"
 #include "intel_display_types.h"
 #include "intel_dsi.h"
 #include "intel_dsi_vbt.h"
+#include "intel_gmbus_regs.h"
+#include "intel_pps_regs.h"
 #include "vlv_dsi.h"
 #include "vlv_dsi_regs.h"
 #include "vlv_sideband.h"
@@ -139,9 +140,9 @@ static enum port intel_dsi_seq_port_to_port(struct intel_dsi *intel_dsi,
 		return ffs(intel_dsi->ports) - 1;
 
 	if (seq_port) {
-		if (intel_dsi->ports & PORT_B)
+		if (intel_dsi->ports & BIT(PORT_B))
 			return PORT_B;
-		else if (intel_dsi->ports & PORT_C)
+		else if (intel_dsi->ports & BIT(PORT_C))
 			return PORT_C;
 	}
 
@@ -234,7 +235,7 @@ static const u8 *mipi_exec_delay(struct intel_dsi *intel_dsi, const u8 *data)
 	struct drm_i915_private *i915 = to_i915(intel_dsi->base.base.dev);
 	u32 delay = *((const u32 *) data);
 
-	drm_dbg_kms(&i915->drm, "\n");
+	drm_dbg_kms(&i915->drm, "%d usecs\n", delay);
 
 	usleep_range(delay, delay + 10);
 	data += 4;
@@ -379,6 +380,85 @@ static void icl_exec_gpio(struct intel_connector *connector,
 	drm_dbg_kms(&dev_priv->drm, "Skipping ICL GPIO element execution\n");
 }
 
+enum {
+	MIPI_RESET_1 = 0,
+	MIPI_AVDD_EN_1,
+	MIPI_BKLT_EN_1,
+	MIPI_AVEE_EN_1,
+	MIPI_VIO_EN_1,
+	MIPI_RESET_2,
+	MIPI_AVDD_EN_2,
+	MIPI_BKLT_EN_2,
+	MIPI_AVEE_EN_2,
+	MIPI_VIO_EN_2,
+};
+
+static void icl_native_gpio_set_value(struct drm_i915_private *dev_priv,
+				      int gpio, bool value)
+{
+	int index;
+
+	if (drm_WARN_ON(&dev_priv->drm, DISPLAY_VER(dev_priv) == 11 && gpio >= MIPI_RESET_2))
+		return;
+
+	switch (gpio) {
+	case MIPI_RESET_1:
+	case MIPI_RESET_2:
+		index = gpio == MIPI_RESET_1 ? HPD_PORT_A : HPD_PORT_B;
+
+		/*
+		 * Disable HPD to set the pin to output, and set output
+		 * value. The HPD pin should not be enabled for DSI anyway,
+		 * assuming the board design and VBT are sane, and the pin isn't
+		 * used by a non-DSI encoder.
+		 *
+		 * The locking protects against concurrent SHOTPLUG_CTL_DDI
+		 * modifications in irq setup and handling.
+		 */
+		spin_lock_irq(&dev_priv->irq_lock);
+		intel_de_rmw(dev_priv, SHOTPLUG_CTL_DDI,
+			     SHOTPLUG_CTL_DDI_HPD_ENABLE(index) |
+			     SHOTPLUG_CTL_DDI_HPD_OUTPUT_DATA(index),
+			     value ? SHOTPLUG_CTL_DDI_HPD_OUTPUT_DATA(index) : 0);
+		spin_unlock_irq(&dev_priv->irq_lock);
+		break;
+	case MIPI_AVDD_EN_1:
+	case MIPI_AVDD_EN_2:
+		index = gpio == MIPI_AVDD_EN_1 ? 0 : 1;
+
+		intel_de_rmw(dev_priv, PP_CONTROL(index), PANEL_POWER_ON,
+			     value ? PANEL_POWER_ON : 0);
+		break;
+	case MIPI_BKLT_EN_1:
+	case MIPI_BKLT_EN_2:
+		index = gpio == MIPI_BKLT_EN_1 ? 0 : 1;
+
+		intel_de_rmw(dev_priv, PP_CONTROL(index), EDP_BLC_ENABLE,
+			     value ? EDP_BLC_ENABLE : 0);
+		break;
+	case MIPI_AVEE_EN_1:
+	case MIPI_AVEE_EN_2:
+		index = gpio == MIPI_AVEE_EN_1 ? 1 : 2;
+
+		intel_de_rmw(dev_priv, GPIO(dev_priv, index),
+			     GPIO_CLOCK_VAL_OUT,
+			     GPIO_CLOCK_DIR_MASK | GPIO_CLOCK_DIR_OUT |
+			     GPIO_CLOCK_VAL_MASK | (value ? GPIO_CLOCK_VAL_OUT : 0));
+		break;
+	case MIPI_VIO_EN_1:
+	case MIPI_VIO_EN_2:
+		index = gpio == MIPI_VIO_EN_1 ? 1 : 2;
+
+		intel_de_rmw(dev_priv, GPIO(dev_priv, index),
+			     GPIO_DATA_VAL_OUT,
+			     GPIO_DATA_DIR_MASK | GPIO_DATA_DIR_OUT |
+			     GPIO_DATA_VAL_MASK | (value ? GPIO_DATA_VAL_OUT : 0));
+		break;
+	default:
+		MISSING_CASE(gpio);
+	}
+}
+
 static const u8 *mipi_exec_gpio(struct intel_dsi *intel_dsi, const u8 *data)
 {
 	struct drm_device *dev = intel_dsi->base.base.dev;
@@ -386,8 +466,7 @@ static const u8 *mipi_exec_gpio(struct intel_dsi *intel_dsi, const u8 *data)
 	struct intel_connector *connector = intel_dsi->attached_connector;
 	u8 gpio_source, gpio_index = 0, gpio_number;
 	bool value;
-
-	drm_dbg_kms(&dev_priv->drm, "\n");
+	bool native = DISPLAY_VER(dev_priv) >= 11;
 
 	if (connector->panel.vbt.dsi.seq_version >= 3)
 		gpio_index = *data++;
@@ -400,10 +479,18 @@ static const u8 *mipi_exec_gpio(struct intel_dsi *intel_dsi, const u8 *data)
 	else
 		gpio_source = 0;
 
+	if (connector->panel.vbt.dsi.seq_version >= 4 && *data & BIT(1))
+		native = false;
+
 	/* pull up/down */
 	value = *data++ & 1;
 
-	if (DISPLAY_VER(dev_priv) >= 11)
+	drm_dbg_kms(&dev_priv->drm, "GPIO index %u, number %u, source %u, native %s, set to %s\n",
+		    gpio_index, gpio_number, gpio_source, str_yes_no(native), str_on_off(value));
+
+	if (native)
+		icl_native_gpio_set_value(dev_priv, gpio_number, value);
+	else if (DISPLAY_VER(dev_priv) >= 11)
 		icl_exec_gpio(connector, gpio_source, gpio_index, value);
 	else if (IS_VALLEYVIEW(dev_priv))
 		vlv_exec_gpio(connector, gpio_source, gpio_number, value);
@@ -448,24 +535,16 @@ static void i2c_acpi_find_adapter(struct intel_dsi *intel_dsi,
 				  const u16 slave_addr)
 {
 	struct drm_device *drm_dev = intel_dsi->base.base.dev;
-	struct device *dev = drm_dev->dev;
-	struct acpi_device *acpi_dev;
-	struct list_head resource_list;
-	struct i2c_adapter_lookup lookup;
+	struct acpi_device *adev = ACPI_COMPANION(drm_dev->dev);
+	struct i2c_adapter_lookup lookup = {
+		.slave_addr = slave_addr,
+		.intel_dsi = intel_dsi,
+		.dev_handle = acpi_device_handle(adev),
+	};
+	LIST_HEAD(resource_list);
 
-	acpi_dev = ACPI_COMPANION(dev);
-	if (acpi_dev) {
-		memset(&lookup, 0, sizeof(lookup));
-		lookup.slave_addr = slave_addr;
-		lookup.intel_dsi = intel_dsi;
-		lookup.dev_handle = acpi_device_handle(acpi_dev);
-
-		INIT_LIST_HEAD(&resource_list);
-		acpi_dev_get_resources(acpi_dev, &resource_list,
-				       i2c_adapter_lookup,
-				       &lookup);
-		acpi_dev_free_resource_list(&resource_list);
-	}
+	acpi_dev_get_resources(adev, &resource_list, i2c_adapter_lookup, &lookup);
+	acpi_dev_free_resource_list(&resource_list);
 }
 #else
 static inline void i2c_acpi_find_adapter(struct intel_dsi *intel_dsi,
@@ -673,32 +752,15 @@ void intel_dsi_vbt_exec_sequence(struct intel_dsi *intel_dsi,
 {
 	if (seq_id == MIPI_SEQ_POWER_ON && intel_dsi->gpio_panel)
 		gpiod_set_value_cansleep(intel_dsi->gpio_panel, 1);
-
-#ifndef BPM_PINCTRL_UNREGISTER_MAPPINGS_NOT_PRESENT
 	if (seq_id == MIPI_SEQ_BACKLIGHT_ON && intel_dsi->gpio_backlight)
 		gpiod_set_value_cansleep(intel_dsi->gpio_backlight, 1);
-#endif
 
 	intel_dsi_vbt_exec(intel_dsi, seq_id);
 
 	if (seq_id == MIPI_SEQ_POWER_OFF && intel_dsi->gpio_panel)
 		gpiod_set_value_cansleep(intel_dsi->gpio_panel, 0);
-#ifndef BPM_PINCTRL_UNREGISTER_MAPPINGS_NOT_PRESENT
 	if (seq_id == MIPI_SEQ_BACKLIGHT_OFF && intel_dsi->gpio_backlight)
 		gpiod_set_value_cansleep(intel_dsi->gpio_backlight, 0);
-#endif
-
-}
-
-void intel_dsi_msleep(struct intel_dsi *intel_dsi, int msec)
-{
-	struct intel_connector *connector = intel_dsi->attached_connector;
-
-	/* For v3 VBTs in vid-mode the delays are part of the VBT sequences */
-	if (is_vid_mode(intel_dsi) && connector->panel.vbt.dsi.seq_version >= 3)
-		return;
-
-	msleep(msec);
 }
 
 void intel_dsi_log_params(struct intel_dsi *intel_dsi)
@@ -865,6 +927,8 @@ bool intel_dsi_vbt_init(struct intel_dsi *intel_dsi, u16 panel_id)
 /*
  * On some BYT/CHT devs some sequences are incomplete and we need to manually
  * control some GPIOs. We need to add a GPIO lookup table before we get these.
+ * If the GOP did not initialize the panel (HDMI inserted) we may need to also
+ * change the pinmux for the SoC's PWM0 pin from GPIO to PWM.
  */
 static struct gpiod_lookup_table pmic_panel_gpio_table = {
 	/* Intel GFX is consumer */
@@ -876,21 +940,19 @@ static struct gpiod_lookup_table pmic_panel_gpio_table = {
 	},
 };
 
-#ifndef BPM_PINCTRL_UNREGISTER_MAPPINGS_NOT_PRESENT
 static struct gpiod_lookup_table soc_panel_gpio_table = {
-       .dev_id = "0000:00:02.0",
-       .table = {
-               GPIO_LOOKUP("INT33FC:01", 10, "backlight", GPIO_ACTIVE_HIGH),
-               GPIO_LOOKUP("INT33FC:01", 11, "panel", GPIO_ACTIVE_HIGH),
-               { }
-       },
+	.dev_id = "0000:00:02.0",
+	.table = {
+		GPIO_LOOKUP("INT33FC:01", 10, "backlight", GPIO_ACTIVE_HIGH),
+		GPIO_LOOKUP("INT33FC:01", 11, "panel", GPIO_ACTIVE_HIGH),
+		{ }
+	},
 };
 
 static const struct pinctrl_map soc_pwm_pinctrl_map[] = {
-       PIN_MAP_MUX_GROUP("0000:00:02.0", "soc_pwm0", "INT33FC:00",
-                         "pwm0_grp", "pwm"),
+	PIN_MAP_MUX_GROUP("0000:00:02.0", "soc_pwm0", "INT33FC:00",
+			  "pwm0_grp", "pwm"),
 };
-#endif
 
 void intel_dsi_vbt_gpio_init(struct intel_dsi *intel_dsi, bool panel_is_on)
 {
@@ -899,17 +961,14 @@ void intel_dsi_vbt_gpio_init(struct intel_dsi *intel_dsi, bool panel_is_on)
 	struct intel_connector *connector = intel_dsi->attached_connector;
 	struct mipi_config *mipi_config = connector->panel.vbt.dsi.config;
 	enum gpiod_flags flags = panel_is_on ? GPIOD_OUT_HIGH : GPIOD_OUT_LOW;
-#ifndef BPM_PINCTRL_UNREGISTER_MAPPINGS_NOT_PRESENT
 	bool want_backlight_gpio = false;
 	bool want_panel_gpio = false;
 	struct pinctrl *pinctrl;
 	int ret;
-#endif
 
 	if ((IS_VALLEYVIEW(dev_priv) || IS_CHERRYVIEW(dev_priv)) &&
-			mipi_config->pwm_blc == PPS_BLC_PMIC) {
+	    mipi_config->pwm_blc == PPS_BLC_PMIC) {
 		gpiod_add_lookup_table(&pmic_panel_gpio_table);
-#ifndef BPM_PINCTRL_UNREGISTER_MAPPINGS_NOT_PRESENT
 		want_panel_gpio = true;
 	}
 
@@ -920,19 +979,18 @@ void intel_dsi_vbt_gpio_init(struct intel_dsi *intel_dsi, bool panel_is_on)
 
 		/* Ensure PWM0 pin is muxed as PWM instead of GPIO */
 		ret = pinctrl_register_mappings(soc_pwm_pinctrl_map,
-				ARRAY_SIZE(soc_pwm_pinctrl_map));
+					     ARRAY_SIZE(soc_pwm_pinctrl_map));
 		if (ret)
 			drm_err(&dev_priv->drm,
-					"Failed to register pwm0 pinmux mapping\n");
+				"Failed to register pwm0 pinmux mapping\n");
 
 		pinctrl = devm_pinctrl_get_select(dev->dev, "soc_pwm0");
 		if (IS_ERR(pinctrl))
 			drm_err(&dev_priv->drm,
-					"Failed to set pinmux to PWM\n");
+				"Failed to set pinmux to PWM\n");
 	}
 
-       if (want_panel_gpio) {
-#endif
+	if (want_panel_gpio) {
 		intel_dsi->gpio_panel = gpiod_get(dev->dev, "panel", flags);
 		if (IS_ERR(intel_dsi->gpio_panel)) {
 			drm_err(&dev_priv->drm,
@@ -941,18 +999,15 @@ void intel_dsi_vbt_gpio_init(struct intel_dsi *intel_dsi, bool panel_is_on)
 		}
 	}
 
-#ifndef BPM_PINCTRL_UNREGISTER_MAPPINGS_NOT_PRESENT
-       if (want_backlight_gpio) {
-	       intel_dsi->gpio_backlight =
-		       gpiod_get(dev->dev, "backlight", flags);
-	       if (IS_ERR(intel_dsi->gpio_backlight)) {
-		       drm_err(&dev_priv->drm,
-				       "Failed to own gpio for backlight control\n");
-		       intel_dsi->gpio_backlight = NULL;
-	       }
-       }
-#endif
-
+	if (want_backlight_gpio) {
+		intel_dsi->gpio_backlight =
+			gpiod_get(dev->dev, "backlight", flags);
+		if (IS_ERR(intel_dsi->gpio_backlight)) {
+			drm_err(&dev_priv->drm,
+				"Failed to own gpio for backlight control\n");
+			intel_dsi->gpio_backlight = NULL;
+		}
+	}
 }
 
 void intel_dsi_vbt_gpio_cleanup(struct intel_dsi *intel_dsi)
@@ -962,27 +1017,22 @@ void intel_dsi_vbt_gpio_cleanup(struct intel_dsi *intel_dsi)
 	struct intel_connector *connector = intel_dsi->attached_connector;
 	struct mipi_config *mipi_config = connector->panel.vbt.dsi.config;
 
-#ifndef BPM_PINCTRL_UNREGISTER_MAPPINGS_NOT_PRESENT
-	if (intel_dsi->gpio_backlight) {
-		gpiod_put(intel_dsi->gpio_backlight);
-		intel_dsi->gpio_backlight = NULL;
-	}
-#endif
-
 	if (intel_dsi->gpio_panel) {
 		gpiod_put(intel_dsi->gpio_panel);
 		intel_dsi->gpio_panel = NULL;
+	}
+
+	if (intel_dsi->gpio_backlight) {
+		gpiod_put(intel_dsi->gpio_backlight);
+		intel_dsi->gpio_backlight = NULL;
 	}
 
 	if ((IS_VALLEYVIEW(dev_priv) || IS_CHERRYVIEW(dev_priv)) &&
 	    mipi_config->pwm_blc == PPS_BLC_PMIC)
 		gpiod_remove_lookup_table(&pmic_panel_gpio_table);
 
-#ifndef BPM_PINCTRL_UNREGISTER_MAPPINGS_NOT_PRESENT
 	if (IS_VALLEYVIEW(dev_priv) && mipi_config->pwm_blc == PPS_BLC_SOC) {
 		pinctrl_unregister_mappings(soc_pwm_pinctrl_map);
 		gpiod_remove_lookup_table(&soc_panel_gpio_table);
 	}
-#endif
-
 }

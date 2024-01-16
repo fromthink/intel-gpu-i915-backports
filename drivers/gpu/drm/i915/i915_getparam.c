@@ -5,6 +5,8 @@
 #include "gem/i915_gem_mman.h"
 #include "gt/intel_engine_user.h"
 
+#include "pxp/intel_pxp.h"
+
 #include "i915_cmd_parser.h"
 #include "i915_drv.h"
 #include "i915_getparam.h"
@@ -17,9 +19,7 @@ int i915_getparam_ioctl(struct drm_device *dev, void *data,
 	struct pci_dev *pdev = to_pci_dev(dev->dev);
 	const struct sseu_dev_info *sseu = &to_gt(i915)->info.sseu;
 	drm_i915_getparam_t *param = data;
-	struct intel_memory_region *mr;
 	int value = 0;
-	int id;
 
 	switch (param->param) {
 	case I915_PARAM_IRQ_ACTIVE:
@@ -38,7 +38,7 @@ int i915_getparam_ioctl(struct drm_device *dev, void *data,
 		value = to_gt(i915)->ggtt->num_fences;
 		break;
 	case I915_PARAM_HAS_OVERLAY:
-		value = !!i915->overlay;
+		value = !!i915->display.overlay;
 		break;
 	case I915_PARAM_HAS_BSD:
 		value = !!intel_engine_lookup_user(i915,
@@ -108,6 +108,11 @@ int i915_getparam_ioctl(struct drm_device *dev, void *data,
 		if (value < 0)
 			return value;
 		break;
+	case I915_PARAM_PXP_STATUS:
+		value = intel_pxp_get_readiness_status(i915->pxp, 0);
+		if (value < 0)
+			return value;
+		break;
 	case I915_PARAM_MMAP_GTT_VERSION:
 		/* Though we've started our numbering from 1, and so class all
 		 * earlier versions as 0, in effect their value is undefined as
@@ -142,6 +147,7 @@ int i915_getparam_ioctl(struct drm_device *dev, void *data,
 	case I915_PARAM_HAS_EXEC_FENCE_ARRAY:
 	case I915_PARAM_HAS_EXEC_SUBMIT_FENCE:
 	case I915_PARAM_HAS_EXEC_TIMELINE_FENCES:
+	case I915_PARAM_HAS_USERPTR_PROBE:
 		/* For the time being all of these are always true;
 		 * if some supported hardware does not have one of these
 		 * features this value needs to be provided from
@@ -178,58 +184,13 @@ int i915_getparam_ioctl(struct drm_device *dev, void *data,
 		value = INTEL_INFO(i915)->has_coherent_ggtt;
 		break;
 	case I915_PARAM_PERF_REVISION:
-		value = i915_perf_ioctl_version();
+		value = i915_perf_ioctl_version(i915);
 		break;
 	case I915_PARAM_OA_TIMESTAMP_FREQUENCY:
 		value = i915_perf_oa_timestamp_frequency(i915);
 		break;
-	case PRELIM_I915_PARAM_HAS_VM_BIND:
-		value = GRAPHICS_VER(i915) >= 12;
-		break;
-	case PRELIM_I915_PARAM_EXECBUF2_MAX_ENGINE:
-		value = 256;
-		break;
-	case PRELIM_I915_PARAM_LMEM_TOTAL_BYTES:
-		if (!HAS_LMEM(i915))
-			return -ENODEV;
-
-		value = 0; /* overflow! */
-		for_each_memory_region(mr, i915, id)
-			if (mr->type == INTEL_MEMORY_LOCAL)
-				value += mr->total;
-		break;
-	case PRELIM_I915_PARAM_LMEM_AVAIL_BYTES:
-		if (!HAS_LMEM(i915))
-			return -ENODEV;
-
-		value = 0; /* overflow! */
-		for_each_memory_region(mr, i915, id)
-			if (mr->type == INTEL_MEMORY_LOCAL)
-				value += atomic64_read(&mr->avail);
-		break;
-	case PRELIM_I915_PARAM_HAS_SVM:
-		value = i915_has_svm(i915);
-		break;
-	case PRELIM_I915_PARAM_OA_TIMESTAMP_FREQUENCY:
-		value = i915_perf_oa_timestamp_frequency(i915);
-		break;
-	case PRELIM_I915_PARAM_HAS_PAGE_FAULT:
-		value =  HAS_RECOVERABLE_PAGE_FAULT(i915);
-		break;
-	case PRELIM_I915_PARAM_HAS_SET_PAIR:
-		value = 1;
-		break;
-	case PRELIM_I915_PARAM_EU_DEBUGGER_VERSION:
-		value = IS_ENABLED(CPTCFG_DRM_I915_DEBUGGER) ? PRELIM_DRM_I915_DEBUG_VERSION : 0;
-		break;
-	case PRELIM_I915_PARAM_HAS_CHUNK_SIZE:
-		/* restrict to platforms where legacy mmap is not supported */
-		if (!(IS_DGFX(i915) || GRAPHICS_VER_FULL(i915) > IP_VER(12, 0)))
-			return -EINVAL;
-		value = 1;
-		break;
 	default:
-		DRM_DEBUG("Unknown parameter %d\n", param->param);
+		drm_dbg(&i915->drm, "Unknown parameter %d\n", param->param);
 		return -EINVAL;
 	}
 

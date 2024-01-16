@@ -30,18 +30,8 @@ static void guc_prepare_xfer(struct intel_gt *gt)
 		shim_flags |= GUC_DISABLE_SRAM_INIT_TO_ZEROES |
 			      GUC_ENABLE_MIA_CACHING;
 
-	/* Make GUC transactions uncacheable on PVC */
-	if (HAS_GUC_PROGRAMMABLE_MOCS(uncore->i915))
-		shim_flags |= PVC_GUC_MOCS_INDEX(PVC_MOCS_UC_INDEX);
-
 	/* Must program this register before loading the ucode with DMA */
 	intel_uncore_write(uncore, GUC_SHIM_CONTROL, shim_flags);
-
-#if IS_ENABLED(CPTCFG_DRM_I915_DEBUG_GEM)
-	/* Enable the EIP counter for debug */
-	if (GRAPHICS_VER_FULL(uncore->i915) >= IP_VER(12, 50))
-		intel_uncore_rmw(uncore, GUC_SHIM_CONTROL2, 0, ENABLE_EIP);
-#endif
 
 	if (IS_GEN9_LP(uncore->i915))
 		intel_uncore_write(uncore, GEN9LP_GT_PM_CONFIG, GT_DOORBELL_ENABLE);
@@ -50,9 +40,8 @@ static void guc_prepare_xfer(struct intel_gt *gt)
 
 	if (GRAPHICS_VER(uncore->i915) == 9) {
 		/* DOP Clock Gating Enable for GuC clocks */
-		intel_gt_mcr_multicast_write(gt, GEN8_MISCCPCTL,
-					     GEN8_DOP_CLOCK_GATE_GUC_ENABLE |
-					     intel_gt_mcr_read_any(gt, GEN8_MISCCPCTL));
+		intel_uncore_rmw(uncore, GEN7_MISCCPCTL, 0,
+				 GEN8_DOP_CLOCK_GATE_GUC_ENABLE);
 
 		/* allows for 5us (in 10ns units) before GT can go to RC6 */
 		intel_uncore_write(uncore, GUC_ARAT_C6DIS, 0x1FF);
@@ -126,6 +115,7 @@ static inline bool guc_load_done(struct intel_uncore *uncore, u32 *status, bool 
 	case INTEL_GUC_LOAD_STATUS_INIT_DATA_INVALID:
 	case INTEL_GUC_LOAD_STATUS_MPU_DATA_INVALID:
 	case INTEL_GUC_LOAD_STATUS_INIT_MMIO_SAVE_RESTORE_INVALID:
+	case INTEL_GUC_LOAD_STATUS_KLV_WORKAROUND_INIT_ERROR:
 		*success = false;
 		return true;
 	}
@@ -252,6 +242,11 @@ static int guc_wait_ucode(struct intel_guc *guc)
 			ret = -EPERM;
 			break;
 
+		case INTEL_GUC_LOAD_STATUS_KLV_WORKAROUND_INIT_ERROR:
+			guc_info(guc, "invalid w/a KLV entry\n");
+			ret = -EINVAL;
+			break;
+
 		case INTEL_GUC_LOAD_STATUS_HWCONFIG_START:
 			guc_info(guc, "still extracting hwconfig table.\n");
 			ret = -ETIMEDOUT;
@@ -261,30 +256,12 @@ static int guc_wait_ucode(struct intel_guc *guc)
 		/* Uncommon/unexpected error, see earlier status code print for details */
 		if (ret == 0)
 			ret = -ENXIO;
-
-		/*
-		 * If the GuC load has timed out, dump the instruction pointers
-		 * so we can check where it stopped. The expectation here is
-		 * that the GuC is stuck, so we dump the registers twice with a
-		 * slight delay to confirm if the GuC has indeed stopped making
-		 * forward progress or not.
-		 * the 1ms was picked as a good balance between tolerating
-		 * slowness and not waiting too long for the counters to
-		 * increase.
-		 */
-		if (IS_ENABLED(CPTCFG_DRM_I915_DEBUG_GEM) && ret == -ETIMEDOUT) {
-			guc_info(guc, "EIP: %#x, EIPC: %#x\n",
-				 intel_uncore_read(uncore, GUC_EIP),
-				 intel_uncore_read(uncore, GUC_EIP_COUNTER));
-			msleep(1);
-			guc_info(guc, "EIP: %#x, EIPC: %#x\n",
-				 intel_uncore_read(uncore, GUC_EIP),
-				 intel_uncore_read(uncore, GUC_EIP_COUNTER));
-		}
 	} else if (delta_ms > 200) {
-		guc_warn(guc, "excessive init time: %lldms! [freq = %dMHz, before = %dMHz, status = 0x%08X, count = %d, ret = %d]\n",
-			 delta_ms, intel_rps_read_actual_frequency(&uncore->gt->rps),
-			 before_freq, status, count, ret);
+		guc_warn(guc, "excessive init time: %lldms! [status = 0x%08X, count = %d, ret = %d]\n",
+			 delta_ms, status, count, ret);
+		guc_warn(guc, "excessive init time: [freq = %dMHz, before = %dMHz, perf_limit_reasons = 0x%08X]\n",
+			 intel_rps_read_actual_frequency(&uncore->gt->rps), before_freq,
+			 intel_uncore_read(uncore, intel_gt_perf_limit_reasons_reg(gt)));
 	} else {
 		guc_dbg(guc, "init took %lldms, freq = %dMHz, before = %dMHz, status = 0x%08X, count = %d, ret = %d\n",
 			delta_ms, intel_rps_read_actual_frequency(&uncore->gt->rps),

@@ -12,7 +12,7 @@
 #include "i915_reg.h"
 #include "i915_trace.h"
 #include "i915_utils.h"
-#include "intel_pm.h"
+#include "intel_clock_gating.h"
 #include "vlv_suspend.h"
 
 #include "gt/intel_gt_regs.h"
@@ -175,14 +175,12 @@ static void vlv_save_gunit_s0ix_state(struct drm_i915_private *i915)
 	s->gtlc_survive = intel_uncore_read(uncore, VLV_GTLC_SURVIVABILITY_REG);
 	s->pmwgicz = intel_uncore_read(uncore, VLV_PMWGICZ);
 
-#if IS_ENABLED(CPTCFG_DRM_I915_DISPLAY)
 	/* Gunit-Display CZ domain, 0x182028-0x1821CF */
 	s->gu_ctl0 = intel_uncore_read(uncore, VLV_GU_CTL0);
 	s->gu_ctl1 = intel_uncore_read(uncore, VLV_GU_CTL1);
 	s->pcbr = intel_uncore_read(uncore, VLV_PCBR);
 	s->clock_gate_dis2 = intel_uncore_read(uncore, VLV_GUNIT_CLOCK_GATE2);
 
-#endif
 	/*
 	 * Not saving any of:
 	 * DFT,		0x9800-0x9EC0
@@ -196,7 +194,6 @@ static void vlv_restore_gunit_s0ix_state(struct drm_i915_private *i915)
 {
 	struct vlv_s0ix_state *s = i915->vlv_s0ix_state;
 	struct intel_uncore *uncore = &i915->uncore;
-	u32 val;
 	int i;
 
 	if (!s)
@@ -264,25 +261,19 @@ static void vlv_restore_gunit_s0ix_state(struct drm_i915_private *i915)
 	 * be restored, as they are used to control the s0ix suspend/resume
 	 * sequence by the caller.
 	 */
-	val = intel_uncore_read(uncore, VLV_GTLC_WAKE_CTRL);
-	val &= VLV_GTLC_ALLOWWAKEREQ;
-	val |= s->gtlc_wake_ctrl & ~VLV_GTLC_ALLOWWAKEREQ;
-	intel_uncore_write(uncore, VLV_GTLC_WAKE_CTRL, val);
+	intel_uncore_rmw(uncore, VLV_GTLC_WAKE_CTRL, ~VLV_GTLC_ALLOWWAKEREQ,
+			 s->gtlc_wake_ctrl & ~VLV_GTLC_ALLOWWAKEREQ);
 
-	val = intel_uncore_read(uncore, VLV_GTLC_SURVIVABILITY_REG);
-	val &= VLV_GFX_CLK_FORCE_ON_BIT;
-	val |= s->gtlc_survive & ~VLV_GFX_CLK_FORCE_ON_BIT;
-	intel_uncore_write(uncore, VLV_GTLC_SURVIVABILITY_REG, val);
+	intel_uncore_rmw(uncore, VLV_GTLC_SURVIVABILITY_REG, ~VLV_GFX_CLK_FORCE_ON_BIT,
+			 s->gtlc_survive & ~VLV_GFX_CLK_FORCE_ON_BIT);
 
 	intel_uncore_write(uncore, VLV_PMWGICZ, s->pmwgicz);
 
-#if IS_ENABLED(CPTCFG_DRM_I915_DISPLAY)
 	/* Gunit-Display CZ domain, 0x182028-0x1821CF */
 	intel_uncore_write(uncore, VLV_GU_CTL0, s->gu_ctl0);
 	intel_uncore_write(uncore, VLV_GU_CTL1, s->gu_ctl1);
 	intel_uncore_write(uncore, VLV_PCBR, s->pcbr);
 	intel_uncore_write(uncore, VLV_GUNIT_CLOCK_GATE2, s->clock_gate_dis2);
-#endif
 }
 
 static int vlv_wait_for_pw_status(struct drm_i915_private *i915,
@@ -312,14 +303,10 @@ static int vlv_wait_for_pw_status(struct drm_i915_private *i915,
 static int vlv_force_gfx_clock(struct drm_i915_private *i915, bool force_on)
 {
 	struct intel_uncore *uncore = &i915->uncore;
-	u32 val;
 	int err;
 
-	val = intel_uncore_read(uncore, VLV_GTLC_SURVIVABILITY_REG);
-	val &= ~VLV_GFX_CLK_FORCE_ON_BIT;
-	if (force_on)
-		val |= VLV_GFX_CLK_FORCE_ON_BIT;
-	intel_uncore_write(uncore, VLV_GTLC_SURVIVABILITY_REG, val);
+	intel_uncore_rmw(uncore, VLV_GTLC_SURVIVABILITY_REG, VLV_GFX_CLK_FORCE_ON_BIT,
+			 force_on ? VLV_GFX_CLK_FORCE_ON_BIT : 0);
 
 	if (!force_on)
 		return 0;
@@ -344,11 +331,8 @@ static int vlv_allow_gt_wake(struct drm_i915_private *i915, bool allow)
 	u32 val;
 	int err;
 
-	val = intel_uncore_read(uncore, VLV_GTLC_WAKE_CTRL);
-	val &= ~VLV_GTLC_ALLOWWAKEREQ;
-	if (allow)
-		val |= VLV_GTLC_ALLOWWAKEREQ;
-	intel_uncore_write(uncore, VLV_GTLC_WAKE_CTRL, val);
+	intel_uncore_rmw(uncore, VLV_GTLC_WAKE_CTRL, VLV_GTLC_ALLOWWAKEREQ,
+			 allow ? VLV_GTLC_ALLOWWAKEREQ : 0);
 	intel_uncore_posting_read(uncore, VLV_GTLC_WAKE_CTRL);
 
 	mask = VLV_GTLC_ALLOWWAKEACK;
@@ -467,7 +451,7 @@ int vlv_resume_prepare(struct drm_i915_private *dev_priv, bool rpm_resume)
 	vlv_check_no_gt_access(dev_priv);
 
 	if (rpm_resume)
-		intel_init_clock_gating(dev_priv);
+		intel_clock_gating_init(dev_priv);
 
 	return ret;
 }

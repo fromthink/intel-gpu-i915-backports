@@ -19,6 +19,5 @@ Module.symvers
 *.mod.c
 .cache.mk
 osv_version.h
-drivers/gpu/drm/i915/README.*
 INTERNAL*
 docs/INTERNAL*

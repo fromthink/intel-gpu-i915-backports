@@ -6,6 +6,7 @@
 #include "i915_selftest.h"
 
 #include "gem/i915_gem_internal.h"
+#include "gem/i915_gem_lmem.h"
 #include "gem/i915_gem_region.h"
 
 #include "gen8_engine_cs.h"
@@ -19,11 +20,11 @@
 #include "selftests/igt_flush_test.h"
 #include "selftests/i915_random.h"
 
-static void clear_dw(struct i915_vma *vma, u64 addr, u32 val)
+static void vma_set_qw(struct i915_vma *vma, u64 addr, u64 val)
 {
 	GEM_BUG_ON(addr < i915_vma_offset(vma));
-	GEM_BUG_ON(addr >= i915_vma_offset(vma) + i915_vma_size(vma));
-	memset32(page_mask_bits(vma->obj->mm.mapping) +
+	GEM_BUG_ON(addr >= i915_vma_offset(vma) + i915_vma_size(vma) + sizeof(val));
+	memset64(page_mask_bits(vma->obj->mm.mapping) +
 		 (addr - i915_vma_offset(vma)), val, 1);
 }
 
@@ -38,11 +39,10 @@ pte_tlbinv(struct intel_context *ce,
 {
 	const unsigned int pat_index =
 		i915_gem_get_pat_index(ce->vm->i915, I915_CACHE_NONE);
-	const int use_64b = GRAPHICS_VER(ce->vm->i915) >= 8;
 	struct drm_i915_gem_object *batch;
+	struct drm_mm_node vb_node;
 	struct i915_request *rq;
 	struct i915_vma *vma;
-	int retries;
 	u64 addr;
 	int err;
 	u32 *cs;
@@ -57,65 +57,65 @@ pte_tlbinv(struct intel_context *ce,
 		goto out;
 	}
 
-	err = i915_vma_pin(vma, 0, 0, PIN_USER | PIN_ZONE_48);
+	err = i915_vma_pin(vma, 0, 0, PIN_USER);
 	if (err)
 		goto out;
 
-	retries = 5;
-	do {
-		addr = igt_random_offset(prng,
-					 i915_vma_offset(vma),
-					 /* upper limit for MI_BB_START */
-					 min(ce->vm->total, BIT_ULL(48)),
-					 va->size, 4);
-
-		err = i915_vma_pin(va,  0, 0, (addr & -align) | PIN_OFFSET_FIXED | PIN_USER);
-	} while (err == -ENOSPC && --retries);
+	/* Pin va at random but aligned offset after vma */
+	addr = round_up(vma->node.start + vma->node.size, align);
+	/* MI_CONDITIONAL_BATCH_BUFFER_END limits address to 48b */
+	addr = igt_random_offset(prng, addr, min(ce->vm->total, BIT_ULL(48)),
+				 va->size, align);
+	err = i915_vma_pin(va,  0, 0, addr | PIN_OFFSET_FIXED | PIN_USER);
 	if (err) {
-		err = 0;
+		pr_err("Cannot pin at %llx+%llx\n", addr, va->size);
 		goto out;
 	}
-	GEM_BUG_ON(i915_vma_offset(va) != (addr & -align));
-	vb->node = va->node; /* overwrites the _same_ PTE  */
-
-	if (align == SZ_64K) {
-		u64 end = addr + va->size;
-
-		/*
-		 * SZ_64K pages on dg1 require that the whole PT be marked
-		 * containing 64KiB entries. So we make sure that our vma
-		 * covers the whole PT, despite being randomly aligned to 64KiB
-		 * and restrict our sampling to the 2MiB PT within where
-		 * we know that we will be using 64KiB pages.
-		 */
-		addr = round_up(addr & -align, SZ_2M);
-		addr |=	igt_random_offset(prng, 0, end - addr, 4, 4);
+	GEM_BUG_ON(i915_vma_offset(va) != addr);
+	if (vb != va) {
+		vb_node = vb->node;
+		vb->node = va->node; /* overwrites the _same_ PTE  */
 	}
 
-	if (addr - i915_vma_offset(va) >= i915_vma_size(va))
-		addr = igt_random_offset(prng,
-					 i915_vma_offset(va),
-					 i915_vma_offset(va) + i915_vma_size(va),
-					 4, 4);
+	/*
+	 * Now choose random dword at the 1st pinned page.
+	 *
+	 * SZ_64K pages on dg1 require that the whole PT be marked
+	 * containing 64KiB entries. So we make sure that vma
+	 * covers the whole PT, despite being randomly aligned to 64KiB
+	 * and restrict our sampling to the 2MiB PT within where
+	 * we know that we will be using 64KiB pages.
+	 */
+	if (align == SZ_64K)
+		addr = round_up(addr, SZ_2M);
+	addr = igt_random_offset(prng, addr, addr + align, 8, 8);
 
-	pr_info("%s(%s): Sampling %llx, with alignment %llx, using PTE size %x, invalidate:%llx+%llx\n",
-		ce->engine->name, va->obj->mm.region.mem->name ?: "smem",
-		addr, align, va->page_sizes,
-		addr & -length, length);
+	if (va != vb)
+		pr_info("%s(%s): Sampling %llx, with alignment %llx, using PTE size %x (phys %x, sg %x), invalidate:%llx+%llx\n",
+			ce->engine->name, va->obj->mm.region->name ?: "smem",
+			addr, align, va->resource->page_sizes_gtt,
+			va->page_sizes.phys, va->page_sizes.sg,
+			addr & -length, length);
 
 	cs = i915_gem_object_pin_map_unlocked(batch, I915_MAP_WC);
 	*cs++ = MI_NOOP; /* for later termination */
-
-	/* Sample the target to see if we spot an incorrect page */
-	*cs++ = MI_CONDITIONAL_BATCH_BUFFER_END | MI_DO_COMPARE | (1 + use_64b);
-	*cs++ = -2; /* break if *addr < -1 */
+	/*
+	 * Sample the target to see if we spot the updated backing store.
+	 * Gen8 VCS compares immediate value with bitwise-and of two
+	 * consecutive DWORDS pointed by addr, other gen/engines compare value
+	 * with DWORD pointed by addr. Moreover we want to exercise DWORD size
+	 * invalidations. To fulfill all these requirements below values
+	 * have been chosen.
+	 */
+	*cs++ = MI_CONDITIONAL_BATCH_BUFFER_END | MI_DO_COMPARE | 2;
+	*cs++ = 0; /* break if *addr == 0 */
 	*cs++ = lower_32_bits(addr);
 	*cs++ = upper_32_bits(addr);
-	clear_dw(va, addr, -1);
-	clear_dw(vb, addr, 0);
+	vma_set_qw(va, addr, -1);
+	vma_set_qw(vb, addr, 0);
 
 	/* Keep sampling until we get bored */
-	*cs++ = MI_BATCH_BUFFER_START | BIT(8) | use_64b;
+	*cs++ = MI_BATCH_BUFFER_START | BIT(8) | 1;
 	*cs++ = lower_32_bits(i915_vma_offset(vma));
 	*cs++ = upper_32_bits(i915_vma_offset(vma));
 
@@ -136,38 +136,33 @@ pte_tlbinv(struct intel_context *ce,
 	i915_request_get(rq);
 	i915_request_add(rq);
 
-	/* Short sleep to sanitycheck the batch is spinning before we begin */
-	msleep(ADJUST_TIMEOUT(10));
+	/*
+	 * Short sleep to sanitycheck the batch is spinning before we begin
+	 * FIXME: needs updating to wait until the request has started
+	 * rather than waiting for a fixed amount of time.
+	 */
+	msleep(200);
 	if (va == vb) {
 		if (!i915_request_completed(rq)) {
-			pr_err("Semaphore sanitycheck failed\n");
+			pr_err("%s(%s): Semaphore sanitycheck failed %llx, with alignment %llx, using PTE size %x (phys %x, sg %x)\n",
+			       ce->engine->name, va->obj->mm.region->name ?: "smem",
+			       addr, align, va->resource->page_sizes_gtt,
+			       va->page_sizes.phys, va->page_sizes.sg);
 			err = -EIO;
 		}
 	} else if (!i915_request_completed(rq)) {
-		struct i915_vm_pt_stash stash = {};
+		struct i915_vma_resource vb_res = {
+			.bi.pages = vb->obj->mm.pages,
+			.bi.page_sizes = vb->obj->mm.page_sizes,
+			.start = i915_vma_offset(vb),
+			.vma_size = i915_vma_size(vb)
+		};
 		unsigned int pte_flags = 0;
-		struct i915_gem_ww_ctx ww;
-
-		err = i915_vm_alloc_pt_stash(ce->vm, &stash, vb->size);
-		if (err)
-			goto err;
-
-		for_i915_gem_ww(&ww, err, false) {
-			err = i915_vm_lock_objects(ce->vm, &ww);
-			if (err)
-				continue;
-
-			err = i915_vm_map_pt_stash(ce->vm, &stash);
-		}
-		if (err) {
-			i915_vm_free_pt_stash(ce->vm, &stash);
-			goto err;
-		}
 
 		/* Flip the PTE between A and B */
 		if (i915_gem_object_is_lmem(vb->obj))
 			pte_flags |= PTE_LM;
-		ce->vm->insert_entries(ce->vm, &stash, vb, pat_index, pte_flags);
+		ce->vm->insert_entries(ce->vm, &vb_res, pat_index, pte_flags);
 
 		/* Flush the PTE update to concurrent HW */
 		tlbinv(ce->vm, addr & -length, length);
@@ -177,13 +172,10 @@ pte_tlbinv(struct intel_context *ce,
 			       ce->engine->name);
 			err = -EINVAL;
 		}
-
-		i915_vm_free_pt_stash(ce->vm, &stash);
 	} else {
-		pr_err("Spinner sanitycheck failed\n");
+		pr_err("Spinner ended unexpectedly\n");
 		err = -EIO;
 	}
-err:
 	i915_request_put(rq);
 
 	cs = page_mask_bits(batch->mm.mapping);
@@ -192,9 +184,9 @@ err:
 
 out_va:
 	if (vb != va)
-		memset(&vb->node, 0, sizeof(vb->node));
+		vb->node = vb_node;
 	i915_vma_unpin(va);
-	if (i915_vma_unbind(va))
+	if (i915_vma_unbind_unlocked(va))
 		err = -EIO;
 out:
 	i915_gem_object_put(batch);
@@ -203,7 +195,18 @@ out:
 
 static struct drm_i915_gem_object *create_lmem(struct intel_gt *gt)
 {
-	return i915_gem_object_create_lmem(gt->i915, SZ_1G, I915_BO_ALLOC_CONTIGUOUS);
+	struct intel_memory_region *mr = gt->i915->mm.regions[INTEL_REGION_LMEM_0];
+	resource_size_t size = SZ_1G;
+
+	/*
+	 * Allocation of largest possible page size allows to test all types
+	 * of pages. To succeed with both allocations, especially in case of Small
+	 * BAR, try to allocate no more than quarter of mappable memory.
+	 */
+	if (mr && size > mr->io_size / 4)
+		size = mr->io_size / 4;
+
+	return i915_gem_object_create_lmem(gt->i915, size, I915_BO_ALLOC_CONTIGUOUS);
 }
 
 static struct drm_i915_gem_object *create_smem(struct intel_gt *gt)
@@ -223,18 +226,15 @@ mem_tlbinv(struct intel_gt *gt,
 	   struct drm_i915_gem_object *(*create_fn)(struct intel_gt *),
 	   void (*tlbinv)(struct i915_address_space *vm, u64 addr, u64 length))
 {
+	unsigned int ppgtt_size = RUNTIME_INFO(gt->i915)->ppgtt_size;
 	struct intel_engine_cs *engine;
 	struct drm_i915_gem_object *A, *B;
 	struct i915_ppgtt *ppgtt;
 	struct i915_vma *va, *vb;
 	enum intel_engine_id id;
 	I915_RND_STATE(prng);
-	LIST_HEAD(discard);
 	void *vaddr;
 	int err;
-
-	if (GRAPHICS_VER(gt->i915) < 6) /* MI_CONDITIONAL_BB_END & bcs */
-		return 0;
 
 	/*
 	 * Check that the TLB invalidate is able to revoke an active
@@ -254,24 +254,11 @@ mem_tlbinv(struct intel_gt *gt,
 		goto out_a;
 	}
 
-	/* Allocate a second physical address significantly different from A */
-	do {
-		B = create_fn(gt);
-		if (IS_ERR(B)) {
-			err = PTR_ERR(B);
-			goto out_a;
-		}
-
-		err = i915_gem_object_pin_pages_unlocked(B);
-		if (err)
-			goto out_b;
-
-		if (upper_32_bits(i915_gem_object_get_dma_address(A, 0)) !=
-		    upper_32_bits(i915_gem_object_get_dma_address(B, 0)))
-			break;
-
-		list_add(&B->st_link, &discard);
-	} while (1);
+	B = create_fn(gt);
+	if (IS_ERR(B)) {
+		err = PTR_ERR(B);
+		goto out_a;
+	}
 
 	vaddr = i915_gem_object_pin_map_unlocked(B, I915_MAP_WC);
 	if (IS_ERR(vaddr)) {
@@ -280,7 +267,7 @@ mem_tlbinv(struct intel_gt *gt,
 	}
 
 	GEM_BUG_ON(A->base.size != B->base.size);
-	if (!sg_is_last(A->mm.pages->sgl) || !sg_is_last(B->mm.pages->sgl))
+	if ((A->mm.page_sizes.phys | B->mm.page_sizes.phys) & (A->base.size - 1))
 		pr_warn("Failed to allocate contiguous pages for size %zx\n",
 			A->base.size);
 
@@ -301,8 +288,6 @@ mem_tlbinv(struct intel_gt *gt,
 		err = PTR_ERR(vb);
 		goto out_vm;
 	}
-	/* manual prep as we overwrite va's GTT range with vb later */
-	ppgtt_set_pages(vb);
 
 	err = 0;
 	for_each_engine(engine, gt, id) {
@@ -321,45 +306,40 @@ mem_tlbinv(struct intel_gt *gt,
 
 		for_i915_gem_ww(&ww, err, true)
 			err = intel_context_pin_ww(ce, &ww);
-		if (err == 0) {
-			for_each_set_bit(bit,
-					 (unsigned long *)&INTEL_INFO(gt->i915)->page_sizes,
-					 BITS_PER_TYPE(INTEL_INFO(gt->i915)->page_sizes)) {
-				int len;
+		if (err)
+			goto err_put;
 
-				/* sanitycheck the semaphore wake up */
-				err = pte_tlbinv(ce, va, va,
+		for_each_set_bit(bit,
+				 (unsigned long *)&RUNTIME_INFO(gt->i915)->page_sizes,
+				 BITS_PER_TYPE(RUNTIME_INFO(gt->i915)->page_sizes)) {
+			unsigned int len;
+
+			if (BIT_ULL(bit) < i915_vm_obj_min_alignment(va->vm, va->obj))
+				continue;
+
+			/* sanitycheck the semaphore wake up */
+			err = pte_tlbinv(ce, va, va,
+					 BIT_ULL(bit),
+					 NULL, SZ_4K,
+					 &prng);
+			if (err)
+				goto err_unpin;
+
+			for (len = 2; len <= ppgtt_size; len = min(2 * len, ppgtt_size)) {
+				err = pte_tlbinv(ce, va, vb,
 						 BIT_ULL(bit),
-						 NULL, SZ_4K,
+						 tlbinv,
+						 BIT_ULL(len),
 						 &prng);
 				if (err)
 					goto err_unpin;
-
-				for (len = 2; len <= INTEL_INFO(gt->i915)->ppgtt_size; len *= 2) {
-					err = pte_tlbinv(ce, va, vb,
-							BIT_ULL(bit),
-							tlbinv,
-							BIT_ULL(len),
-							&prng);
-					if (err)
-						goto err_unpin;
-				}
-
-				if (len != INTEL_INFO(gt->i915)->ppgtt_size) {
-					len = INTEL_INFO(gt->i915)->ppgtt_size;
-					err = pte_tlbinv(ce, va, vb,
-							BIT_ULL(bit),
-							tlbinv,
-							BIT_ULL(len),
-							&prng);
-					if (err)
-						goto err_unpin;
-				}
+				if (len == ppgtt_size)
+					break;
 			}
-err_unpin:
-			intel_context_unpin(ce);
 		}
-
+err_unpin:
+		intel_context_unpin(ce);
+err_put:
 		intel_context_put(ce);
 		if (err)
 			break;
@@ -374,8 +354,6 @@ out_b:
 	i915_gem_object_put(B);
 out_a:
 	i915_gem_object_put(A);
-	list_for_each_entry_safe(A, B, &discard, st_link)
-		i915_gem_object_put(A);
 	return err;
 }
 
@@ -401,46 +379,10 @@ static int invalidate_full(void *arg)
 	return err;
 }
 
-static void tlbinv_range(struct i915_address_space *vm, u64 addr, u64 length)
-{
-	if (!intel_gt_invalidate_tlb_range(vm->gt, vm, addr, length))
-		pr_err("range invalidate failed\n");
-}
-
-static bool has_invalidate_range(struct intel_gt *gt)
-{
-	struct i915_address_space *vm = gt->vm;
-	intel_wakeref_t wf;
-	bool result = false;
-
-	with_intel_gt_pm(gt, wf)
-		result = intel_gt_invalidate_tlb_range(gt, vm, 0, vm->total);
-
-	return result;
-}
-
-static int invalidate_range(void *arg)
-{
-	struct intel_gt *gt = arg;
-	int err;
-
-	if (!has_invalidate_range(gt))
-		return 0;
-
-	err = mem_tlbinv(gt, create_smem, tlbinv_range);
-	if (err == 0)
-		err = mem_tlbinv(gt, create_lmem, tlbinv_range);
-	if (err == -ENODEV || err == -ENXIO)
-		err = 0;
-
-	return err;
-}
-
 int intel_tlb_live_selftests(struct drm_i915_private *i915)
 {
 	static const struct i915_subtest tests[] = {
 		SUBTEST(invalidate_full),
-		SUBTEST(invalidate_range),
 	};
 	struct intel_gt *gt;
 	unsigned int i;
@@ -457,57 +399,4 @@ int intel_tlb_live_selftests(struct drm_i915_private *i915)
 	}
 
 	return 0;
-}
-
-static int tlb_page_size(void *arg)
-{
-	int start, size, offset;
-
-	for (start = 0; start < 57; start++) {
-		for (size = 0; size <= 57 - start; size++) {
-			for (offset = 0; offset <= size; offset++) {
-				u64 len = BIT(size);
-				u64 addr = BIT(start) + len - BIT(offset);
-				u64 expected_start = addr;
-				u64 expected_end = addr + len - 1;
-				int err = 0;
-
-				if (addr + len < addr)
-					continue;
-
-				len = tlb_page_selective_size(&addr, len);
-				if (addr > expected_start) {
-					pr_err("(start:%d, size:%d, offset:%d, range:[%llx, %llx]) invalidate range:[%llx + %llx] after start:%llx\n",
-					       start, size, offset,
-					       expected_start, expected_end,
-					       addr, len,
-					       expected_start);
-					err = -EINVAL;
-				}
-
-				if (addr + len < expected_end) {
-					pr_err("(start:%d, size:%d, offset:%d, range:[%llx, %llx]) invalidate range:[%llx + %llx] before end:%llx\n",
-					       start, size, offset,
-					       expected_start, expected_end,
-					       addr, len,
-					       expected_end);
-					err = -EINVAL;
-				}
-
-				if (err)
-					return err;
-			}
-		}
-	}
-
-	return 0;
-}
-
-int intel_tlb_mock_selftests(void)
-{
-	static const struct i915_subtest tests[] = {
-		SUBTEST(tlb_page_size),
-	};
-
-	return i915_subtests(tests, NULL);
 }

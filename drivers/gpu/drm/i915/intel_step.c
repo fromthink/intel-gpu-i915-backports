@@ -93,7 +93,6 @@ static const struct intel_step_info adls_revids[] = {
 	[0x4] = { COMMON_GT_MEDIA_STEP(B0), .display_step = STEP_B0 },
 	[0x8] = { COMMON_GT_MEDIA_STEP(C0), .display_step = STEP_B0 },
 	[0xC] = { COMMON_GT_MEDIA_STEP(D0), .display_step = STEP_C0 },
-	[0x10] = { COMMON_GT_MEDIA_STEP(D0), .display_step = STEP_D0 },
 };
 
 static const struct intel_step_info adlp_revids[] = {
@@ -101,7 +100,6 @@ static const struct intel_step_info adlp_revids[] = {
 	[0x4] = { COMMON_GT_MEDIA_STEP(B0), .display_step = STEP_B0 },
 	[0x8] = { COMMON_GT_MEDIA_STEP(C0), .display_step = STEP_C0 },
 	[0xC] = { COMMON_GT_MEDIA_STEP(C0), .display_step = STEP_D0 },
-	[0x10] = { COMMON_GT_MEDIA_STEP(C0), .display_step = STEP_E0 },
 };
 
 static const struct intel_step_info xehpsdv_revids[] = {
@@ -134,50 +132,25 @@ static const struct intel_step_info adls_rpls_revids[] = {
 	[0xC] = { COMMON_GT_MEDIA_STEP(D0), .display_step = STEP_C0 },
 };
 
+static const struct intel_step_info adlp_rplp_revids[] = {
+	[0x4] = { COMMON_GT_MEDIA_STEP(C0), .display_step = STEP_E0 },
+};
+
 static const struct intel_step_info adlp_n_revids[] = {
 	[0x0] = { COMMON_GT_MEDIA_STEP(A0), .display_step = STEP_D0 },
 };
 
-struct gmd_to_intel_step {
-	struct ip_version gmd;
-	enum intel_step step;
-};
-
-static const struct gmd_to_intel_step gmd_graphics_table[] = {
-	{ .gmd.ver = 12, .gmd.rel = 70, .gmd.step = 0, .step = STEP_A0 },
-	{ .gmd.ver = 12, .gmd.rel = 70, .gmd.step = 4, .step = STEP_B0 },
-	{ .gmd.ver = 12, .gmd.rel = 71, .gmd.step = 0, .step = STEP_A0 },
-	{ .gmd.ver = 12, .gmd.rel = 71, .gmd.step = 4, .step = STEP_B0 },
-	{ .gmd.ver = 12, .gmd.rel = 73, .gmd.step = 0, .step = STEP_A0 },
-	{ .gmd.ver = 12, .gmd.rel = 73, .gmd.step = 4, .step = STEP_B0 },
-};
-
-static const struct gmd_to_intel_step gmd_media_table[] = {
-	{ .gmd.ver = 13, .gmd.rel = 70, .gmd.step = 0, .step = STEP_A0 },
-	{ .gmd.ver = 13, .gmd.rel = 70, .gmd.step = 4, .step = STEP_B0 },
-};
-
-static const struct gmd_to_intel_step gmd_display_table[] = {
-	{ .gmd.ver = 14, .gmd.rel = 0, .gmd.step = 0, .step = STEP_A0 },
-	{ .gmd.ver = 14, .gmd.rel = 0, .gmd.step = 4, .step = STEP_B0 },
-};
-
 static u8 gmd_to_intel_step(struct drm_i915_private *i915,
-			    struct ip_version *gmd,
-			    const struct gmd_to_intel_step *table,
-			    int len)
+			    struct intel_ip_version *gmd)
 {
-	int i;
+	u8 step = gmd->step + STEP_A0;
 
-	for (i = 0; i < len; i++) {
-		if (table[i].gmd.ver == gmd->ver &&
-		    table[i].gmd.rel == gmd->rel &&
-		    table[i].gmd.step == gmd->step)
-			return table[i].step;
+	if (step >= STEP_FUTURE) {
+		drm_dbg(&i915->drm, "Using future steppings\n");
+		return STEP_FUTURE;
 	}
 
-	drm_dbg(&i915->drm, "Using future steppings\n");
-	return STEP_FUTURE;
+	return step;
 }
 
 static void pvc_step_init(struct drm_i915_private *i915, int pci_revid);
@@ -191,17 +164,15 @@ void intel_step_init(struct drm_i915_private *i915)
 
 	if (HAS_GMD_ID(i915)) {
 		step.graphics_step = gmd_to_intel_step(i915,
-						       &RUNTIME_INFO(i915)->graphics,
-						       gmd_graphics_table,
-						       ARRAY_SIZE(gmd_graphics_table));
+						       &RUNTIME_INFO(i915)->graphics.ip);
 		step.media_step = gmd_to_intel_step(i915,
-						    &RUNTIME_INFO(i915)->media,
-						    gmd_media_table,
-						    ARRAY_SIZE(gmd_media_table));
-		step.display_step = gmd_to_intel_step(i915,
-						      &RUNTIME_INFO(i915)->display,
-						      gmd_display_table,
-						      ARRAY_SIZE(gmd_display_table));
+						    &RUNTIME_INFO(i915)->media.ip);
+		step.display_step = STEP_A0 + DISPLAY_RUNTIME_INFO(i915)->ip.step;
+		if (step.display_step >= STEP_FUTURE) {
+			drm_dbg(&i915->drm, "Using future display steppings\n");
+			step.display_step = STEP_FUTURE;
+		}
+
 		RUNTIME_INFO(i915)->step = step;
 
 		return;
@@ -222,13 +193,16 @@ void intel_step_init(struct drm_i915_private *i915)
 	} else if (IS_XEHPSDV(i915)) {
 		revids = xehpsdv_revids;
 		size = ARRAY_SIZE(xehpsdv_revids);
-	} else if (IS_ADLP_N(i915)) {
+	} else if (IS_ALDERLAKE_P_N(i915)) {
 		revids = adlp_n_revids;
 		size = ARRAY_SIZE(adlp_n_revids);
+	} else if (IS_RAPTORLAKE_P(i915)) {
+		revids = adlp_rplp_revids;
+		size = ARRAY_SIZE(adlp_rplp_revids);
 	} else if (IS_ALDERLAKE_P(i915)) {
 		revids = adlp_revids;
 		size = ARRAY_SIZE(adlp_revids);
-	} else if (IS_ADLS_RPLS(i915)) {
+	} else if (IS_RAPTORLAKE_S(i915)) {
 		revids = adls_rpls_revids;
 		size = ARRAY_SIZE(adls_rpls_revids);
 	} else if (IS_ALDERLAKE_S(i915)) {
@@ -240,13 +214,13 @@ void intel_step_init(struct drm_i915_private *i915)
 	} else if (IS_ROCKETLAKE(i915)) {
 		revids = rkl_revids;
 		size = ARRAY_SIZE(rkl_revids);
-	} else if (IS_TGL_UY(i915)) {
+	} else if (IS_TIGERLAKE_UY(i915)) {
 		revids = tgl_uy_revids;
 		size = ARRAY_SIZE(tgl_uy_revids);
 	} else if (IS_TIGERLAKE(i915)) {
 		revids = tgl_revids;
 		size = ARRAY_SIZE(tgl_revids);
-	} else if (IS_JSL_EHL(i915)) {
+	} else if (IS_JASPERLAKE(i915) || IS_ELKHARTLAKE(i915)) {
 		revids = jsl_ehl_revids;
 		size = ARRAY_SIZE(jsl_ehl_revids);
 	} else if (IS_ICELAKE(i915)) {

@@ -31,4 +31,3 @@ i915_sriov_lmem_size(struct pci_dev *pdev, unsigned int vfid, unsigned int tile)
 void *i915_sriov_lmem_map(struct pci_dev *pdev, unsigned int vfid, unsigned int tile);
 void
 i915_sriov_lmem_unmap(struct pci_dev *pdev, unsigned int vfid, unsigned int tile);
-

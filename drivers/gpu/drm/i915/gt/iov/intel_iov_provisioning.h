@@ -29,10 +29,6 @@ int intel_iov_provisioning_auto(struct intel_iov *iov, unsigned int num_vfs);
 int intel_iov_provisioning_verify(struct intel_iov *iov, unsigned int num_vfs);
 int intel_iov_provisioning_push(struct intel_iov *iov, unsigned int num);
 
-#ifndef BPM_PCI_IOV_VF_ID_NOT_PRESENT
-u32 intel_iov_provisioning_get_tile_mask(struct intel_iov *iov, unsigned int vfid);
-#endif
-
 int intel_iov_provisioning_set_ggtt(struct intel_iov *iov, unsigned int id, u64 size);
 u64 intel_iov_provisioning_get_ggtt(struct intel_iov *iov, unsigned int id);
 int intel_iov_provisioning_set_spare_ggtt(struct intel_iov *iov, u64 size);
@@ -60,13 +56,6 @@ u32 intel_iov_provisioning_get_exec_quantum(struct intel_iov *iov, unsigned int 
 int intel_iov_provisioning_set_preempt_timeout(struct intel_iov *iov, unsigned int id, u32 preempt_timeout);
 u32 intel_iov_provisioning_get_preempt_timeout(struct intel_iov *iov, unsigned int id);
 
-int intel_iov_provisioning_set_lmem(struct intel_iov *iov, unsigned int id, u64 size);
-u64 intel_iov_provisioning_get_lmem(struct intel_iov *iov, unsigned int id);
-int intel_iov_provisioning_set_spare_lmem(struct intel_iov *iov, u64 size);
-u64 intel_iov_provisioning_get_spare_lmem(struct intel_iov *iov);
-u64 intel_iov_provisioning_query_free_lmem(struct intel_iov *iov);
-u64 intel_iov_provisioning_query_max_lmem(struct intel_iov *iov);
-
 int intel_iov_provisioning_set_threshold(struct intel_iov *iov, unsigned int id,
 					 enum intel_iov_threshold threshold, u32 value);
 u32 intel_iov_provisioning_get_threshold(struct intel_iov *iov, unsigned int id,
@@ -79,10 +68,6 @@ int intel_iov_provisioning_print_ctxs(struct intel_iov *iov, struct drm_printer 
 int intel_iov_provisioning_print_dbs(struct intel_iov *iov, struct drm_printer *p);
 
 int intel_iov_provisioning_print_available_ggtt(struct intel_iov *iov, struct drm_printer *p);
-
-#if IS_ENABLED(CPTCFG_DRM_I915_DEBUG_IOV)
-int intel_iov_provisioning_move_ggtt(struct intel_iov *iov, unsigned int id);
-#endif /* CPTCFG_DRM_I915_DEBUG_IOV */
 
 int intel_iov_provisioning_force_vgt_mode(struct intel_iov *iov);
 

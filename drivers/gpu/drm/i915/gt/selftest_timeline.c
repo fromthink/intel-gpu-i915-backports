@@ -684,7 +684,7 @@ static int live_hwsp_wrap(void *arg)
 	if (IS_ERR(tl))
 		return PTR_ERR(tl);
 
-	if (!intel_timeline_has_initial_breadcrumb(tl))
+	if (!tl->has_initial_breadcrumb)
 		goto out_free;
 
 	err = selftest_tl_pin(tl);
@@ -838,13 +838,13 @@ static int setup_watcher(struct hwsp_watcher *w, struct intel_gt *gt,
 	/* keep the same cache settings as timeline */
 	i915_gem_object_set_pat_index(obj, tl->hwsp_ggtt->obj->pat_index);
 	w->map = i915_gem_object_pin_map_unlocked(obj,
-			page_unmask_bits(tl->hwsp_ggtt->obj->mm.mapping));
+						  page_unmask_bits(tl->hwsp_ggtt->obj->mm.mapping));
 	if (IS_ERR(w->map)) {
 		i915_gem_object_put(obj);
 		return PTR_ERR(w->map);
 	}
 
-	vma = i915_gem_object_ggtt_pin(obj, gt->ggtt, NULL, 0, 0, 0);
+	vma = i915_gem_object_ggtt_pin(obj, NULL, 0, 0, 0);
 	if (IS_ERR(vma)) {
 		i915_gem_object_put(obj);
 		return PTR_ERR(vma);
@@ -957,7 +957,7 @@ static struct i915_request *wrap_timeline(struct i915_request *rq)
 {
 	struct intel_context *ce = rq->context;
 	struct intel_timeline *tl = ce->timeline;
-	u32 seqno = i915_request_seqno(rq);
+	u32 seqno = rq->fence.seqno;
 
 	while (tl->seqno >= seqno) { /* Cause a wrap */
 		i915_request_put(rq);
@@ -1005,7 +1005,7 @@ static int live_hwsp_read(void *arg)
 	if (IS_ERR(tl))
 		return PTR_ERR(tl);
 
-	if (!intel_timeline_has_initial_breadcrumb(tl))
+	if (!tl->has_initial_breadcrumb)
 		goto out_free;
 
 	selftest_tl_pin(tl);
@@ -1085,8 +1085,7 @@ static int live_hwsp_read(void *arg)
 			err = intel_timeline_read_hwsp(rq, watcher[0].rq, &hwsp);
 			if (err == 0)
 				err = emit_read_hwsp(watcher[0].rq, /* before */
-						     i915_request_seqno(rq),
-						     hwsp,
+						     rq->fence.seqno, hwsp,
 						     &watcher[0].addr);
 			switch_tl_lock(watcher[0].rq, rq);
 			if (err) {
@@ -1100,8 +1099,7 @@ static int live_hwsp_read(void *arg)
 			err = intel_timeline_read_hwsp(rq, watcher[1].rq, &hwsp);
 			if (err == 0)
 				err = emit_read_hwsp(watcher[1].rq, /* after */
-						     i915_request_seqno(rq),
-						     hwsp,
+						     rq->fence.seqno, hwsp,
 						     &watcher[1].addr);
 			switch_tl_lock(watcher[1].rq, rq);
 			if (err) {
@@ -1203,7 +1201,7 @@ static int live_hwsp_rollover_kernel(void *arg)
 		}
 
 		GEM_BUG_ON(i915_active_fence_isset(&tl->last_request));
-		tl->seqno = -2 * (1 + intel_timeline_has_initial_breadcrumb(tl));
+		tl->seqno = -2u;
 		WRITE_ONCE(*(u32 *)tl->hwsp_seqno, tl->seqno);
 
 		for (i = 0; i < ARRAY_SIZE(rq); i++) {
@@ -1216,7 +1214,8 @@ static int live_hwsp_rollover_kernel(void *arg)
 			}
 
 			pr_debug("%s: create fence.seqnp:%d\n",
-				 engine->name, i915_request_seqno(this));
+				 engine->name,
+				 lower_32_bits(this->fence.seqno));
 
 			GEM_BUG_ON(rcu_access_pointer(this->timeline) != tl);
 
@@ -1282,14 +1281,14 @@ static int live_hwsp_rollover_user(void *arg)
 			goto out;
 
 		tl = ce->timeline;
-		if (!intel_timeline_has_initial_breadcrumb(tl))
+		if (!tl->has_initial_breadcrumb)
 			goto out;
 
 		err = intel_context_pin(ce);
 		if (err)
 			goto out;
 
-		tl->seqno = -2 * (1 + intel_timeline_has_initial_breadcrumb(tl));
+		tl->seqno = -4u;
 		WRITE_ONCE(*(u32 *)tl->hwsp_seqno, tl->seqno);
 
 		for (i = 0; i < ARRAY_SIZE(rq); i++) {
@@ -1302,7 +1301,8 @@ static int live_hwsp_rollover_user(void *arg)
 			}
 
 			pr_debug("%s: create fence.seqnp:%d\n",
-				 engine->name, i915_request_seqno(this));
+				 engine->name,
+				 lower_32_bits(this->fence.seqno));
 
 			GEM_BUG_ON(rcu_access_pointer(this->timeline) != tl);
 
@@ -1414,114 +1414,9 @@ static int live_hwsp_recycle(void *arg)
 	return err;
 }
 
-static int live_hwsp_relative(void *arg)
-{
-	struct intel_gt *gt = arg;
-	struct intel_engine_cs *engine;
-	enum intel_engine_id id;
-
-	/*
-	 * Check backend support for different timeline modes.
-	 */
-
-	for_each_engine(engine, gt, id) {
-		enum intel_timeline_mode mode;
-
-		if (!intel_engine_has_scheduler(engine))
-			continue;
-
-		for (mode = INTEL_TIMELINE_ABSOLUTE;
-		     mode <= INTEL_TIMELINE_RELATIVE_ENGINE;
-		     mode++) {
-			struct intel_timeline *tl;
-			struct i915_request *rq;
-			struct intel_context *ce;
-			const char *msg;
-			int err;
-
-			if (mode == INTEL_TIMELINE_RELATIVE_CONTEXT &&
-			    !HAS_EXECLISTS(gt->i915))
-				continue;
-
-			ce = intel_context_create(engine);
-			if (IS_ERR(ce))
-				return PTR_ERR(ce);
-
-			err = intel_context_alloc_state(ce);
-			if (err) {
-				intel_context_put(ce);
-				return err;
-			}
-
-			switch (mode) {
-			case INTEL_TIMELINE_ABSOLUTE:
-				tl = intel_timeline_create(gt);
-				msg = "local";
-				break;
-
-			case INTEL_TIMELINE_RELATIVE_CONTEXT:
-				tl = __intel_timeline_create(gt,
-							     ce->state,
-							     INTEL_TIMELINE_RELATIVE_CONTEXT |
-							     0x400);
-				msg = "ppHWSP";
-				break;
-
-			case INTEL_TIMELINE_RELATIVE_ENGINE:
-				tl = __intel_timeline_create(gt,
-							     engine->status_page.vma,
-							     0x400);
-				msg = "HWSP";
-				break;
-			}
-			if (IS_ERR(tl)) {
-				pr_info("Failed to create %s timeline on %s, err:%pe\n",
-					msg, engine->name, tl);
-				intel_context_put(ce);
-				return PTR_ERR(tl);
-			}
-
-			pr_info("Testing %s timeline on %s\n",
-				msg, engine->name);
-
-			intel_timeline_put(ce->timeline);
-			ce->timeline = tl;
-
-			rq = intel_context_create_request(ce);
-			intel_context_put(ce);
-			if (IS_ERR(rq))
-				return PTR_ERR(rq);
-
-			GEM_BUG_ON(rcu_access_pointer(rq->timeline) != tl);
-
-			i915_request_get(rq);
-			i915_request_add(rq);
-
-			if (i915_request_wait(rq, 0, HZ / 5) < 0) {
-				struct drm_printer p =
-					drm_info_printer(gt->i915->drm.dev);
-
-				pr_err("%s(%s): Failed to signal request %llx:%llx\n",
-				       engine->name, msg,
-				       rq->fence.context,
-				       rq->fence.seqno);
-				intel_engine_dump(engine, &p,
-						  "%s\n", engine->name);
-				i915_request_put(rq);
-				return -EIO;
-			}
-
-			i915_request_put(rq);
-		}
-	}
-
-	return 0;
-}
-
 int intel_timeline_live_selftests(struct drm_i915_private *i915)
 {
 	static const struct i915_subtest tests[] = {
-		SUBTEST(live_hwsp_relative),
 		SUBTEST(live_hwsp_recycle),
 		SUBTEST(live_hwsp_engine),
 		SUBTEST(live_hwsp_alternate),
@@ -1530,18 +1425,9 @@ int intel_timeline_live_selftests(struct drm_i915_private *i915)
 		SUBTEST(live_hwsp_rollover_kernel),
 		SUBTEST(live_hwsp_rollover_user),
 	};
-	struct intel_gt *gt;
-	unsigned int i;
-	int ret = 0;
 
-	for_each_gt(gt, i915, i) {
-		if (intel_gt_is_wedged(gt))
-			continue;
+	if (intel_gt_is_wedged(to_gt(i915)))
+		return 0;
 
-		ret = intel_gt_live_subtests(tests, gt);
-		if (ret)
-			break;
-	}
-
-	return ret;
+	return intel_gt_live_subtests(tests, to_gt(i915));
 }

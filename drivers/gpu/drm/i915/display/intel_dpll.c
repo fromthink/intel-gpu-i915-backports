@@ -6,11 +6,13 @@
 #include <linux/kernel.h>
 #include <linux/string_helpers.h>
 
+#include "i915_reg.h"
 #include "intel_crtc.h"
 #include "intel_cx0_phy.h"
 #include "intel_de.h"
 #include "intel_display.h"
 #include "intel_display_types.h"
+#include "intel_dpio_phy.h"
 #include "intel_dpll.h"
 #include "intel_lvds.h"
 #include "intel_panel.h"
@@ -312,10 +314,11 @@ int pnv_calc_dpll_params(int refclk, struct dpll *clock)
 {
 	clock->m = clock->m2 + 2;
 	clock->p = clock->p1 * clock->p2;
-	if (WARN_ON(clock->n == 0 || clock->p == 0))
-		return 0;
-	clock->vco = DIV_ROUND_CLOSEST(refclk * clock->m, clock->n);
-	clock->dot = DIV_ROUND_CLOSEST(clock->vco, clock->p);
+
+	clock->vco = clock->n == 0 ? 0 :
+		DIV_ROUND_CLOSEST(refclk * clock->m, clock->n);
+	clock->dot = clock->p == 0 ? 0 :
+		DIV_ROUND_CLOSEST(clock->vco, clock->p);
 
 	return clock->dot;
 }
@@ -329,10 +332,11 @@ int i9xx_calc_dpll_params(int refclk, struct dpll *clock)
 {
 	clock->m = i9xx_dpll_compute_m(clock);
 	clock->p = clock->p1 * clock->p2;
-	if (WARN_ON(clock->n + 2 == 0 || clock->p == 0))
-		return 0;
-	clock->vco = DIV_ROUND_CLOSEST(refclk * clock->m, clock->n + 2);
-	clock->dot = DIV_ROUND_CLOSEST(clock->vco, clock->p);
+
+	clock->vco = clock->n + 2 == 0 ? 0 :
+		DIV_ROUND_CLOSEST(refclk * clock->m, clock->n + 2);
+	clock->dot = clock->p == 0 ? 0 :
+		DIV_ROUND_CLOSEST(clock->vco, clock->p);
 
 	return clock->dot;
 }
@@ -341,10 +345,11 @@ int vlv_calc_dpll_params(int refclk, struct dpll *clock)
 {
 	clock->m = clock->m1 * clock->m2;
 	clock->p = clock->p1 * clock->p2 * 5;
-	if (WARN_ON(clock->n == 0 || clock->p == 0))
-		return 0;
-	clock->vco = DIV_ROUND_CLOSEST(refclk * clock->m, clock->n);
-	clock->dot = DIV_ROUND_CLOSEST(clock->vco, clock->p);
+
+	clock->vco = clock->n == 0 ? 0 :
+		DIV_ROUND_CLOSEST(refclk * clock->m, clock->n);
+	clock->dot = clock->p == 0 ? 0 :
+		DIV_ROUND_CLOSEST(clock->vco, clock->p);
 
 	return clock->dot;
 }
@@ -353,11 +358,11 @@ int chv_calc_dpll_params(int refclk, struct dpll *clock)
 {
 	clock->m = clock->m1 * clock->m2;
 	clock->p = clock->p1 * clock->p2 * 5;
-	if (WARN_ON(clock->n == 0 || clock->p == 0))
-		return 0;
-	clock->vco = DIV_ROUND_CLOSEST_ULL(mul_u32_u32(refclk, clock->m),
-					   clock->n << 22);
-	clock->dot = DIV_ROUND_CLOSEST(clock->vco, clock->p);
+
+	clock->vco = clock->n == 0 ? 0 :
+		DIV_ROUND_CLOSEST_ULL(mul_u32_u32(refclk, clock->m), clock->n << 22);
+	clock->dot = clock->p == 0 ? 0 :
+		DIV_ROUND_CLOSEST(clock->vco, clock->p);
 
 	return clock->dot;
 }
@@ -939,12 +944,25 @@ static int hsw_crtc_compute_clock(struct intel_atomic_state *state,
 		intel_atomic_get_new_crtc_state(state, crtc);
 	struct intel_encoder *encoder =
 		intel_get_crtc_new_encoder(state, crtc_state);
+	int ret;
 
 	if (DISPLAY_VER(dev_priv) < 11 &&
 	    intel_crtc_has_type(crtc_state, INTEL_OUTPUT_DSI))
 		return 0;
 
-	return intel_compute_shared_dplls(state, crtc, encoder);
+	ret = intel_compute_shared_dplls(state, crtc, encoder);
+	if (ret)
+		return ret;
+
+	/* FIXME this is a mess */
+	if (intel_crtc_has_type(crtc_state, INTEL_OUTPUT_DSI))
+		return 0;
+
+	/* CRT dotclock is determined via other means */
+	if (!crtc_state->has_pch_encoder)
+		crtc_state->hw.adjusted_mode.crtc_clock = intel_crtc_dotclock(crtc_state);
+
+	return 0;
 }
 
 static int hsw_crtc_get_shared_dpll(struct intel_atomic_state *state,
@@ -970,8 +988,15 @@ static int dg2_crtc_compute_clock(struct intel_atomic_state *state,
 		intel_atomic_get_new_crtc_state(state, crtc);
 	struct intel_encoder *encoder =
 		intel_get_crtc_new_encoder(state, crtc_state);
+	int ret;
 
-	return intel_mpllb_calc_state(crtc_state, encoder);
+	ret = intel_mpllb_calc_state(crtc_state, encoder);
+	if (ret)
+		return ret;
+
+	crtc_state->hw.adjusted_mode.crtc_clock = intel_crtc_dotclock(crtc_state);
+
+	return 0;
 }
 
 static int mtl_crtc_compute_clock(struct intel_atomic_state *state,
@@ -1018,7 +1043,7 @@ static void ilk_update_pll_dividers(struct intel_crtc_state *crtc_state,
 	factor = 21;
 	if (intel_crtc_has_type(crtc_state, INTEL_OUTPUT_LVDS)) {
 		if ((intel_panel_use_ssc(dev_priv) &&
-		     dev_priv->vbt.lvds_ssc_freq == 100000) ||
+		     dev_priv->display.vbt.lvds_ssc_freq == 100000) ||
 		    (HAS_PCH_IBX(dev_priv) &&
 		     intel_is_dual_link_lvds(dev_priv)))
 			factor = 25;
@@ -1123,6 +1148,7 @@ static int ilk_crtc_compute_clock(struct intel_atomic_state *state,
 		intel_atomic_get_new_crtc_state(state, crtc);
 	const struct intel_limit *limit;
 	int refclk = 120000;
+	int ret;
 
 	/* CPU eDP is the only output that doesn't need a PCH PLL of its own. */
 	if (!crtc_state->has_pch_encoder)
@@ -1132,8 +1158,8 @@ static int ilk_crtc_compute_clock(struct intel_atomic_state *state,
 		if (intel_panel_use_ssc(dev_priv)) {
 			drm_dbg_kms(&dev_priv->drm,
 				    "using SSC reference clock of %d kHz\n",
-				    dev_priv->vbt.lvds_ssc_freq);
-			refclk = dev_priv->vbt.lvds_ssc_freq;
+				    dev_priv->display.vbt.lvds_ssc_freq);
+			refclk = dev_priv->display.vbt.lvds_ssc_freq;
 		}
 
 		if (intel_is_dual_link_lvds(dev_priv)) {
@@ -1156,10 +1182,19 @@ static int ilk_crtc_compute_clock(struct intel_atomic_state *state,
 				refclk, NULL, &crtc_state->dpll))
 		return -EINVAL;
 
+	i9xx_calc_dpll_params(refclk, &crtc_state->dpll);
+
 	ilk_compute_dpll(crtc_state, &crtc_state->dpll,
 			 &crtc_state->dpll);
 
-	return intel_compute_shared_dplls(state, crtc, NULL);
+	ret = intel_compute_shared_dplls(state, crtc, NULL);
+	if (ret)
+		return ret;
+
+	crtc_state->port_clock = crtc_state->dpll.dot;
+	crtc_state->hw.adjusted_mode.crtc_clock = intel_crtc_dotclock(crtc_state);
+
+	return ret;
 }
 
 static int ilk_crtc_get_shared_dpll(struct intel_atomic_state *state,
@@ -1223,7 +1258,16 @@ static int chv_crtc_compute_clock(struct intel_atomic_state *state,
 				refclk, NULL, &crtc_state->dpll))
 		return -EINVAL;
 
+	chv_calc_dpll_params(refclk, &crtc_state->dpll);
+
 	chv_compute_dpll(crtc_state);
+
+	/* FIXME this is a mess */
+	if (intel_crtc_has_type(crtc_state, INTEL_OUTPUT_DSI))
+		return 0;
+
+	crtc_state->port_clock = crtc_state->dpll.dot;
+	crtc_state->hw.adjusted_mode.crtc_clock = intel_crtc_dotclock(crtc_state);
 
 	return 0;
 }
@@ -1238,11 +1282,19 @@ static int vlv_crtc_compute_clock(struct intel_atomic_state *state,
 
 	if (!crtc_state->clock_set &&
 	    !vlv_find_best_dpll(limit, crtc_state, crtc_state->port_clock,
-				refclk, NULL, &crtc_state->dpll)) {
+				refclk, NULL, &crtc_state->dpll))
 		return -EINVAL;
-	}
+
+	vlv_calc_dpll_params(refclk, &crtc_state->dpll);
 
 	vlv_compute_dpll(crtc_state);
+
+	/* FIXME this is a mess */
+	if (intel_crtc_has_type(crtc_state, INTEL_OUTPUT_DSI))
+		return 0;
+
+	crtc_state->port_clock = crtc_state->dpll.dot;
+	crtc_state->hw.adjusted_mode.crtc_clock = intel_crtc_dotclock(crtc_state);
 
 	return 0;
 }
@@ -1258,7 +1310,7 @@ static int g4x_crtc_compute_clock(struct intel_atomic_state *state,
 
 	if (intel_crtc_has_type(crtc_state, INTEL_OUTPUT_LVDS)) {
 		if (intel_panel_use_ssc(dev_priv)) {
-			refclk = dev_priv->vbt.lvds_ssc_freq;
+			refclk = dev_priv->display.vbt.lvds_ssc_freq;
 			drm_dbg_kms(&dev_priv->drm,
 				    "using SSC reference clock of %d kHz\n",
 				    refclk);
@@ -1283,8 +1335,15 @@ static int g4x_crtc_compute_clock(struct intel_atomic_state *state,
 				refclk, NULL, &crtc_state->dpll))
 		return -EINVAL;
 
+	i9xx_calc_dpll_params(refclk, &crtc_state->dpll);
+
 	i9xx_compute_dpll(crtc_state, &crtc_state->dpll,
 			  &crtc_state->dpll);
+
+	crtc_state->port_clock = crtc_state->dpll.dot;
+	/* FIXME this is a mess */
+	if (!intel_crtc_has_type(crtc_state, INTEL_OUTPUT_TVOUT))
+		crtc_state->hw.adjusted_mode.crtc_clock = intel_crtc_dotclock(crtc_state);
 
 	return 0;
 }
@@ -1300,7 +1359,7 @@ static int pnv_crtc_compute_clock(struct intel_atomic_state *state,
 
 	if (intel_crtc_has_type(crtc_state, INTEL_OUTPUT_LVDS)) {
 		if (intel_panel_use_ssc(dev_priv)) {
-			refclk = dev_priv->vbt.lvds_ssc_freq;
+			refclk = dev_priv->display.vbt.lvds_ssc_freq;
 			drm_dbg_kms(&dev_priv->drm,
 				    "using SSC reference clock of %d kHz\n",
 				    refclk);
@@ -1316,8 +1375,13 @@ static int pnv_crtc_compute_clock(struct intel_atomic_state *state,
 				refclk, NULL, &crtc_state->dpll))
 		return -EINVAL;
 
+	pnv_calc_dpll_params(refclk, &crtc_state->dpll);
+
 	i9xx_compute_dpll(crtc_state, &crtc_state->dpll,
 			  &crtc_state->dpll);
+
+	crtc_state->port_clock = crtc_state->dpll.dot;
+	crtc_state->hw.adjusted_mode.crtc_clock = intel_crtc_dotclock(crtc_state);
 
 	return 0;
 }
@@ -1333,7 +1397,7 @@ static int i9xx_crtc_compute_clock(struct intel_atomic_state *state,
 
 	if (intel_crtc_has_type(crtc_state, INTEL_OUTPUT_LVDS)) {
 		if (intel_panel_use_ssc(dev_priv)) {
-			refclk = dev_priv->vbt.lvds_ssc_freq;
+			refclk = dev_priv->display.vbt.lvds_ssc_freq;
 			drm_dbg_kms(&dev_priv->drm,
 				    "using SSC reference clock of %d kHz\n",
 				    refclk);
@@ -1349,8 +1413,15 @@ static int i9xx_crtc_compute_clock(struct intel_atomic_state *state,
 				 refclk, NULL, &crtc_state->dpll))
 		return -EINVAL;
 
+	i9xx_calc_dpll_params(refclk, &crtc_state->dpll);
+
 	i9xx_compute_dpll(crtc_state, &crtc_state->dpll,
 			  &crtc_state->dpll);
+
+	crtc_state->port_clock = crtc_state->dpll.dot;
+	/* FIXME this is a mess */
+	if (!intel_crtc_has_type(crtc_state, INTEL_OUTPUT_TVOUT))
+		crtc_state->hw.adjusted_mode.crtc_clock = intel_crtc_dotclock(crtc_state);
 
 	return 0;
 }
@@ -1366,7 +1437,7 @@ static int i8xx_crtc_compute_clock(struct intel_atomic_state *state,
 
 	if (intel_crtc_has_type(crtc_state, INTEL_OUTPUT_LVDS)) {
 		if (intel_panel_use_ssc(dev_priv)) {
-			refclk = dev_priv->vbt.lvds_ssc_freq;
+			refclk = dev_priv->display.vbt.lvds_ssc_freq;
 			drm_dbg_kms(&dev_priv->drm,
 				    "using SSC reference clock of %d kHz\n",
 				    refclk);
@@ -1384,8 +1455,13 @@ static int i8xx_crtc_compute_clock(struct intel_atomic_state *state,
 				 refclk, NULL, &crtc_state->dpll))
 		return -EINVAL;
 
+	i9xx_calc_dpll_params(refclk, &crtc_state->dpll);
+
 	i8xx_compute_dpll(crtc_state, &crtc_state->dpll,
 			  &crtc_state->dpll);
+
+	crtc_state->port_clock = crtc_state->dpll.dot;
+	crtc_state->hw.adjusted_mode.crtc_clock = intel_crtc_dotclock(crtc_state);
 
 	return 0;
 }
@@ -1442,16 +1518,13 @@ int intel_dpll_crtc_compute_clock(struct intel_atomic_state *state,
 
 	drm_WARN_ON(&i915->drm, !intel_crtc_needs_modeset(crtc_state));
 
-	if (drm_WARN_ON(&i915->drm, crtc_state->shared_dpll))
-		return 0;
-
 	memset(&crtc_state->dpll_hw_state, 0,
 	       sizeof(crtc_state->dpll_hw_state));
 
 	if (!crtc_state->hw.enable)
 		return 0;
 
-	ret = i915->dpll_funcs->crtc_compute_clock(state, crtc);
+	ret = i915->display.funcs.dpll->crtc_compute_clock(state, crtc);
 	if (ret) {
 		drm_dbg_kms(&i915->drm, "[CRTC:%d:%s] Couldn't calculate DPLL settings\n",
 			    crtc->base.base.id, crtc->base.name);
@@ -1470,17 +1543,15 @@ int intel_dpll_crtc_get_shared_dpll(struct intel_atomic_state *state,
 	int ret;
 
 	drm_WARN_ON(&i915->drm, !intel_crtc_needs_modeset(crtc_state));
+	drm_WARN_ON(&i915->drm, !crtc_state->hw.enable && crtc_state->shared_dpll);
 
-	if (drm_WARN_ON(&i915->drm, crtc_state->shared_dpll))
+	if (!crtc_state->hw.enable || crtc_state->shared_dpll)
 		return 0;
 
-	if (!crtc_state->hw.enable)
+	if (!i915->display.funcs.dpll->crtc_get_shared_dpll)
 		return 0;
 
-	if (!i915->dpll_funcs->crtc_get_shared_dpll)
-		return 0;
-
-	ret = i915->dpll_funcs->crtc_get_shared_dpll(state, crtc);
+	ret = i915->display.funcs.dpll->crtc_get_shared_dpll(state, crtc);
 	if (ret) {
 		drm_dbg_kms(&i915->drm, "[CRTC:%d:%s] Couldn't get a shared DPLL\n",
 			    crtc->base.base.id, crtc->base.name);
@@ -1494,25 +1565,25 @@ void
 intel_dpll_init_clock_hook(struct drm_i915_private *dev_priv)
 {
 	if (DISPLAY_VER(dev_priv) >= 14)
-		dev_priv->dpll_funcs = &mtl_dpll_funcs;
+		dev_priv->display.funcs.dpll = &mtl_dpll_funcs;
 	else if (IS_DG2(dev_priv))
-		dev_priv->dpll_funcs = &dg2_dpll_funcs;
+		dev_priv->display.funcs.dpll = &dg2_dpll_funcs;
 	else if (DISPLAY_VER(dev_priv) >= 9 || HAS_DDI(dev_priv))
-		dev_priv->dpll_funcs = &hsw_dpll_funcs;
+		dev_priv->display.funcs.dpll = &hsw_dpll_funcs;
 	else if (HAS_PCH_SPLIT(dev_priv))
-		dev_priv->dpll_funcs = &ilk_dpll_funcs;
+		dev_priv->display.funcs.dpll = &ilk_dpll_funcs;
 	else if (IS_CHERRYVIEW(dev_priv))
-		dev_priv->dpll_funcs = &chv_dpll_funcs;
+		dev_priv->display.funcs.dpll = &chv_dpll_funcs;
 	else if (IS_VALLEYVIEW(dev_priv))
-		dev_priv->dpll_funcs = &vlv_dpll_funcs;
+		dev_priv->display.funcs.dpll = &vlv_dpll_funcs;
 	else if (IS_G4X(dev_priv))
-		dev_priv->dpll_funcs = &g4x_dpll_funcs;
+		dev_priv->display.funcs.dpll = &g4x_dpll_funcs;
 	else if (IS_PINEVIEW(dev_priv))
-		dev_priv->dpll_funcs = &pnv_dpll_funcs;
+		dev_priv->display.funcs.dpll = &pnv_dpll_funcs;
 	else if (DISPLAY_VER(dev_priv) != 2)
-		dev_priv->dpll_funcs = &i9xx_dpll_funcs;
+		dev_priv->display.funcs.dpll = &i9xx_dpll_funcs;
 	else
-		dev_priv->dpll_funcs = &i8xx_dpll_funcs;
+		dev_priv->display.funcs.dpll = &i8xx_dpll_funcs;
 }
 
 static bool i9xx_has_pps(struct drm_i915_private *dev_priv)
@@ -1738,13 +1809,11 @@ static void chv_prepare_pll(const struct intel_crtc_state *crtc_state)
 	enum pipe pipe = crtc->pipe;
 	enum dpio_channel port = vlv_pipe_to_channel(pipe);
 	u32 loopfilter, tribuf_calcntr;
-	u32 bestn, bestm1, bestm2, bestp1, bestp2, bestm2_frac;
+	u32 bestm2, bestp1, bestp2, bestm2_frac;
 	u32 dpio_val;
 	int vco;
 
-	bestn = crtc_state->dpll.n;
 	bestm2_frac = crtc_state->dpll.m2 & 0x3fffff;
-	bestm1 = crtc_state->dpll.m1;
 	bestm2 = crtc_state->dpll.m2 >> 22;
 	bestp1 = crtc_state->dpll.p1;
 	bestp2 = crtc_state->dpll.p2;
@@ -1888,7 +1957,7 @@ void chv_enable_pll(const struct intel_crtc_state *crtc_state)
 		intel_de_write(dev_priv, DPLL_MD(PIPE_B),
 			       crtc_state->dpll_hw_state.dpll_md);
 		intel_de_write(dev_priv, CBR4_VLV, 0);
-		dev_priv->chv_dpll_md[pipe] = crtc_state->dpll_hw_state.dpll_md;
+		dev_priv->display.state.chv_dpll_md[pipe] = crtc_state->dpll_hw_state.dpll_md;
 
 		/*
 		 * DPLLB VGA mode also seems to cause problems.
@@ -2025,7 +2094,7 @@ static void assert_pll(struct drm_i915_private *dev_priv,
 	bool cur_state;
 
 	cur_state = intel_de_read(dev_priv, DPLL(pipe)) & DPLL_VCO_ENABLE;
-	I915_STATE_WARN(cur_state != state,
+	I915_STATE_WARN(dev_priv, cur_state != state,
 			"PLL state assertion failure (expected %s, current %s)\n",
 			str_on_off(state), str_on_off(cur_state));
 }

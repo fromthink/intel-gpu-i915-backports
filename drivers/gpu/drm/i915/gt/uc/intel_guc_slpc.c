@@ -7,6 +7,7 @@
 #include <linux/string_helpers.h>
 
 #include "i915_drv.h"
+#include "i915_reg.h"
 #include "intel_guc_slpc.h"
 #include "intel_guc_print.h"
 #include "intel_mchbar_regs.h"
@@ -31,17 +32,9 @@ static inline struct drm_i915_private *slpc_to_i915(struct intel_guc_slpc *slpc)
 
 static bool __detect_slpc_supported(struct intel_guc *guc)
 {
-	struct drm_i915_private *i915 = guc_to_gt(guc)->i915;
-
-	if (!i915->params.enable_rps)
-		return false;
-
-	if (i915_modparams.force_host_pm)
-		return false;
-
 	/* GuC SLPC is unavailable for pre-Gen12 */
 	return guc->submission_supported &&
-		GRAPHICS_VER(i915) >= 12;
+		GRAPHICS_VER(guc_to_gt(guc)->i915) >= 12;
 }
 
 static bool __guc_slpc_selected(struct intel_guc *guc)
@@ -145,17 +138,6 @@ static int guc_action_slpc_set_param(struct intel_guc *guc, u8 id, u32 value)
 	return ret > 0 ? -EPROTO : ret;
 }
 
-static int guc_action_slpc_unset_param(struct intel_guc *guc, u8 id)
-{
-	u32 request[] = {
-		GUC_ACTION_HOST2GUC_PC_SLPC_REQUEST,
-		SLPC_EVENT(SLPC_EVENT_PARAMETER_UNSET, 1),
-		id,
-	};
-
-	return intel_guc_send(guc, request, ARRAY_SIZE(request));
-}
-
 static bool slpc_is_running(struct intel_guc_slpc *slpc)
 {
 	return slpc_get_state(slpc) == SLPC_GLOBAL_STATE_RUNNING;
@@ -204,15 +186,6 @@ static int slpc_set_param(struct intel_guc_slpc *slpc, u8 id, u32 value)
 				id, value, ERR_PTR(ret));
 
 	return ret;
-}
-
-static int slpc_unset_param(struct intel_guc_slpc *slpc, u8 id)
-{
-	struct intel_guc *guc = slpc_to_guc(slpc);
-
-	GEM_BUG_ON(id >= SLPC_MAX_PARAM);
-
-	return guc_action_slpc_unset_param(guc, id);
 }
 
 static int slpc_force_min_freq(struct intel_guc_slpc *slpc, u32 freq)
@@ -284,17 +257,13 @@ int intel_guc_slpc_init(struct intel_guc_slpc *slpc)
 
 	slpc->max_freq_softlimit = 0;
 	slpc->min_freq_softlimit = 0;
+	slpc->ignore_eff_freq = false;
 	slpc->min_is_rpmax = false;
 
 	slpc->boost_freq = 0;
 	atomic_set(&slpc->num_waiters, 0);
 	slpc->num_boosts = 0;
-
-	slpc->media_ratio_mode = IS_PONTEVECCHIO(slpc_to_gt(slpc)->i915) ?
-					SLPC_MEDIA_RATIO_MODE_FIXED_ONE_TO_TWO :
-					SLPC_MEDIA_RATIO_MODE_DYNAMIC_CONTROL;
-
-	slpc_to_gt(slpc)->rps_defaults.media_ratio_mode = slpc->media_ratio_mode;
+	slpc->media_ratio_mode = SLPC_MEDIA_RATIO_MODE_DYNAMIC_CONTROL;
 
 	mutex_init(&slpc->lock);
 	INIT_WORK(&slpc->boost_work, slpc_boost_work);
@@ -469,6 +438,36 @@ int intel_guc_slpc_get_max_freq(struct intel_guc_slpc *slpc, u32 *val)
 	return ret;
 }
 
+int intel_guc_slpc_set_ignore_eff_freq(struct intel_guc_slpc *slpc, bool val)
+{
+	struct drm_i915_private *i915 = slpc_to_i915(slpc);
+	intel_wakeref_t wakeref;
+	int ret;
+
+	mutex_lock(&slpc->lock);
+	wakeref = intel_runtime_pm_get(&i915->runtime_pm);
+
+	ret = slpc_set_param(slpc,
+			     SLPC_PARAM_IGNORE_EFFICIENT_FREQUENCY,
+			     val);
+	if (ret) {
+		guc_probe_error(slpc_to_guc(slpc), "Failed to set efficient freq(%d): %pe\n",
+				val, ERR_PTR(ret));
+	} else {
+		slpc->ignore_eff_freq = val;
+
+		/* Set min to RPn when we disable efficient freq */
+		if (val)
+			ret = slpc_set_param(slpc,
+					     SLPC_PARAM_GLOBAL_MIN_GT_UNSLICE_FREQ_MHZ,
+					     slpc->min_freq);
+	}
+
+	intel_runtime_pm_put(&i915->runtime_pm, wakeref);
+	mutex_unlock(&slpc->lock);
+	return ret;
+}
+
 /**
  * intel_guc_slpc_set_min_freq() - Set min frequency limit for SLPC.
  * @slpc: pointer to intel_guc_slpc.
@@ -492,22 +491,21 @@ int intel_guc_slpc_set_min_freq(struct intel_guc_slpc *slpc, u32 val)
 
 	/* Need a lock now since waitboost can be modifying min as well */
 	mutex_lock(&slpc->lock);
+	wakeref = intel_runtime_pm_get(&i915->runtime_pm);
 
-	with_intel_runtime_pm(&i915->runtime_pm, wakeref) {
-
-		ret = slpc_set_param(slpc,
-				     SLPC_PARAM_GLOBAL_MIN_GT_UNSLICE_FREQ_MHZ,
-				     val);
-
-		/* Return standardized err code for sysfs calls */
-		if (ret)
-			ret = -EIO;
-	}
+	ret = slpc_set_param(slpc,
+			     SLPC_PARAM_GLOBAL_MIN_GT_UNSLICE_FREQ_MHZ,
+			     val);
 
 	if (!ret)
 		slpc->min_freq_softlimit = val;
 
+	intel_runtime_pm_put(&i915->runtime_pm, wakeref);
 	mutex_unlock(&slpc->lock);
+
+	/* Return standardized err code for sysfs calls */
+	if (ret)
+		ret = -EIO;
 
 	return ret;
 }
@@ -552,9 +550,6 @@ int intel_guc_slpc_set_media_ratio_mode(struct intel_guc_slpc *slpc, u32 val)
 		ret = slpc_set_param(slpc,
 				     SLPC_PARAM_MEDIA_FF_RATIO_MODE,
 				     val);
-	if (ret)
-		i915_probe_error(i915, "set_media_ratio_mode returned %d\n", ret);
-
 	return ret;
 }
 
@@ -584,7 +579,7 @@ static int slpc_set_softlimits(struct intel_guc_slpc *slpc)
 	 */
 	if (!slpc->max_freq_softlimit) {
 		slpc->max_freq_softlimit = slpc->rp0_freq;
-		slpc_to_gt(slpc)->rps_defaults.max_freq = slpc->max_freq_softlimit;
+		slpc_to_gt(slpc)->defaults.max_freq = slpc->max_freq_softlimit;
 	} else if (slpc->max_freq_softlimit != slpc->rp0_freq) {
 		ret = intel_guc_slpc_set_max_freq(slpc,
 						  slpc->max_freq_softlimit);
@@ -594,10 +589,10 @@ static int slpc_set_softlimits(struct intel_guc_slpc *slpc)
 		return ret;
 
 	if (!slpc->min_freq_softlimit) {
+		/* Min softlimit is initialized to RPn */
 		slpc->min_freq_softlimit = slpc->min_freq;
-		slpc_to_gt(slpc)->rps_defaults.min_freq = slpc->min_freq_softlimit;
-	}
-	else if (slpc->min_freq_softlimit != slpc->min_freq) {
+		slpc_to_gt(slpc)->defaults.min_freq = slpc->min_freq_softlimit;
+	} else {
 		return intel_guc_slpc_set_min_freq(slpc,
 						   slpc->min_freq_softlimit);
 	}
@@ -605,37 +600,18 @@ static int slpc_set_softlimits(struct intel_guc_slpc *slpc)
 	return 0;
 }
 
-static int slpc_ignore_eff_freq(struct intel_guc_slpc *slpc, bool ignore)
-{
-	int ret = 0;
-
-	if (ignore) {
-		ret = slpc_set_param(slpc,
-				     SLPC_PARAM_IGNORE_EFFICIENT_FREQUENCY,
-				     ignore);
-		if (!ret)
-			return slpc_set_param(slpc,
-					      SLPC_PARAM_GLOBAL_MIN_GT_UNSLICE_FREQ_MHZ,
-					      slpc->min_freq);
-	} else {
-		ret = slpc_unset_param(slpc,
-				       SLPC_PARAM_IGNORE_EFFICIENT_FREQUENCY);
-		if (!ret)
-			return slpc_unset_param(slpc,
-						SLPC_PARAM_GLOBAL_MIN_GT_UNSLICE_FREQ_MHZ);
-	}
-
-	return ret;
-}
-
 static bool is_slpc_min_freq_rpmax(struct intel_guc_slpc *slpc)
 {
 	int slpc_min_freq;
+	int ret;
 
-	if (intel_guc_slpc_get_min_freq(slpc, &slpc_min_freq))
+	ret = intel_guc_slpc_get_min_freq(slpc, &slpc_min_freq);
+	if (ret) {
+		guc_err(slpc_to_guc(slpc), "Failed to get min freq: %pe\n", ERR_PTR(ret));
 		return false;
+	}
 
-	if (slpc_min_freq > slpc->rp0_freq)
+	if (slpc_min_freq == SLPC_MAX_FREQ_MHZ)
 		return true;
 	else
 		return false;
@@ -646,11 +622,11 @@ static void update_server_min_softlimit(struct intel_guc_slpc *slpc)
 	/* For server parts, SLPC min will be at RPMax.
 	 * Use min softlimit to clamp it to RP0 instead.
 	 */
-	if (is_slpc_min_freq_rpmax(slpc) &&
-	    !slpc->min_freq_softlimit) {
+	if (!slpc->min_freq_softlimit &&
+	    is_slpc_min_freq_rpmax(slpc)) {
 		slpc->min_is_rpmax = true;
 		slpc->min_freq_softlimit = slpc->rp0_freq;
-		slpc_to_gt(slpc)->rps_defaults.min_freq = slpc->min_freq_softlimit;
+		(slpc_to_gt(slpc))->defaults.min_freq = slpc->min_freq_softlimit;
 	}
 }
 
@@ -672,54 +648,8 @@ static void slpc_get_rp_values(struct intel_guc_slpc *slpc)
 	slpc->rp1_freq = intel_gpu_freq(rps, caps.rp1_freq);
 	slpc->min_freq = intel_gpu_freq(rps, caps.min_freq);
 
-	/* Boost freq is RP0, unless already set */
-	if (!slpc->boost_freq) {
+	if (!slpc->boost_freq)
 		slpc->boost_freq = slpc->rp0_freq;
-		slpc_to_gt(slpc)->rps_defaults.boost_freq = slpc->boost_freq;
-	}
-}
-
-/**
- * intel_guc_slpc_override_gucrc_mode() - override GUCRC mode
- * @slpc: pointer to intel_guc_slpc.
- * @mode: new value of the mode.
- *
- * This function will override the GUCRC mode.
- *
- * Return: 0 on success, non-zero error code on failure.
- */
-int intel_guc_slpc_override_gucrc_mode(struct intel_guc_slpc *slpc, u32 mode)
-{
-	int ret;
-	struct drm_i915_private *i915 = slpc_to_i915(slpc);
-	intel_wakeref_t wakeref;
-
-	if (mode >= SLPC_GUCRC_MODE_MAX)
-		return -EINVAL;
-
-	with_intel_runtime_pm(&i915->runtime_pm, wakeref) {
-		ret = slpc_set_param(slpc, SLPC_PARAM_PWRGATE_RC_MODE, mode);
-		if (ret)
-			guc_err(slpc_to_guc(slpc), "Override RC mode %d failed: %pe\n",
-				mode, ERR_PTR(ret));
-	}
-
-	return ret;
-}
-
-int intel_guc_slpc_unset_gucrc_mode(struct intel_guc_slpc *slpc)
-{
-	struct drm_i915_private *i915 = slpc_to_i915(slpc);
-	intel_wakeref_t wakeref;
-	int ret = 0;
-
-	with_intel_runtime_pm(&i915->runtime_pm, wakeref) {
-		ret = slpc_unset_param(slpc, SLPC_PARAM_PWRGATE_RC_MODE);
-		if (ret)
-			guc_err(slpc_to_guc(slpc), "Unsetting RC mode failed: %pe\n", ERR_PTR(ret));
-	}
-
-	return ret;
 }
 
 /*
@@ -761,19 +691,15 @@ int intel_guc_slpc_enable(struct intel_guc_slpc *slpc)
 	/* Handle the case where min=max=RPmax */
 	update_server_min_softlimit(slpc);
 
-	/* Ignore efficient freq and set min to platform min */
-	ret = slpc_ignore_eff_freq(slpc, true);
-	if (unlikely(ret)) {
-		guc_probe_error(guc, "Failed to set SLPC min to RPn (%pe)\n", ERR_PTR(ret));
-		return ret;
-	}
-
 	/* Set SLPC max limit to RP0 */
 	ret = slpc_use_fused_rp0(slpc);
 	if (unlikely(ret)) {
 		guc_probe_error(guc, "Failed to set SLPC max to RP0: %pe\n", ERR_PTR(ret));
 		return ret;
 	}
+
+	/* Set cached value of ignore efficient freq */
+	intel_guc_slpc_set_ignore_eff_freq(slpc, slpc->ignore_eff_freq);
 
 	/* Revert SLPC min/max to softlimits if necessary */
 	ret = slpc_set_softlimits(slpc);
@@ -854,6 +780,8 @@ int intel_guc_slpc_print_info(struct intel_guc_slpc *slpc, struct drm_printer *p
 				   slpc_decode_min_freq(slpc));
 			drm_printf(p, "\twaitboosts: %u\n",
 				   slpc->num_boosts);
+			drm_printf(p, "\tBoosts outstanding: %u\n",
+				   atomic_read(&slpc->num_waiters));
 		}
 	}
 

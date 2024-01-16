@@ -9,6 +9,5 @@
 struct intel_gt;
 
 int live_engine_pm_selftests(struct intel_gt *gt);
-int live_engine_mi_selftests(struct intel_gt *gt);
 
 #endif

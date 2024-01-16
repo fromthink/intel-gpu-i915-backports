@@ -42,24 +42,6 @@ static inline void intel_timeline_put(struct intel_timeline *timeline)
 	kref_put(&timeline->kref, __intel_timeline_free);
 }
 
-static inline bool
-intel_timeline_has_initial_breadcrumb(const struct intel_timeline *tl)
-{
-	return true;
-}
-
-static inline bool
-intel_timeline_is_relative(const struct intel_timeline *tl)
-{
-	return tl->mode != INTEL_TIMELINE_ABSOLUTE;
-}
-
-static inline bool
-intel_timeline_in_context(const struct intel_timeline *tl)
-{
-	return tl->mode == INTEL_TIMELINE_RELATIVE_CONTEXT;
-}
-
 static inline int __intel_timeline_sync_set(struct intel_timeline *tl,
 					    u64 context, u32 seqno)
 {
@@ -69,8 +51,7 @@ static inline int __intel_timeline_sync_set(struct intel_timeline *tl,
 static inline int intel_timeline_sync_set(struct intel_timeline *tl,
 					  const struct dma_fence *fence)
 {
-	/* An external fence may be 64b, but we are only tracking the low 32b */
-	return __intel_timeline_sync_set(tl, fence->context, lower_32_bits(fence->seqno));
+	return __intel_timeline_sync_set(tl, fence->context, fence->seqno);
 }
 
 static inline bool __intel_timeline_sync_is_later(struct intel_timeline *tl,
@@ -82,11 +63,8 @@ static inline bool __intel_timeline_sync_is_later(struct intel_timeline *tl,
 static inline bool intel_timeline_sync_is_later(struct intel_timeline *tl,
 						const struct dma_fence *fence)
 {
-	return __intel_timeline_sync_is_later(tl, fence->context, lower_32_bits(fence->seqno));
+	return __intel_timeline_sync_is_later(tl, fence->context, fence->seqno);
 }
-
-bool intel_timeline_get_if_active(struct intel_timeline *tl);
-void intel_timeline_put_active(struct intel_timeline *tl);
 
 void __intel_timeline_pin(struct intel_timeline *tl);
 int intel_timeline_pin(struct intel_timeline *tl, struct i915_gem_ww_ctx *ww);

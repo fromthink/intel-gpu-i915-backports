@@ -28,10 +28,10 @@
 #include <linux/list.h>
 #include <linux/overflow.h>
 #include <linux/sched.h>
-#include <linux/sched/clock.h>
 #include <linux/string_helpers.h>
 #include <linux/types.h>
 #include <linux/workqueue.h>
+#include <linux/sched/clock.h>
 
 #ifdef CONFIG_X86
 #include <asm/hypervisor.h>
@@ -122,43 +122,6 @@ bool i915_error_injected(void);
 }))
 #endif
 
-/* Note we don't consider signbits :| */
-#define overflows_type(x, T) \
-	(sizeof(x) > sizeof(T) && (x) >> BITS_PER_TYPE(T))
-
-static inline bool
-__check_struct_size(size_t base, size_t arr, size_t count, size_t *size)
-{
-	size_t sz;
-
-	if (check_mul_overflow(count, arr, &sz))
-		return false;
-
-	if (check_add_overflow(sz, base, &sz))
-		return false;
-
-	*size = sz;
-	return true;
-}
-
-/**
- * check_struct_size() - Calculate size of structure with trailing array.
- * @p: Pointer to the structure.
- * @member: Name of the array member.
- * @n: Number of elements in the array.
- * @sz: Total size of structure and array
- *
- * Calculates size of memory needed for structure @p followed by an
- * array of @n @member elements, like struct_size() but reports
- * whether it overflowed, and the resultant size in @sz
- *
- * Return: false if the calculation overflowed.
- */
-#define check_struct_size(p, member, n, sz) \
-	likely(__check_struct_size(sizeof(*(p)), \
-				   sizeof(*(p)->member) + __must_be_array((p)->member), \
-				   n, sz))
-
 #define ptr_mask_bits(ptr, n) ({					\
 	unsigned long __v = (unsigned long)(ptr);			\
 	(typeof(ptr))(__v & -BIT(n));					\
@@ -193,17 +156,13 @@ __check_struct_size(size_t base, size_t arr, size_t count, size_t *size)
 #define page_pack_bits(ptr, bits) ptr_pack_bits(ptr, bits, PAGE_SHIFT)
 #define page_unpack_bits(ptr, bits) ptr_unpack_bits(ptr, bits, PAGE_SHIFT)
 
-#define struct_member(T, member) (((T *)0)->member)
-
-#define ptr_offset(ptr, member) offsetof(typeof(*(ptr)), member)
-
 #define fetch_and_zero(ptr) ({						\
 	typeof(*ptr) __T = *(ptr);					\
 	*(ptr) = (typeof(*ptr))0;					\
 	__T;								\
 })
 
-static __always_inline ptrdiff_t ptrdiff(const void __force *a, const void __force *b)
+static __always_inline ptrdiff_t ptrdiff(const void *a, const void *b)
 {
 	return a - b;
 }
@@ -216,7 +175,7 @@ static __always_inline ptrdiff_t ptrdiff(const void __force *a, const void __for
  */
 #define container_of_user(ptr, type, member) ({				\
 	void __user *__mptr = (void __user *)(ptr);			\
-	BUILD_BUG_ON_MSG(!__same_type(*(ptr), struct_member(type, member)) && \
+	BUILD_BUG_ON_MSG(!__same_type(*(ptr), typeof_member(type, member)) && \
 			 !__same_type(*(ptr), void),			\
 			 "pointer type mismatch in container_of()");	\
 	((type __user *)(__mptr - offsetof(type, member))); })
@@ -238,11 +197,6 @@ static __always_inline ptrdiff_t ptrdiff(const void __force *a, const void __for
 	typeof(*(U)) mbz__;						\
 	get_user(mbz__, (U)) ? -EFAULT : mbz__ ? -EINVAL : 0;		\
 })
-
-static inline u64 ptr_to_u64(const void *ptr)
-{
-	return (uintptr_t)ptr;
-}
 
 #define u64_to_ptr(T, x) ({						\
 	typecheck(u64, x);						\
@@ -272,8 +226,6 @@ static inline int list_is_last_rcu(const struct list_head *list,
 {
 	return READ_ONCE(list->next) == head;
 }
-
-void fs_reclaim_taints_mutex(struct mutex *mutex);
 
 static inline unsigned long msecs_to_jiffies_timeout(const unsigned int m)
 {
@@ -309,15 +261,7 @@ wait_remaining_ms_from_jiffies(unsigned long timestamp_jiffies, int to_wait_ms)
 	}
 }
 
-/**
- * until_timeout_ns - Keep retrying (busy spin) until the duration has passed
- */
-#define until_timeout_ns(end, timeout_ns) \
-	for ((end) = ktime_get() + (timeout_ns); \
-	     ktime_before(ktime_get(), (end)); \
-	     cpu_relax())
-
-/**
+/*
  * __wait_for - magic wait macro
  *
  * Macro to help avoid open coding check/wait/timeout patterns. Note that it's
@@ -326,8 +270,7 @@ wait_remaining_ms_from_jiffies(unsigned long timestamp_jiffies, int to_wait_ms)
  * check the condition before the timeout.
  */
 #define __wait_for(OP, COND, US, Wmin, Wmax) ({ \
-	const ktime_t end__ = ktime_add_ns(ktime_get_raw(),		\
-			1000ll * ADJUST_TIMEOUT(US));			\
+	const ktime_t end__ = ktime_add_ns(ktime_get_raw(), 1000ll * (US)); \
 	long wait__ = (Wmin); /* recommended min for usleep is 10 us */	\
 	int ret__;							\
 	might_sleep();							\
@@ -364,8 +307,8 @@ wait_remaining_ms_from_jiffies(unsigned long timestamp_jiffies, int to_wait_ms)
 
 #define _wait_for_atomic(COND, US, ATOMIC) \
 ({ \
-	int cpu, ret; \
-	u64 base, timeout = ADJUST_TIMEOUT(US) * 1000; \
+	int cpu, ret, timeout = (US) * 1000; \
+	u64 base; \
 	_WAIT_FOR_ATOMIC_CHECK(ATOMIC); \
 	if (!(ATOMIC)) { \
 		preempt_disable(); \
@@ -459,66 +402,6 @@ static inline bool i915_run_as_guest(void)
 
 bool i915_vtd_active(struct drm_i915_private *i915);
 
-#ifdef CONFIG_DEBUG_LOCK_ALLOC
-void __mark_lock_used_irq(struct lockdep_map *lock);
-#define mark_lock_used_irq(lock) __mark_lock_used_irq(&(lock)->dep_map)
-#else
-#define mark_lock_used_irq(lock)
-#endif
-
-#ifndef try_cmpxchg64
-#if IS_ENABLED(CONFIG_64BIT)
-#define try_cmpxchg64(_ptr, _pold, _new) try_cmpxchg(_ptr, _pold, _new)
-#else
-#define try_cmpxchg64(_ptr, _pold, _new)				\
-({									\
-	__typeof__(_ptr) _old = (__typeof__(_ptr))(_pold);		\
-	__typeof__(*(_ptr)) __old = *_old;				\
-	__typeof__(*(_ptr)) __cur = cmpxchg64(_ptr, __old, _new);	\
-	bool success = __cur == __old;					\
-	if (unlikely(!success))						\
-		*_old = __cur;						\
-	likely(success);						\
-})
-#endif
-#endif
-
-#ifndef xchg64
-#if IS_ENABLED(CONFIG_64BIT)
-#define xchg64(_ptr, _new) xchg(_ptr, _new)
-#else
-#define xchg64(_ptr, _new)						\
-({									\
-	__typeof__(_ptr) __ptr = (_ptr);				\
-	__typeof__(*(_ptr)) __old = *__ptr;				\
-	while (!try_cmpxchg64(__ptr, &__old, (_new)))			\
-		;							\
-	__old;								\
-})
-#endif
-#endif
-
-/* A poor man's -Wconversion: only allow variables of an exact type. */
-#define exact_type(T, n) \
-	BUILD_BUG_ON(!__builtin_constant_p(n) && !__builtin_types_compatible_p(T, typeof(n)))
-
-#define exactly_pgoff_t(n) exact_type(pgoff_t, n)
-
-/*
- * Perform a type conversion (cast) of an integer value into a new
- * variable, checking that the destination is large enough to hold the source
- * value. If the value would overflow the destination leaving a truncated
- * result, return false instead.
- */
-#define safe_conversion(ptr, value) ({ \
-	typeof(value) __v = (value); \
-	typeof(ptr) __ptr = (ptr); \
-	overflows_type(__v, *__ptr) ? 0 : (*__ptr = (typeof(*__ptr))__v), 1; \
-})
-
 #define make_u64(hi__, low__) ((u64)(hi__) << 32 | (low__))
-
-int from_user_to_u32array(const char __user *from, size_t count,
-			  u32 *array, unsigned int size);
 
 #endif /* !__I915_UTILS_H */

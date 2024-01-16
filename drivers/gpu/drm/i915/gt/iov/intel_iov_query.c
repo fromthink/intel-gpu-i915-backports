@@ -14,6 +14,7 @@
 #include "gt/uc/abi/guc_actions_vf_abi.h"
 #include "gt/uc/abi/guc_klvs_abi.h"
 #include "gt/uc/abi/guc_version_abi.h"
+#include "gt/uc/intel_guc_print.h"
 #include "i915_drv.h"
 #include "intel_iov_relay.h"
 #include "intel_iov_utils.h"
@@ -101,24 +102,13 @@ static int vf_handshake_with_guc(struct intel_iov *iov)
 	if (unlikely(err))
 		goto fail;
 
-	/* XXX we don't support interface version change */
-	if ((iov->vf.config.guc_abi.major || iov->vf.config.guc_abi.major) &&
-	    (iov->vf.config.guc_abi.branch != branch ||
-	     iov->vf.config.guc_abi.major != major ||
-	     iov->vf.config.guc_abi.minor != minor)) {
-		IOV_ERROR(iov, "Unexpected interface version change: %u.%u.%u.%u != %u.%u.%u.%u\n",
-			  branch, major, minor, patch,
-			  iov->vf.config.guc_abi.branch, iov->vf.config.guc_abi.major,
-			  iov->vf.config.guc_abi.minor, iov->vf.config.guc_abi.patch);
-		return -EREMCHG;
+	/* we shouldn't get anything newer than requested */
+	if (major > GUC_VF_VERSION_LATEST_MAJOR) {
+		err = -EPROTO;
+		goto fail;
 	}
 
-	/* XXX backwards breaking changes are not supported */
-	if (major != GUC_VF_VERSION_LATEST_MAJOR || minor < GUC_VF_VERSION_LATEST_MINOR)
-		goto fail;
-
-	dev_info(iov_to_dev(iov), "%s interface version %u.%u.%u.%u\n",
-		 intel_uc_fw_type_repr(guc->fw.type),
+	guc_info(iov_to_guc(iov), "interface version %u.%u.%u.%u\n",
 		 branch, major, minor, patch);
 
 	iov->vf.config.guc_abi.branch = branch;
@@ -235,35 +225,63 @@ static int guc_action_query_single_klv64(struct intel_guc *guc, u32 key, u64 *va
 	return 0;
 }
 
-static int vf_get_tiles(struct intel_iov *iov)
+static bool abi_supports_gmd_klv(struct intel_iov *iov)
 {
+	GEM_BUG_ON(!intel_iov_is_vf(iov));
+
+	/* version 1.2+ is required to query GMD_ID KLV */
+	return iov->vf.config.guc_abi.major == 1 && iov->vf.config.guc_abi.minor >= 2;
+}
+
+static int vf_get_ipver(struct intel_iov *iov)
+{
+	struct drm_i915_private *i915 = iov_to_i915(iov);
+	struct intel_runtime_info *runtime = RUNTIME_INFO(i915);
 	struct intel_guc *guc = iov_to_guc(iov);
-	u32 tile_mask;
+	struct intel_gt *gt = iov_to_gt(iov);
+	bool is_media = gt->type == GT_MEDIA;
+	struct intel_ip_version *ip = is_media ? &runtime->media.ip : &runtime->graphics.ip;
+	u32 gmd_id;
 	int err;
 
 	GEM_BUG_ON(!intel_iov_is_vf(iov));
-	GEM_BUG_ON(!iov_is_root(iov));
 
-	err = guc_action_query_single_klv32(guc, GUC_KLV_VF_CFG_TILE_MASK_KEY, &tile_mask);
+	if (!HAS_GMD_ID(i915))
+		return 0;
+
+	if (!abi_supports_gmd_klv(iov)) {
+		err = -ENOPKG;
+		goto fallback;
+	}
+
+	err = guc_action_query_single_klv32(guc, GUC_KLV_GLOBAL_CFG_GMD_ID_KEY, &gmd_id);
 	if (unlikely(err))
-		return err;
+		goto fallback;
 
-	if (!tile_mask) {
-		IOV_ERROR(iov, "Invalid GT assignment: %#x\n", tile_mask);
-		return -ENODATA;
-	}
+	gt_info(gt, "GMD_ID %#x version %u.%u step %s\n", gmd_id,
+		REG_FIELD_GET(GMD_ID_ARCH_MASK, gmd_id),
+		REG_FIELD_GET(GMD_ID_RELEASE_MASK, gmd_id),
+		intel_step_name(STEP_A0 + REG_FIELD_GET(GMD_ID_STEP, gmd_id)));
 
-	IOV_DEBUG(iov, "tile mask %#x\n", tile_mask);
+	ip->ver = REG_FIELD_GET(GMD_ID_ARCH_MASK, gmd_id);
+	ip->rel = REG_FIELD_GET(GMD_ID_RELEASE_MASK, gmd_id);
+	ip->step = REG_FIELD_GET(GMD_ID_STEP, gmd_id);
+#if IS_ENABLED(CPTCFG_DRM_I915_DEBUG)
+	ip->preliminary = false;
+#endif
 
-	if (iov->vf.config.tile_mask && iov->vf.config.tile_mask != tile_mask) {
-		IOV_ERROR(iov, "Unexpected GT reassignment: %#x != %#x\n",
-			  tile_mask, iov->vf.config.tile_mask);
-		return -EREMCHG;
-	}
-
-	iov->vf.config.tile_mask = tile_mask;
-
+	/* need to repeat step initialization, this time with real IP version */
+	intel_step_init(i915);
 	return 0;
+
+fallback:
+	IOV_ERROR(iov, "failed to query %s IP version (%pe) using hardcoded %u.%u\n",
+		  is_media ? "media" : "graphics", ERR_PTR(err), ip->ver, ip->rel);
+#if IS_ENABLED(CPTCFG_DRM_I915_DEBUG)
+	ip->preliminary = false;
+#endif
+	return 0;
+
 }
 
 static int vf_get_ggtt_info(struct intel_iov *iov)
@@ -273,6 +291,7 @@ static int vf_get_ggtt_info(struct intel_iov *iov)
 	int err;
 
 	GEM_BUG_ON(!intel_iov_is_vf(iov));
+	GEM_BUG_ON(iov->vf.config.ggtt_size);
 
 	err = guc_action_query_single_klv64(guc, GUC_KLV_VF_CFG_GGTT_START_KEY, &start);
 	if (unlikely(err))
@@ -285,41 +304,10 @@ static int vf_get_ggtt_info(struct intel_iov *iov)
 	IOV_DEBUG(iov, "GGTT %#llx-%#llx = %lluK\n",
 		  start, start + size - 1, size / SZ_1K);
 
-	if (iov->vf.config.ggtt_size && iov->vf.config.ggtt_size != size) {
-		IOV_ERROR(iov, "Unexpected GGTT reassignment: %lluK != %lluK\n",
-			  size / SZ_1K, iov->vf.config.ggtt_size / SZ_1K);
-		return -EREMCHG;
-	}
-
 	iov->vf.config.ggtt_base = start;
 	iov->vf.config.ggtt_size = size;
 
 	return iov->vf.config.ggtt_size ? 0 : -ENODATA;
-}
-
-static int vf_get_lmem_info(struct intel_iov *iov)
-{
-	struct intel_guc *guc = iov_to_guc(iov);
-	u64 size;
-	int err;
-
-	GEM_BUG_ON(!intel_iov_is_vf(iov));
-
-	err = guc_action_query_single_klv64(guc, GUC_KLV_VF_CFG_LMEM_SIZE_KEY, &size);
-	if (unlikely(err))
-		return err;
-
-	IOV_DEBUG(iov, "LMEM %lluM\n", size / SZ_1M);
-
-	if (iov->vf.config.lmem_size && iov->vf.config.lmem_size != size) {
-		IOV_ERROR(iov, "Unexpected LMEM reassignment: %lluM != %lluM\n",
-			  size / SZ_1M, iov->vf.config.lmem_size / SZ_1M);
-		return -EREMCHG;
-	}
-
-	iov->vf.config.lmem_size = size;
-
-	return iov->vf.config.lmem_size ? 0 : -ENODATA;
 }
 
 static int vf_get_submission_cfg(struct intel_iov *iov)
@@ -329,6 +317,7 @@ static int vf_get_submission_cfg(struct intel_iov *iov)
 	int err;
 
 	GEM_BUG_ON(!intel_iov_is_vf(iov));
+	GEM_BUG_ON(iov->vf.config.num_ctxs);
 
 	err = guc_action_query_single_klv32(guc, GUC_KLV_VF_CFG_NUM_CONTEXTS_KEY, &num_ctxs);
 	if (unlikely(err))
@@ -340,31 +329,10 @@ static int vf_get_submission_cfg(struct intel_iov *iov)
 
 	IOV_DEBUG(iov, "CTXs %u DBs %u\n", num_ctxs, num_dbs);
 
-	if (iov->vf.config.num_ctxs && iov->vf.config.num_ctxs != num_ctxs) {
-		IOV_ERROR(iov, "Unexpected CTXs reassignment: %u != %u\n",
-			  num_ctxs, iov->vf.config.num_ctxs);
-		return -EREMCHG;
-	}
-	if (iov->vf.config.num_dbs && iov->vf.config.num_dbs != num_dbs) {
-		IOV_ERROR(iov, "Unexpected DBs reassignment: %u != %u\n",
-			  num_dbs, iov->vf.config.num_dbs);
-		return -EREMCHG;
-	}
-
 	iov->vf.config.num_ctxs = num_ctxs;
 	iov->vf.config.num_dbs = num_dbs;
 
 	return iov->vf.config.num_ctxs ? 0 : -ENODATA;
-}
-
-static bool vf_in_tile_mask(struct intel_iov *iov)
-{
-	GEM_BUG_ON(!intel_iov_is_vf(iov));
-
-	if (!HAS_REMOTE_TILES(iov_to_i915(iov)))
-		return true;
-
-	return iov_get_root(iov)->vf.config.tile_mask & BIT(iov_to_gt(iov)->info.id);
 }
 
 /**
@@ -381,25 +349,13 @@ int intel_iov_query_config(struct intel_iov *iov)
 
 	GEM_BUG_ON(!intel_iov_is_vf(iov));
 
-	if (HAS_REMOTE_TILES(iov_to_i915(iov)) && iov_is_root(iov)) {
-		err = vf_get_tiles(iov);
-		if (unlikely(err))
-			return err;
-
-		if (!vf_in_tile_mask(iov))
-			return 0;
-	}
-
+	err = vf_get_ipver(iov);
+	if (unlikely(err))
+		return err;
 
 	err = vf_get_ggtt_info(iov);
 	if (unlikely(err))
 		return err;
-
-	if (HAS_LMEM(iov_to_i915(iov))) {
-		err = vf_get_lmem_info(iov);
-		if (unlikely(err))
-			return err;
-	}
 
 	err = vf_get_submission_cfg(iov);
 	if (unlikely(err))
@@ -498,41 +454,6 @@ static const i915_reg_t tgl_early_regs[] = {
 	GEN11_HUC_KERNEL_LOAD_INFO,	/* _MMIO(0xC1DC) */
 };
 
-static const i915_reg_t xehpsdv_early_regs[] = {
-	RPM_CONFIG0,			/* _MMIO(0x0D00) */
-	GEN10_MIRROR_FUSE3,		/* _MMIO(0x9118) */
-	HSW_PAVP_FUSE1,			/* _MMIO(0x911C) */
-	XEHP_EU_ENABLE,			/* _MMIO(0x9134) */
-	GEN12_GT_GEOMETRY_DSS_ENABLE,	/* _MMIO(0x913C) */
-	GEN11_GT_VEBOX_VDBOX_DISABLE,	/* _MMIO(0x9140) */
-	GEN12_GT_COMPUTE_DSS_ENABLE,	/* _MMIO(0x9144) */
-	CTC_MODE,			/* _MMIO(0xA26C) */
-};
-
-static const i915_reg_t dg2_early_regs[] = {
-	RPM_CONFIG0,			/* _MMIO(0x0D00) */
-	GEN10_MIRROR_FUSE3,		/* _MMIO(0x9118) */
-	HSW_PAVP_FUSE1,			/* _MMIO(0x911C) */
-	XEHP_EU_ENABLE,			/* _MMIO(0x9134) */
-	GEN12_GT_GEOMETRY_DSS_ENABLE,	/* _MMIO(0x913C) */
-	GEN11_GT_VEBOX_VDBOX_DISABLE,	/* _MMIO(0x9140) */
-	GEN12_GT_COMPUTE_DSS_ENABLE,	/* _MMIO(0x9144) */
-	CTC_MODE,			/* _MMIO(0xA26C) */
-	GEN11_HUC_KERNEL_LOAD_INFO,	/* _MMIO(0xC1DC) */
-};
-
-static const i915_reg_t pvc_early_regs[] = {
-	RPM_CONFIG0,			/* _MMIO(0x0D00) */
-	GEN10_MIRROR_FUSE3,		/* _MMIO(0x9118) */
-	XEHP_EU_ENABLE,			/* _MMIO(0x9134) */
-	GEN12_GT_GEOMETRY_DSS_ENABLE,	/* _MMIO(0x913C) */
-	GEN11_GT_VEBOX_VDBOX_DISABLE,	/* _MMIO(0x9140) */
-	GEN12_GT_COMPUTE_DSS_ENABLE,	/* _MMIO(0x9144) */
-	XEHPC_GT_COMPUTE_DSS_ENABLE_EXT,/* _MMIO(0x9148) */
-	CTC_MODE,			/* _MMIO(0xA26C) */
-	GEN11_HUC_KERNEL_LOAD_INFO,	/* _MMIO(0xC1DC) */
-};
-
 static const i915_reg_t mtl_early_regs[] = {
 	RPM_CONFIG0,			/* _MMIO(0x0D00) */
 	XEHP_FUSE4,			/* _MMIO(0x9114) */
@@ -545,6 +466,7 @@ static const i915_reg_t mtl_early_regs[] = {
 	XEHPC_GT_COMPUTE_DSS_ENABLE_EXT,/* _MMIO(0x9148) */
 	CTC_MODE,			/* _MMIO(0xA26C) */
 	GEN11_HUC_KERNEL_LOAD_INFO,	/* _MMIO(0xC1DC) */
+	_MMIO(MTL_GSC_HECI1_BASE + HECI_FWSTS5),/* _MMIO(0x116c68) */
 	MTL_GT_ACTIVITY_FACTOR,		/* _MMIO(0x138010) */
 };
 
@@ -556,15 +478,6 @@ static const i915_reg_t *get_early_regs(struct drm_i915_private *i915,
 	if (GRAPHICS_VER_FULL(i915) >= IP_VER(12, 70)) {
 		regs = mtl_early_regs;
 		*size = ARRAY_SIZE(mtl_early_regs);
-	} else if (IS_PONTEVECCHIO(i915)) {
-		regs = pvc_early_regs;
-		*size = ARRAY_SIZE(pvc_early_regs);
-	} else if (IS_DG2(i915)) {
-		regs = dg2_early_regs;
-		*size = ARRAY_SIZE(dg2_early_regs);
-	} else if (IS_XEHPSDV(i915)) {
-		regs = xehpsdv_early_regs;
-		*size = ARRAY_SIZE(xehpsdv_early_regs);
 	} else if (IS_TIGERLAKE(i915) || IS_ALDERLAKE_S(i915) || IS_ALDERLAKE_P(i915)) {
 		regs = tgl_early_regs;
 		*size = ARRAY_SIZE(tgl_early_regs);
@@ -612,7 +525,7 @@ static void vf_show_runtime_info(struct intel_iov *iov)
 
 	GEM_BUG_ON(!intel_iov_is_vf(iov));
 
-	for (;size--; vf_regs++) {
+	for (; size--; vf_regs++) {
 		IOV_DEBUG(iov, "RUNTIME reg[%#x] = %#x\n",
 			  vf_regs->offset, vf_regs->value);
 	}
@@ -694,6 +607,127 @@ failed:
 	return -ECONNREFUSED;
 }
 
+static int intel_iov_query_update_ggtt_pte_mmio(struct intel_iov *iov, u32 pte_offset, u8 mode,
+						u16 num_copies, gen8_pte_t pte)
+{
+	u32 request[VF2GUC_MMIO_RELAY_SERVICE_REQUEST_MSG_MAX_LEN] = {
+		mmio_relay_header(IOV_OPCODE_VF2PF_MMIO_UPDATE_GGTT, 0xF),
+		FIELD_PREP(VF2PF_MMIO_UPDATE_GGTT_REQUEST_MSG_1_MODE, mode) |
+		FIELD_PREP(VF2PF_MMIO_UPDATE_GGTT_REQUEST_MSG_1_NUM_COPIES, num_copies) |
+		FIELD_PREP(VF2PF_MMIO_UPDATE_GGTT_REQUEST_MSG_1_OFFSET, pte_offset),
+		FIELD_PREP(VF2PF_MMIO_UPDATE_GGTT_REQUEST_MSG_2_PTE_LO, lower_32_bits(pte)),
+		FIELD_PREP(VF2PF_MMIO_UPDATE_GGTT_REQUEST_MSG_3_PTE_HI, upper_32_bits(pte)),
+	};
+	u32 response[VF2PF_MMIO_UPDATE_GGTT_RESPONSE_MSG_LEN];
+	u16 expected = (num_copies) ? num_copies + 1 : 1;
+	u16 updated;
+	int ret;
+
+	GEM_BUG_ON(!intel_iov_is_vf(iov));
+	GEM_BUG_ON(FIELD_MAX(VF2PF_MMIO_UPDATE_GGTT_REQUEST_MSG_1_MODE) < mode);
+	GEM_BUG_ON(FIELD_MAX(VF2PF_MMIO_UPDATE_GGTT_REQUEST_MSG_1_NUM_COPIES) < num_copies);
+
+	ret = guc_send_mmio_relay(iov_to_guc(iov), request, ARRAY_SIZE(request),
+				  response, ARRAY_SIZE(response));
+	if (unlikely(ret < 0))
+		return ret;
+
+	updated = FIELD_GET(VF2PF_MMIO_UPDATE_GGTT_RESPONSE_MSG_1_NUM_PTES, response[0]);
+	WARN_ON(updated != expected);
+	return updated;
+}
+
+static int intel_iov_query_update_ggtt_pte_relay(struct intel_iov *iov, u32 pte_offset, u8 mode,
+						 u16 num_copies, gen8_pte_t *ptes, u16 count)
+{
+	struct drm_i915_private *i915 = iov_to_i915(iov);
+	u32 request[VF2PF_UPDATE_GGTT32_REQUEST_MSG_MAX_LEN];
+	u32 response[VF2PF_UPDATE_GGTT32_RESPONSE_MSG_LEN];
+	u16 expected = num_copies + count;
+	u16 updated;
+	int i;
+	int ret;
+
+	GEM_BUG_ON(!intel_iov_is_vf(iov));
+	GEM_BUG_ON(FIELD_MAX(VF2PF_UPDATE_GGTT32_REQUEST_MSG_1_MODE) < mode);
+	GEM_BUG_ON(FIELD_MAX(VF2PF_UPDATE_GGTT32_REQUEST_MSG_1_NUM_COPIES) < num_copies);
+	assert_rpm_wakelock_held(&i915->runtime_pm);
+
+	if (count < 1)
+		return -EINVAL;
+
+	request[0] = FIELD_PREP(GUC_HXG_MSG_0_ORIGIN, GUC_HXG_ORIGIN_HOST) |
+		     FIELD_PREP(GUC_HXG_MSG_0_TYPE, GUC_HXG_TYPE_REQUEST) |
+		     FIELD_PREP(GUC_HXG_REQUEST_MSG_0_ACTION, IOV_ACTION_VF2PF_UPDATE_GGTT32);
+
+	request[1] = FIELD_PREP(VF2PF_UPDATE_GGTT32_REQUEST_MSG_1_MODE, mode) |
+		     FIELD_PREP(VF2PF_UPDATE_GGTT32_REQUEST_MSG_1_NUM_COPIES, num_copies) |
+		     FIELD_PREP(VF2PF_UPDATE_GGTT32_REQUEST_MSG_1_OFFSET, pte_offset);
+
+	for (i = 0; i < count; i++) {
+		request[i * 2 + 2] = FIELD_PREP(VF2PF_UPDATE_GGTT32_REQUEST_DATAn_PTE_LO,
+						lower_32_bits(ptes[i]));
+		request[i * 2 + 3] = FIELD_PREP(VF2PF_UPDATE_GGTT32_REQUEST_DATAn_PTE_HI,
+						upper_32_bits(ptes[i]));
+	}
+
+	ret = intel_iov_relay_send_to_pf(&iov->relay,
+					 request, count * 2 + 2,
+					 response, ARRAY_SIZE(response));
+	if (unlikely(ret < 0))
+		return ret;
+
+	updated = FIELD_GET(VF2PF_UPDATE_GGTT32_RESPONSE_MSG_0_NUM_PTES, response[0]);
+	WARN_ON(updated != expected);
+	return updated;
+}
+
+/**
+ * intel_iov_query_update_ggtt_ptes - Send buffered PTEs to PF to update GGTT
+ * @iov: the IOV struct
+ *
+ * This function is for VF use only.
+ *
+ * Return: Number of successfully updated PTEs on success or a negative error code on failure.
+ */
+int intel_iov_query_update_ggtt_ptes(struct intel_iov *iov)
+{
+	struct intel_iov_vf_ggtt_ptes *buffer = &iov->vf.ptes_buffer;
+	int ret;
+
+	BUILD_BUG_ON(MMIO_UPDATE_GGTT_MODE_DUPLICATE != VF2PF_UPDATE_GGTT32_MODE_DUPLICATE);
+	BUILD_BUG_ON(MMIO_UPDATE_GGTT_MODE_REPLICATE != VF2PF_UPDATE_GGTT32_MODE_REPLICATE);
+	BUILD_BUG_ON(MMIO_UPDATE_GGTT_MODE_DUPLICATE_LAST !=
+		     VF2PF_UPDATE_GGTT32_MODE_DUPLICATE_LAST);
+	BUILD_BUG_ON(MMIO_UPDATE_GGTT_MODE_REPLICATE_LAST !=
+		     VF2PF_UPDATE_GGTT32_MODE_REPLICATE_LAST);
+
+	GEM_BUG_ON(!intel_iov_is_vf(iov));
+	GEM_BUG_ON(buffer->mode == VF_RELAY_UPDATE_GGTT_MODE_INVALID && buffer->num_copies);
+
+	/*
+	 * If we don't have any PTEs to REPLICATE or DUPLICATE,
+	 * let's zero out the mode to be ABI compliant.
+	 * In this case, the value of the MODE field is irrelevant
+	 * to the operation of the ABI, as long as it has a value
+	 * within the allowed range
+	 */
+	if (buffer->mode == VF_RELAY_UPDATE_GGTT_MODE_INVALID && !buffer->num_copies)
+		buffer->mode = 0;
+
+	if (!intel_guc_ct_enabled(&iov_to_guc(iov)->ct))
+		ret = intel_iov_query_update_ggtt_pte_mmio(iov, buffer->offset, buffer->mode,
+							   buffer->num_copies, buffer->ptes[0]);
+	else
+		ret = intel_iov_query_update_ggtt_pte_relay(iov, buffer->offset, buffer->mode,
+							    buffer->num_copies, buffer->ptes,
+							    buffer->count);
+	if (unlikely(ret < 0))
+		IOV_ERROR(iov, "Failed to update VFs PTE by PF (%pe)\n", ERR_PTR(ret));
+
+	return ret;
+}
+
 static int vf_get_runtime_info_mmio(struct intel_iov *iov)
 {
 	u32 request[VF2GUC_MMIO_RELAY_SERVICE_REQUEST_MSG_MAX_LEN];
@@ -738,7 +772,7 @@ static int vf_get_runtime_info_mmio(struct intel_iov *iov)
 			request[1 + n] = vf_regs[i + n].offset;
 
 		/* we will use few bits from crc32 as magic */
-		u32p_replace_bits(request, crc32_le(0, (void*)request, sizeof(request)),
+		u32p_replace_bits(request, crc32_le(0, (void *)request, sizeof(request)),
 				  VF2GUC_MMIO_RELAY_SERVICE_REQUEST_MSG_0_MAGIC);
 
 		ret = guc_send_mmio_relay(iov_to_guc(iov), request, ARRAY_SIZE(request),
@@ -849,9 +883,6 @@ int intel_iov_query_runtime(struct intel_iov *iov, bool early)
 
 	GEM_BUG_ON(!intel_iov_is_vf(iov));
 
-	if (!vf_in_tile_mask(iov))
-		return 0;
-
 	if (early) {
 		err = vf_handshake_with_pf_mmio(iov);
 		if (unlikely(err))
@@ -898,17 +929,10 @@ void intel_iov_query_print_config(struct intel_iov *iov, struct drm_printer *p)
 {
 	GEM_BUG_ON(!intel_iov_is_vf(iov));
 
-	/* tile_mask is valid on root GT only, report it once on primary GT */
-	if (HAS_REMOTE_TILES(iov_to_i915(iov)) && iov_to_gt(iov) == to_gt(iov_to_i915(iov)))
-		drm_printf(p, "tile mask:\t%#x\n", iov_get_root(iov)->vf.config.tile_mask);
-
 	drm_printf(p, "GGTT range:\t%#08llx-%#08llx\n",
 			iov->vf.config.ggtt_base,
 			iov->vf.config.ggtt_base + iov->vf.config.ggtt_size - 1);
 	drm_printf(p, "GGTT size:\t%lluK\n", iov->vf.config.ggtt_size / SZ_1K);
-
-	if (HAS_LMEM(iov_to_i915(iov)))
-		drm_printf(p, "LMEM size:\t%lluM\n", iov->vf.config.lmem_size / SZ_1M);
 
 	drm_printf(p, "contexts:\t%hu\n", iov->vf.config.num_ctxs);
 	drm_printf(p, "doorbells:\t%hu\n", iov->vf.config.num_dbs);

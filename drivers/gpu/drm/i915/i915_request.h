@@ -40,26 +40,29 @@
 #include "i915_scheduler.h"
 #include "i915_selftest.h"
 #include "i915_sw_fence.h"
-#include "i915_drm_client.h"
+#include "i915_vma_resource.h"
 
 #include <uapi/drm/i915_drm.h>
 
 struct drm_file;
 struct drm_i915_gem_object;
 struct drm_printer;
+struct i915_deps;
 struct i915_request;
 
+#if IS_ENABLED(CPTCFG_DRM_I915_CAPTURE_ERROR)
 struct i915_capture_list {
+	struct i915_vma_resource *vma_res;
 	struct i915_capture_list *next;
-	struct i915_vma *vma;
 };
+
+void i915_request_free_capture_list(struct i915_capture_list *capture);
+#else
+#define i915_request_free_capture_list(_a) do {} while (0)
+#endif
 
 #define RQ_TRACE(rq, fmt, ...) do {					\
 	const struct i915_request *rq__ = (rq);				\
-	if (!rq__->engine) {						\
-		GEM_TRACE(fmt,	##__VA_ARGS__);				\
-		break;							\
-	}								\
 	ENGINE_TRACE(rq__->engine, "fence %llx:%lld, current %d " fmt,	\
 		     rq__->fence.context, rq__->fence.seqno,		\
 		     hwsp_seqno(rq__), ##__VA_ARGS__);			\
@@ -135,8 +138,6 @@ enum {
 	 */
 	I915_FENCE_FLAG_SENTINEL,
 
-	I915_FENCE_FLAG_NONBLOCKING,
-
 	/*
 	 * I915_FENCE_FLAG_BOOST - upclock the gpu for this request
 	 *
@@ -169,19 +170,9 @@ enum {
 	 * fence (dma_fence_array) and i915 generated for parallel submission.
 	 */
 	I915_FENCE_FLAG_COMPOSITE,
-
-	/*
-	 * I915_FENCE_FLAG_LR - This fence represents a request on long running
-	 * (LR) context. Can't wait on this under a reservation object, and
-	 * can't wait in reclaim. This fence doesn't signal until the LR request
-	 * is done, and is thus different from a preempt fence.
-	 */
-	I915_FENCE_FLAG_LR,
-
-	__I915_FENCE_FLAG_LAST__
 };
 
-/**
+/*
  * Request queue structure.
  *
  * The request queue allows us to note sequence numbers that have been emitted
@@ -203,10 +194,11 @@ enum {
  */
 struct i915_request {
 	struct dma_fence fence;
+	spinlock_t lock;
 
-	struct i915_sched_engine *sched_engine;
+	struct drm_i915_private *i915;
 
-	/**
+	/*
 	 * Context and ring buffer related to this request
 	 * Contexts are refcounted, so when this request is associated with a
 	 * context, we must increment the context's refcount, to guarantee that
@@ -256,17 +248,12 @@ struct i915_request {
 			struct dma_fence_cb cb;
 			ktime_t emitted;
 		} duration;
-		struct {
-			/* Keep track of requests allocated for flat ppgtt. */
-			struct list_head gt_link;
-			struct list_head vma_link;
-		} fpp;
 	};
 	struct llist_head execute_cb;
 	struct i915_sw_fence semaphore;
-	/**
-	 * @submit_work: complete submit fence from an IRQ if needed for
-	 * locking hierarchy reasons.
+	/*
+	 * complete submit fence from an IRQ if needed for locking hierarchy
+	 * reasons.
 	 */
 	struct irq_work submit_work;
 
@@ -290,57 +277,66 @@ struct i915_request {
 	 */
 	const u32 *hwsp_seqno;
 
-	/** Position in the ring of the start of the request */
+	/* Position in the ring of the start of the request */
 	u32 head;
 
-	/** Position in the ring of the start of the user packets */
+	/* Position in the ring of the start of the user packets */
 	u32 infix;
 
-	/**
+	/*
 	 * Position in the ring of the start of the postfix.
 	 * This is required to calculate the maximum available ring space
 	 * without overwriting the postfix.
 	 */
 	u32 postfix;
 
-	/** Position in the ring of the end of the whole request */
+	/* Position in the ring of the end of the whole request */
 	u32 tail;
 
-	/** Position in the ring of the end of any workarounds after the tail */
+	/* Position in the ring of the end of any workarounds after the tail */
 	u32 wa_tail;
 
-	/** Preallocate space in the ring for the emitting the request */
+	/* Preallocate space in the ring for the emitting the request */
 	u32 reserved_space;
 
-	/** Batch buffer related to this request if any (used for
-	 * error state dump only).
-	 */
-	struct i915_vma *batch;
-	/**
+	/* Batch buffer pointer for selftest internal use. */
+	I915_SELFTEST_DECLARE(struct i915_vma *batch);
+
+	struct i915_vma_resource *batch_res;
+
+#if IS_ENABLED(CPTCFG_DRM_I915_CAPTURE_ERROR)
+	/*
 	 * Additional buffers requested by userspace to be captured upon
 	 * a GPU hang. The vma/obj on this list are protected by their
 	 * active reference - all objects on this list must also be
 	 * on the active_list (of their final request).
 	 */
 	struct i915_capture_list *capture_list;
+#endif
 
-	/** Time at which this request was emitted, in jiffies. */
+	/* Time at which this request was emitted, in jiffies. */
 	unsigned long emitted_jiffies;
 
-	/** timeline->request entry for this request */
+	/* timeline->request entry for this request */
 	struct list_head link;
 
-	/**
-	 * @guc_fence_link: Requests may need to be stalled when using GuC
-	 * submission waiting for certain GuC operations to complete. If that is
-	 * the case, stalled requests are added to a per context list of stalled
-	 * requests. The below list_head is the link in that list. Protected by
+	/* Watchdog support fields. */
+	struct i915_request_watchdog {
+		struct llist_node link;
+		struct hrtimer timer;
+	} watchdog;
+
+	/*
+	 * Requests may need to be stalled when using GuC submission waiting for
+	 * certain GuC operations to complete. If that is the case, stalled
+	 * requests are added to a per context list of stalled requests. The
+	 * below list_head is the link in that list. Protected by
 	 * ce->guc_state.lock.
 	 */
 	struct list_head guc_fence_link;
 
-	/**
-	 * @guc_prio: Priority level while the request is in flight. Differs
+	/*
+	 * Priority level while the request is in flight. Differs
 	 * from i915 scheduler priority. See comment above
 	 * I915_SCHEDULER_CAP_STATIC_PRIORITY_MAP for details. Protected by
 	 * ce->guc_active.lock. Two special values (GUC_PRIO_INIT and
@@ -352,28 +348,24 @@ struct i915_request {
 #define	GUC_PRIO_FINI	0xfe
 	u8 guc_prio;
 
+	/*
+	 * wait queue entry used to wait on the HuC load to complete
+	 */
+	wait_queue_entry_t hucq;
+
 	I915_SELFTEST_DECLARE(struct {
 		struct list_head link;
 		unsigned long delay;
 	} mock;)
-	bool has_user_fence;
-	struct prelim_drm_i915_gem_execbuffer_ext_user_fence user_fence;
 };
 
-#define I915_FENCE_GFP I915_GFP_ALLOW_FAIL
+#define I915_FENCE_GFP (GFP_KERNEL | __GFP_RETRY_MAYFAIL | __GFP_NOWARN)
 
-extern const struct dma_fence_ops i915_dma_fence_ops;
-extern const struct dma_fence_ops i915_cpu_fence_ops;
+extern const struct dma_fence_ops i915_fence_ops;
 
 static inline bool dma_fence_is_i915(const struct dma_fence *fence)
 {
-	return fence->ops == &i915_dma_fence_ops || fence->ops == &i915_cpu_fence_ops;
-}
-
-static inline bool dma_fence_is_lr(const struct dma_fence *fence)
-{
-	return dma_fence_is_i915(fence) &&
-		test_bit(I915_FENCE_FLAG_LR, &fence->flags);
+	return fence->ops == &i915_fence_ops;
 }
 
 struct kmem_cache *i915_request_slab_cache(void);
@@ -381,21 +373,15 @@ struct kmem_cache *i915_request_slab_cache(void);
 struct i915_request * __must_check
 __i915_request_create(struct intel_context *ce, gfp_t gfp);
 struct i915_request * __must_check
-i915_request_create_locked(struct intel_context *ce, gfp_t gfp);
-struct i915_request * __must_check
 i915_request_create(struct intel_context *ce);
-struct i915_request * __must_check
-i915_request_create_atomic(struct intel_context *ce);
-int i915_request_construct(struct i915_request *rq,
-			   struct intel_context *ce,
-			   unsigned long flags);
 
 void __i915_request_skip(struct i915_request *rq);
 bool i915_request_set_error_once(struct i915_request *rq, int error);
 struct i915_request *i915_request_mark_eio(struct i915_request *rq);
 
-void __i915_request_commit(struct i915_request *rq);
-void __i915_request_queue(struct i915_request *rq, int prio);
+struct i915_request *__i915_request_commit(struct i915_request *request);
+void __i915_request_queue(struct i915_request *rq,
+			  const struct i915_sched_attr *attr);
 void __i915_request_queue_bh(struct i915_request *rq);
 
 bool i915_request_retire(struct i915_request *rq);
@@ -433,15 +419,12 @@ int i915_request_await_object(struct i915_request *to,
 			      bool write);
 int i915_request_await_dma_fence(struct i915_request *rq,
 				 struct dma_fence *fence);
+int i915_request_await_deps(struct i915_request *rq, const struct i915_deps *deps);
 int i915_request_await_execution(struct i915_request *rq,
-				 struct dma_fence *fence,
-				 void (*hook)(struct i915_request *rq,
-					      struct dma_fence *signal));
+				 struct dma_fence *fence);
 
 void i915_request_add(struct i915_request *rq);
 
-struct i915_request *i915_request_alloc(gfp_t gfp);
-void i915_request_free(struct i915_request *rq);
 bool __i915_request_submit(struct i915_request *request);
 void i915_request_submit(struct i915_request *request);
 
@@ -449,6 +432,11 @@ void __i915_request_unsubmit(struct i915_request *request);
 void i915_request_unsubmit(struct i915_request *request);
 
 void i915_request_cancel(struct i915_request *rq, int error);
+
+long i915_request_wait_timeout(struct i915_request *rq,
+			       unsigned int flags,
+			       long timeout)
+	__attribute__((nonnull(1)));
 
 long i915_request_wait(struct i915_request *rq,
 		       unsigned int flags,
@@ -485,12 +473,7 @@ i915_request_has_initial_breadcrumb(const struct i915_request *rq)
 	return test_bit(I915_FENCE_FLAG_INITIAL_BREADCRUMB, &rq->fence.flags);
 }
 
-static inline bool i915_request_is_nonblocking(const struct i915_request *rq)
-{
-	return test_bit(I915_FENCE_FLAG_NONBLOCKING, &rq->fence.flags);
-}
-
-/**
+/*
  * Returns true if seq1 is later than seq2.
  */
 static inline bool i915_seqno_passed(u32 seq1, u32 seq2)
@@ -529,15 +512,9 @@ static inline u32 hwsp_seqno(const struct i915_request *rq)
 	return seqno;
 }
 
-static inline u32 i915_request_seqno(const struct i915_request *rq)
-{
-	GEM_BUG_ON(overflows_type(rq->fence.seqno, u32));
-	return lower_32_bits(rq->fence.seqno);
-}
-
 static inline bool __i915_request_has_started(const struct i915_request *rq)
 {
-	return i915_seqno_passed(__hwsp_seqno(rq), i915_request_seqno(rq) - 1);
+	return i915_seqno_passed(__hwsp_seqno(rq), rq->fence.seqno - 1);
 }
 
 /**
@@ -573,11 +550,13 @@ static inline bool i915_request_started(const struct i915_request *rq)
 	if (i915_request_signaled(rq))
 		return true;
 
+	result = true;
 	rcu_read_lock(); /* the HWSP may be freed at runtime */
-	result = __i915_request_has_started(rq);
+	if (likely(!i915_request_signaled(rq)))
+		/* Remember: started but may have since been preempted! */
+		result = __i915_request_has_started(rq);
 	rcu_read_unlock();
 
-	/* Remember: started but may have since been preempted! */
 	return result;
 }
 
@@ -626,7 +605,7 @@ static inline bool i915_request_is_ready(const struct i915_request *rq)
 
 static inline bool __i915_request_is_complete(const struct i915_request *rq)
 {
-	return i915_seqno_passed(__hwsp_seqno(rq), i915_request_seqno(rq));
+	return i915_seqno_passed(__hwsp_seqno(rq), rq->fence.seqno);
 }
 
 static inline bool i915_request_completed(const struct i915_request *rq)
@@ -636,8 +615,10 @@ static inline bool i915_request_completed(const struct i915_request *rq)
 	if (i915_request_signaled(rq))
 		return true;
 
+	result = true;
 	rcu_read_lock(); /* the HWSP may be freed at runtime */
-	result = __i915_request_is_complete(rq);
+	if (likely(!i915_request_signaled(rq)))
+		result = __i915_request_is_complete(rq);
 	rcu_read_unlock();
 
 	return result;
@@ -685,7 +666,8 @@ i915_request_timeline(const struct i915_request *rq)
 {
 	/* Valid only while the request is being constructed (or retired). */
 	return rcu_dereference_protected(rq->timeline,
-					 lockdep_is_held(&rcu_access_pointer(rq->timeline)->mutex));
+					 lockdep_is_held(&rcu_access_pointer(rq->timeline)->mutex) ||
+					 test_bit(CONTEXT_IS_PARKING, &rq->context->flags));
 }
 
 static inline struct i915_gem_context *
@@ -704,12 +686,7 @@ i915_request_active_timeline(const struct i915_request *rq)
 	 * this submission.
 	 */
 	return rcu_dereference_protected(rq->timeline,
-					 lockdep_is_held(&rq->sched_engine->lock));
-}
-
-static inline bool i915_request_use_scheduler(const struct i915_request *rq)
-{
-	return !rq->engine || intel_engine_has_scheduler(rq->engine);
+					 lockdep_is_held(&rq->engine->sched_engine->lock));
 }
 
 static inline u32
@@ -733,36 +710,23 @@ i915_request_active_seqno(const struct i915_request *rq)
 	return hwsp_phys_base + hwsp_relative_offset;
 }
 
-static inline struct i915_drm_client *
-i915_request_get_active_client_rcu(const struct i915_request *rq)
-{
-	const struct intel_context *ce = READ_ONCE(rq->context);
-	struct i915_drm_client *client = NULL;
-
-	if (__i915_request_is_complete(rq))
-		return NULL;
-
-	client = i915_drm_client_get_rcu(ce->client);
-
-	if (client && READ_ONCE(rq->context) != ce) {
-		i915_drm_client_put(client);
-		client = NULL;
-	}
-
-	return client;
-}
-
 bool
 i915_request_active_engine(struct i915_request *rq,
 			   struct intel_engine_cs **active);
 
+void i915_request_notify_execute_cb_imm(struct i915_request *rq);
+
+enum i915_request_state {
+	I915_REQUEST_UNKNOWN = 0,
+	I915_REQUEST_COMPLETE,
+	I915_REQUEST_PENDING,
+	I915_REQUEST_QUEUED,
+	I915_REQUEST_ACTIVE,
+};
+
+enum i915_request_state i915_test_request_state(struct i915_request *rq);
+
 void i915_request_module_exit(void);
 int i915_request_module_init(void);
-
-#ifdef CONFIG_LOCKDEP
-void i915_fence_check_lr_lockdep(struct dma_fence *fence);
-#else
-static inline void i915_fence_check_lr_lockdep(struct dma_fence *fence) { }
-#endif
 
 #endif /* I915_REQUEST_H */

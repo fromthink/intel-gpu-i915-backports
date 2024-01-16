@@ -7,6 +7,7 @@
 #include "gt/intel_gpu_commands.h"
 #include "i915_selftest.h"
 
+#include "gem/selftests/igt_gem_utils.h"
 #include "gem/selftests/mock_context.h"
 #include "selftests/igt_reset.h"
 #include "selftests/igt_spinner.h"
@@ -77,10 +78,8 @@ static int live_mocs_init(struct live_mocs *arg, struct intel_gt *gt)
 
 	arg->scratch =
 		__vm_create_scratch_for_read_pinned(&gt->ggtt->vm, PAGE_SIZE);
-	if (IS_ERR(arg->scratch)) {
-		err = PTR_ERR(arg->scratch);
-		goto err_mocs;
-	}
+	if (IS_ERR(arg->scratch))
+		return PTR_ERR(arg->scratch);
 
 	arg->vaddr = i915_gem_object_pin_map_unlocked(arg->scratch->obj, I915_MAP_WB);
 	if (IS_ERR(arg->vaddr)) {
@@ -88,14 +87,10 @@ static int live_mocs_init(struct live_mocs *arg, struct intel_gt *gt)
 		goto err_scratch;
 	}
 
-	free_mocs_settings(&arg->table);
 	return 0;
 
 err_scratch:
 	i915_vma_unpin_and_release(&arg->scratch, 0);
-
-err_mocs:
-	free_mocs_settings(&arg->table);
 	return err;
 }
 
@@ -136,13 +131,14 @@ static int read_mocs_table(struct i915_request *rq,
 			   const struct drm_i915_mocs_table *table,
 			   u32 *offset)
 {
+	struct intel_gt *gt = rq->engine->gt;
 	u32 addr;
 
 	if (!table)
 		return 0;
 
 	if (HAS_GLOBAL_MOCS_REGISTERS(rq->engine->i915))
-		addr = global_mocs_offset(rq->engine->gt);
+		addr = global_mocs_offset() + gt->uncore->gsi_offset;
 	else
 		addr = mocs_offset(rq->engine);
 
@@ -233,11 +229,7 @@ static int check_mocs_engine(struct live_mocs *arg,
 	if (IS_ERR(rq))
 		return PTR_ERR(rq);
 
-	i915_vma_lock(vma);
-	err = i915_request_await_object(rq, vma->obj, true);
-	if (!err)
-		err = i915_vma_move_to_active(vma, rq, EXEC_OBJECT_WRITE);
-	i915_vma_unlock(vma);
+	err = igt_vma_move_to_active_unlocked(vma, rq, EXEC_OBJECT_WRITE);
 
 	/* Read the mocs tables back using SRM */
 	offset = i915_ggtt_offset(vma);

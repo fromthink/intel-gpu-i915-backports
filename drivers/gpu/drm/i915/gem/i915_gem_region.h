@@ -8,19 +8,44 @@
 
 #include <linux/types.h>
 
-#include "gt/intel_gt_types.h"
-
-struct drm_i915_gem_object;
 struct intel_memory_region;
-struct kobject;
+struct drm_i915_gem_object;
 struct sg_table;
 
-struct sg_table *
-i915_gem_object_get_pages_buddy(struct drm_i915_gem_object *obj,
-				unsigned int *page_sizes);
-int i915_gem_object_put_pages_buddy(struct drm_i915_gem_object *obj,
-				    struct sg_table *pages,
-				    bool dirty);
+struct i915_gem_apply_to_region;
+
+#define I915_BO_INVALID_OFFSET ((resource_size_t)-1)
+
+/**
+ * struct i915_gem_apply_to_region_ops - ops to use when iterating over all
+ * region objects.
+ */
+struct i915_gem_apply_to_region_ops {
+	/**
+	 * @process_obj: Process the current object
+	 *
+	 * Note that if this function is part of a ww transaction, and
+	 * if returns -EDEADLK for one of the objects, it may be
+	 * rerun for that same object in the same pass.
+	 */
+	int (*process_obj)(struct i915_gem_apply_to_region *apply,
+			   struct drm_i915_gem_object *obj);
+};
+
+/**
+ * struct i915_gem_apply_to_region - Argument to the struct
+ * i915_gem_apply_to_region_ops functions.
+ * @ops: The ops for the operation.
+ * @ww: Locking context used for the transaction.
+ * @interruptible: Whether to perform object locking interruptible.
+ *
+ * This structure is intended to be embedded in a private struct if needed
+ */
+struct i915_gem_apply_to_region {
+	const struct i915_gem_apply_to_region_ops *ops;
+	struct i915_gem_ww_ctx *ww;
+	u32 interruptible:1;
+};
 
 void i915_gem_object_init_memory_region(struct drm_i915_gem_object *obj,
 					struct intel_memory_region *mem);
@@ -29,22 +54,14 @@ void i915_gem_object_release_memory_region(struct drm_i915_gem_object *obj);
 struct drm_i915_gem_object *
 i915_gem_object_create_region(struct intel_memory_region *mem,
 			      resource_size_t size,
+			      resource_size_t page_size,
 			      unsigned int flags);
+struct drm_i915_gem_object *
+i915_gem_object_create_region_at(struct intel_memory_region *mem,
+				 resource_size_t offset,
+				 resource_size_t size,
+				 unsigned int flags);
 
-static inline struct drm_i915_gem_object *
-intel_gt_object_create_lmem(struct intel_gt *gt,
-			    resource_size_t size,
-			    unsigned int flags)
-{
-	return i915_gem_object_create_region(gt->lmem, size, flags);
-}
-
-bool i915_gem_shmem_register_sysfs(struct drm_i915_private *i915,
-				   struct kobject *errors);
-
-/* i915_modparams.force_alloc_contig flags */
-#define ALLOC_CONTIGUOUS_SMEM BIT(0)
-#define ALLOC_CONTIGUOUS_LMEM BIT(1)
-#define ALLOC_CONTIGUOUS_FLAGS (ALLOC_CONTIGUOUS_SMEM | ALLOC_CONTIGUOUS_LMEM)
-
+int i915_gem_process_region(struct intel_memory_region *mr,
+			    struct i915_gem_apply_to_region *apply);
 #endif

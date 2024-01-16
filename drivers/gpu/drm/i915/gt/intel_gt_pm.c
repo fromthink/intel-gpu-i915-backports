@@ -7,136 +7,63 @@
 #include <linux/suspend.h>
 
 #include "i915_drv.h"
+#include "i915_irq.h"
 #include "i915_params.h"
 #include "intel_context.h"
 #include "intel_engine_pm.h"
 #include "intel_gt.h"
-#include "intel_gt_ccs_mode.h"
 #include "intel_gt_clock_utils.h"
+#include "intel_gt_mcr.h"
 #include "intel_gt_pm.h"
 #include "intel_gt_print.h"
 #include "intel_gt_requests.h"
 #include "intel_llc.h"
-#include "intel_pm.h"
 #include "intel_rc6.h"
 #include "intel_rps.h"
 #include "intel_wakeref.h"
-#include "intel_pcode.h"
-
 #include "pxp/intel_pxp_pm.h"
+#include "iov/intel_iov.h"
 
-#if IS_ENABLED(CPTCFG_DRM_I915_DISPLAY)
-static void display__gt_unpark(struct drm_i915_private *i915, struct intel_gt *gt)
-{
-	gt->awake = intel_display_power_get(i915, POWER_DOMAIN_GT_IRQ);
-	GEM_BUG_ON(!gt->awake);
-}
-
-static void display__gt_park(struct drm_i915_private *i915, struct intel_gt *gt)
-{
-	/* Defer dropping the display power well for 100ms, it's slow! */
-	intel_display_power_put_async(i915, POWER_DOMAIN_GT_IRQ,
-				      fetch_and_zero(&gt->awake));
-}
-#else
-static void display__gt_unpark(struct drm_i915_private *i915, struct intel_gt *gt) {}
-static void display__gt_park(struct drm_i915_private *i915, struct intel_gt *gt) {}
-#endif
-
-static void dbg_poison_ce(struct intel_context *ce)
-{
-	if (!IS_ENABLED(CPTCFG_DRM_I915_DEBUG_GEM))
-		return;
-
-	if (ce->state) {
-		struct drm_i915_gem_object *obj = ce->state->obj;
-		int type = page_unmask_bits(obj->mm.mapping);
-		void *map;
-
-		if (!i915_gem_object_trylock(obj))
-			return;
-
-		map = i915_gem_object_pin_map(obj, type);
-		if (!IS_ERR(map)) {
-			memset(map, CONTEXT_REDZONE, obj->base.size);
-			i915_gem_object_flush_map(obj);
-			i915_gem_object_unpin_map(obj);
-		}
-		i915_gem_object_unlock(obj);
-	}
-}
-
-static void reset_pinned_contexts(struct intel_gt *gt)
-{
-	struct intel_context *ce;
-
-	list_for_each_entry(ce, &gt->pinned_contexts, pinned_contexts_link) {
-		dbg_poison_ce(ce);
-		ce->ops->reset(ce);
-	}
-}
-
-/*
- * Wa_14017210380: mtl
- */
-
-static bool mtl_needs_media_mc6_wa(struct intel_gt *gt)
-{
-	return (IS_MTL_GRAPHICS_STEP(gt->i915, P, STEP_A0, STEP_B0) &&
-		gt->type == GT_MEDIA);
-}
-
-static void mtl_mc6_wa_media_busy(struct intel_gt *gt)
-{
-	if (mtl_needs_media_mc6_wa(gt))
-		snb_pcode_write_p(gt->uncore, PCODE_MBOX_GT_STATE,
-				  PCODE_MBOX_GT_STATE_MEDIA_BUSY,
-				  PCODE_MBOX_GT_STATE_DOMAIN_MEDIA, 0);
-}
-
-static void mtl_mc6_wa_media_not_busy(struct intel_gt *gt)
-{
-	if (mtl_needs_media_mc6_wa(gt))
-		snb_pcode_write_p(gt->uncore, PCODE_MBOX_GT_STATE,
-				  PCODE_MBOX_GT_STATE_MEDIA_NOT_BUSY,
-				  PCODE_MBOX_GT_STATE_DOMAIN_MEDIA, 0);
-}
+#define I915_GT_SUSPEND_IDLE_TIMEOUT (HZ / 2)
 
 static void user_forcewake(struct intel_gt *gt, bool suspend)
 {
 	int count = atomic_read(&gt->user_wakeref);
-	intel_wakeref_t wakeref;
 
 	/* Inside suspend/resume so single threaded, no races to worry about. */
 	if (likely(!count))
 		return;
 
-	wakeref = intel_gt_pm_get(gt);
+	intel_gt_pm_get(gt);
 	if (suspend) {
 		GEM_BUG_ON(count > atomic_read(&gt->wakeref.count));
 		atomic_sub(count, &gt->wakeref.count);
 	} else {
 		atomic_add(count, &gt->wakeref.count);
 	}
-	intel_gt_pm_put(gt, wakeref);
+	intel_gt_pm_put(gt);
 }
 
 static void runtime_begin(struct intel_gt *gt)
 {
-	smp_wmb(); /* pairs with intel_gt_get_busy_time() */
-	WRITE_ONCE(gt->stats.start, ktime_get());
+	local_irq_disable();
+	write_seqcount_begin(&gt->stats.lock);
+	gt->stats.start = ktime_get();
+	gt->stats.active = true;
+	write_seqcount_end(&gt->stats.lock);
+	local_irq_enable();
 }
 
 static void runtime_end(struct intel_gt *gt)
 {
-	ktime_t total;
-
-	total = ktime_sub(ktime_get(), gt->stats.start);
-	total = ktime_add(gt->stats.total, total);
-
-	WRITE_ONCE(gt->stats.start, 0);
-	smp_wmb(); /* pairs with intel_gt_get_busy_time() */
-	gt->stats.total = total;
+	local_irq_disable();
+	write_seqcount_begin(&gt->stats.lock);
+	gt->stats.active = false;
+	gt->stats.total =
+		ktime_add(gt->stats.total,
+			  ktime_sub(ktime_get(), gt->stats.start));
+	write_seqcount_end(&gt->stats.lock);
+	local_irq_enable();
 }
 
 static int __gt_unpark(struct intel_wakeref *wf)
@@ -145,9 +72,6 @@ static int __gt_unpark(struct intel_wakeref *wf)
 	struct drm_i915_private *i915 = gt->i915;
 
 	GT_TRACE(gt, "\n");
-
-	/* Wa_14017210380: mtl */
-	mtl_mc6_wa_media_busy(gt);
 
 	/*
 	 * It seems that the DMC likes to transition between the DC states a lot
@@ -160,7 +84,8 @@ static int __gt_unpark(struct intel_wakeref *wf)
 	 * Work around it by grabbing a GT IRQ power domain whilst there is any
 	 * GT activity, preventing any DC state transitions.
 	 */
-	display__gt_unpark(i915, gt);
+	gt->awake = intel_display_power_get(i915, POWER_DOMAIN_GT_IRQ);
+	GEM_BUG_ON(!gt->awake);
 
 	intel_rc6_unpark(&gt->rc6);
 	intel_rps_unpark(&gt->rps);
@@ -176,29 +101,26 @@ static int __gt_unpark(struct intel_wakeref *wf)
 static int __gt_park(struct intel_wakeref *wf)
 {
 	struct intel_gt *gt = container_of(wf, typeof(*gt), wakeref);
+	intel_wakeref_t wakeref = fetch_and_zero(&gt->awake);
 	struct drm_i915_private *i915 = gt->i915;
 
 	GT_TRACE(gt, "\n");
-
-	if (gt->lmem && i915_gem_lmem_park(gt->lmem))
-		return -EBUSY;
 
 	runtime_end(gt);
 	intel_gt_park_requests(gt);
 
 	intel_guc_busyness_park(gt);
+	i915_vma_parked(gt);
 	i915_pmu_gt_parked(gt);
 	intel_rps_park(&gt->rps);
 	intel_rc6_park(&gt->rc6);
 
-	intel_gt_park_ccs_mode(gt, NULL);
-
 	/* Everything switched off, flush any residual interrupt just in case */
 	intel_synchronize_irq(i915);
 
-	display__gt_park(i915, gt);
-	/* Wa_14017210380: mtl */
-	mtl_mc6_wa_media_not_busy(gt);
+	/* Defer dropping the display power well for 100ms, it's slow! */
+	GEM_BUG_ON(!wakeref);
+	intel_display_power_put_async(i915, POWER_DOMAIN_GT_IRQ, wakeref);
 
 	return 0;
 }
@@ -217,7 +139,8 @@ void intel_gt_pm_init_early(struct intel_gt *gt)
 	 * runtime_pm is per-device rather than per-tile, so this is still the
 	 * correct structure.
 	 */
-	intel_wakeref_init(&gt->wakeref, &gt->i915->runtime_pm, &wf_ops, "GT");
+	intel_wakeref_init(&gt->wakeref, gt->i915, &wf_ops);
+	seqcount_mutex_init(&gt->stats.lock, &gt->wakeref.mutex);
 }
 
 void intel_gt_pm_init(struct intel_gt *gt)
@@ -245,12 +168,6 @@ static void gt_sanitize(struct intel_gt *gt, bool force)
 	enum intel_engine_id id;
 	intel_wakeref_t wakeref;
 
-	if (is_mock_gt(gt))
-		return;
-
-	if (gt->i915->quiesce_gpu)
-		return;
-
 	GT_TRACE(gt, "force:%s", str_yes_no(force));
 
 	/* Use a raw wakeref to avoid calling intel_display_power_get early */
@@ -275,8 +192,8 @@ static void gt_sanitize(struct intel_gt *gt, bool force)
 		if (engine->reset.prepare)
 			engine->reset.prepare(engine);
 
-		if (engine->status_page.sanitize)
-			engine->status_page.sanitize(engine);
+		if (engine->sanitize)
+			engine->sanitize(engine);
 	}
 
 	if (reset_engines(gt) || force) {
@@ -285,8 +202,6 @@ static void gt_sanitize(struct intel_gt *gt, bool force)
 	}
 
 	intel_uc_reset(&gt->uc, false);
-	intel_gt_retire_requests(gt);
-	reset_pinned_contexts(gt);
 
 	for_each_engine(engine, gt, id)
 		if (engine->reset.finish)
@@ -305,20 +220,23 @@ void intel_gt_pm_fini(struct intel_gt *gt)
 
 void intel_gt_resume_early(struct intel_gt *gt)
 {
-	if (gt->type != GT_MEDIA)
-		i915_ggtt_resume(gt->ggtt);
+	/*
+	 * Sanitize steer semaphores during driver resume. This is necessary
+	 * to address observed cases of steer semaphores being
+	 * held after a suspend operation. Confirmation from the hardware team
+	 * assures the safety of this operation, as no lock acquisitions
+	 * by other agents occur during driver load/resume process.
+	 */
+	intel_gt_mcr_lock_sanitize(gt);
 
-	if (GRAPHICS_VER(gt->i915) >= 8)
-		setup_private_pat(gt);
-
-	intel_uc_resume_early(&gt->uc);
+	intel_uncore_resume_early(gt->uncore);
+	intel_gt_check_and_clear_faults(gt);
 }
 
 int intel_gt_resume(struct intel_gt *gt)
 {
 	struct intel_engine_cs *engine;
 	enum intel_engine_id id;
-	intel_wakeref_t wakeref;
 	int err;
 
 	err = intel_gt_has_unrecoverable_error(gt);
@@ -335,7 +253,7 @@ int intel_gt_resume(struct intel_gt *gt)
 	 */
 	gt_sanitize(gt, true);
 
-	wakeref = intel_gt_pm_get(gt);
+	intel_gt_pm_get(gt);
 
 	intel_uncore_forcewake_get(gt->uncore, FORCEWAKE_ALL);
 	intel_rc6_sanitize(&gt->rc6);
@@ -364,25 +282,22 @@ int intel_gt_resume(struct intel_gt *gt)
 
 		intel_engine_pm_put(engine);
 		if (err) {
-			intel_gt_log_driver_error(gt, INTEL_GT_DRIVER_ERROR_ENGINE_OTHER,
-						  "Failed to restart '%s' (%d)\n",
-						  engine->name, err);
+			gt_err(gt, "Failed to restart %s (%d)\n",
+			       engine->name, err);
 			goto err_wedged;
 		}
 	}
 
-	intel_rc6_enable(&gt->rc6);
+	if (gt->i915->params.enable_rc6)
+		intel_rc6_enable(&gt->rc6);
 
 	intel_uc_resume(&gt->uc);
 
-	intel_pxp_resume(&gt->pxp);
-
 	user_forcewake(gt, false);
-	WRITE_ONCE(gt->suspend, false);
 
 out_fw:
 	intel_uncore_forcewake_put(gt->uncore, FORCEWAKE_ALL);
-	intel_gt_pm_put(gt, wakeref);
+	intel_gt_pm_put(gt);
 	return err;
 
 err_wedged:
@@ -392,31 +307,27 @@ err_wedged:
 
 static void wait_for_suspend(struct intel_gt *gt)
 {
-	intel_wakeref_t wf;
-
-	/* Flush all pending page workers */
-	flush_workqueue(gt->i915->mm.wq);
-
-	if (gt->i915->quiesce_gpu)
+	if (!intel_gt_pm_is_awake(gt))
 		return;
 
-	with_intel_gt_pm(gt, wf) {
-		/* Cancel outstanding work and leave the gpu quiet */
-		if (intel_gt_wait_for_idle(gt, I915_GEM_IDLE_TIMEOUT) == -ETIME)
-			intel_gt_set_wedged(gt);
-
-		/* Make the GPU available again for swapout */
-		intel_gt_unset_wedged(gt);
+	if (intel_gt_wait_for_idle(gt, I915_GT_SUSPEND_IDLE_TIMEOUT) == -ETIME) {
+		/*
+		 * Forcibly cancel outstanding work and leave
+		 * the gpu quiet.
+		 */
+		intel_gt_set_wedged(gt);
+		intel_gt_retire_requests(gt);
 	}
+
+	intel_gt_pm_wait_for_idle(gt);
 }
 
 void intel_gt_suspend_prepare(struct intel_gt *gt)
 {
+	intel_iov_suspend(&gt->iov);
+
 	user_forcewake(gt, true);
 	wait_for_suspend(gt);
-	intel_gt_retire_requests(gt);
-
-	intel_pxp_suspend(&gt->pxp, false);
 }
 
 static suspend_state_t pm_suspend_target(void)
@@ -428,40 +339,14 @@ static suspend_state_t pm_suspend_target(void)
 #endif
 }
 
-static void flush_clear_on_idle(struct intel_gt *gt)
-{
-	struct intel_memory_region *mem;
-
-	if (!IS_ENABLED(CPTCFG_DRM_I915_CHICKEN_CLEAR_ON_IDLE))
-		return;
-
-	mem = gt->lmem;
-	if (!mem)
-		return;
-
-	/* Wait for the suspend flag to be visible in i915_gem_lmem_park() */
-	mutex_lock(&gt->wakeref.mutex);
-	mutex_unlock(&gt->wakeref.mutex);
-
-	/* Wait for any workers started before the flag became visible */
-	wait_for_completion(&mem->parking);
-}
-
 void intel_gt_suspend_late(struct intel_gt *gt)
 {
 	intel_wakeref_t wakeref;
 
-	WRITE_ONCE(gt->suspend, true);
-	flush_clear_on_idle(gt);
-
 	/* We expect to be idle already; but also want to be independent */
 	wait_for_suspend(gt);
-	intel_gt_pm_wait_for_idle(gt);
 
 	if (is_mock_gt(gt))
-		return;
-
-	if (gt->i915->quiesce_gpu)
 		return;
 
 	GEM_BUG_ON(gt->awake);
@@ -485,19 +370,15 @@ void intel_gt_suspend_late(struct intel_gt *gt)
 		intel_rps_disable(&gt->rps);
 		intel_rc6_disable(&gt->rc6);
 		intel_llc_disable(&gt->llc);
-
-		if (gt->type != GT_MEDIA)
-			i915_ggtt_suspend(gt->ggtt);
 	}
 
-	gt_sanitize(gt, false); /* Be paranoid, remove all residual GPU state */
+	gt_sanitize(gt, false);
 
 	GT_TRACE(gt, "\n");
 }
 
 void intel_gt_runtime_suspend(struct intel_gt *gt)
 {
-	intel_pxp_suspend(&gt->pxp, true);
 	intel_uc_runtime_suspend(&gt->uc);
 
 	GT_TRACE(gt, "\n");
@@ -515,23 +396,31 @@ int intel_gt_runtime_resume(struct intel_gt *gt)
 	if (ret)
 		return ret;
 
-	intel_pxp_resume(&gt->pxp);
-
 	return 0;
+}
+
+static ktime_t __intel_gt_get_awake_time(const struct intel_gt *gt)
+{
+	ktime_t total = gt->stats.total;
+
+	if (gt->stats.active)
+		total = ktime_add(total,
+				  ktime_sub(ktime_get(), gt->stats.start));
+
+	return total;
 }
 
 ktime_t intel_gt_get_awake_time(const struct intel_gt *gt)
 {
-	ktime_t total = gt->stats.total;
-	ktime_t start;
+	unsigned int seq;
+	ktime_t total;
 
-	start = READ_ONCE(gt->stats.start);
-	if (start) {
-		smp_rmb(); /* pairs with runtime_begin/end */
-		start = ktime_sub(ktime_get(), start);
-	}
+	do {
+		seq = read_seqcount_begin(&gt->stats.lock);
+		total = __intel_gt_get_awake_time(gt);
+	} while (read_seqcount_retry(&gt->stats.lock, seq));
 
-	return ktime_add(total, start);
+	return total;
 }
 
 #if IS_ENABLED(CPTCFG_DRM_I915_SELFTEST)

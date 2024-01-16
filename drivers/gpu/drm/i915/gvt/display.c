@@ -36,6 +36,9 @@
 #include "i915_reg.h"
 #include "gvt.h"
 
+#include "display/intel_display.h"
+#include "display/intel_dpio_phy.h"
+
 static int get_edp_pipe(struct intel_vgpu *vgpu)
 {
 	u32 data = vgpu_vreg(vgpu, _TRANS_DDI_FUNC_CTL_EDP);
@@ -60,7 +63,7 @@ static int edp_pipe_is_enabled(struct intel_vgpu *vgpu)
 {
 	struct drm_i915_private *dev_priv = vgpu->gvt->gt->i915;
 
-	if (!(vgpu_vreg_t(vgpu, PIPECONF(_PIPE_EDP)) & PIPECONF_ENABLE))
+	if (!(vgpu_vreg_t(vgpu, TRANSCONF(TRANSCODER_EDP)) & TRANSCONF_ENABLE))
 		return 0;
 
 	if (!(vgpu_vreg(vgpu, _TRANS_DDI_FUNC_CTL_EDP) & TRANS_DDI_FUNC_ENABLE))
@@ -76,7 +79,7 @@ int pipe_is_enabled(struct intel_vgpu *vgpu, int pipe)
 			pipe < PIPE_A || pipe >= I915_MAX_PIPES))
 		return -EINVAL;
 
-	if (vgpu_vreg_t(vgpu, PIPECONF(pipe)) & PIPECONF_ENABLE)
+	if (vgpu_vreg_t(vgpu, TRANSCONF(pipe)) & TRANSCONF_ENABLE)
 		return 1;
 
 	if (edp_pipe_is_enabled(vgpu) &&
@@ -168,7 +171,6 @@ static u8 dpcd_fix_data[DPCD_HEADER_SIZE] = {
 	0x12, 0x014, 0x84, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
 };
 
-#if IS_ENABLED(CPTCFG_DRM_I915_DISPLAY)
 static void emulate_monitor_status_change(struct intel_vgpu *vgpu)
 {
 	struct drm_i915_private *dev_priv = vgpu->gvt->gt->i915;
@@ -185,8 +187,8 @@ static void emulate_monitor_status_change(struct intel_vgpu *vgpu)
 			  GEN8_DE_PORT_HOTPLUG(HPD_PORT_C));
 
 		for_each_pipe(dev_priv, pipe) {
-			vgpu_vreg_t(vgpu, PIPECONF(pipe)) &=
-				~(PIPECONF_ENABLE | PIPECONF_STATE_ENABLE);
+			vgpu_vreg_t(vgpu, TRANSCONF(pipe)) &=
+				~(TRANSCONF_ENABLE | TRANSCONF_STATE_ENABLE);
 			vgpu_vreg_t(vgpu, DSPCNTR(pipe)) &= ~DISP_ENABLE;
 			vgpu_vreg_t(vgpu, SPRCTL(pipe)) &= ~SPRITE_ENABLE;
 			vgpu_vreg_t(vgpu, CURCNTR(pipe)) &= ~MCURSOR_MODE_MASK;
@@ -246,8 +248,8 @@ static void emulate_monitor_status_change(struct intel_vgpu *vgpu)
 		 *   TRANSCODER_A can be enabled. PORT_x depends on the input of
 		 *   setup_virtual_dp_monitor.
 		 */
-		vgpu_vreg_t(vgpu, PIPECONF(PIPE_A)) |= PIPECONF_ENABLE;
-		vgpu_vreg_t(vgpu, PIPECONF(PIPE_A)) |= PIPECONF_STATE_ENABLE;
+		vgpu_vreg_t(vgpu, TRANSCONF(TRANSCODER_A)) |= TRANSCONF_ENABLE;
+		vgpu_vreg_t(vgpu, TRANSCONF(TRANSCODER_A)) |= TRANSCONF_STATE_ENABLE;
 
 		/*
 		 * Golden M/N are calculated based on:
@@ -504,10 +506,9 @@ static void emulate_monitor_status_change(struct intel_vgpu *vgpu)
 		vgpu_vreg_t(vgpu, CURCNTR(pipe)) |= MCURSOR_MODE_DISABLE;
 	}
 
-	vgpu_vreg_t(vgpu, PIPECONF(PIPE_A)) |= PIPECONF_ENABLE;
+	vgpu_vreg_t(vgpu, TRANSCONF(TRANSCODER_A)) |= TRANSCONF_ENABLE;
 }
 
-#endif
 static void clean_virtual_dp_monitor(struct intel_vgpu *vgpu, int port_num)
 {
 	struct intel_vgpu_port *port = intel_vgpu_port(vgpu, port_num);
@@ -572,9 +573,7 @@ static int setup_virtual_dp_monitor(struct intel_vgpu *vgpu, int port_num,
 	vblank_timer->vrefresh_k = port->vrefresh_k;
 	vblank_timer->period = DIV64_U64_ROUND_CLOSEST(NSEC_PER_SEC * MSEC_PER_SEC, vblank_timer->vrefresh_k);
 
-#if IS_ENABLED(CPTCFG_DRM_I915_DISPLAY)
 	emulate_monitor_status_change(vgpu);
-#endif
 
 	return 0;
 }
@@ -585,7 +584,7 @@ static int setup_virtual_dp_monitor(struct intel_vgpu *vgpu, int port_num,
  * @turnon: Turn ON/OFF vblank_timer
  *
  * This function is used to turn on/off or update the per-vGPU vblank_timer
- * when PIPECONF is enabled or disabled. vblank_timer period is also updated
+ * when TRANSCONF is enabled or disabled. vblank_timer period is also updated
  * if guest changed the refresh rate.
  *
  */
@@ -620,7 +619,6 @@ void vgpu_update_vblank_emulation(struct intel_vgpu *vgpu, bool turnon)
 	}
 }
 
-#if IS_ENABLED(CPTCFG_DRM_I915_DISPLAY)
 static void emulate_vblank_on_pipe(struct intel_vgpu *vgpu, int pipe)
 {
 	struct drm_i915_private *dev_priv = vgpu->gvt->gt->i915;
@@ -650,17 +648,14 @@ static void emulate_vblank_on_pipe(struct intel_vgpu *vgpu, int pipe)
 	}
 }
 
-#endif
 void intel_vgpu_emulate_vblank(struct intel_vgpu *vgpu)
 {
-#if IS_ENABLED(CPTCFG_DRM_I915_DISPLAY)
 	int pipe;
 
 	mutex_lock(&vgpu->vgpu_lock);
 	for_each_pipe(vgpu->gvt->gt->i915, pipe)
 		emulate_vblank_on_pipe(vgpu, pipe);
 	mutex_unlock(&vgpu->vgpu_lock);
-#endif
 }
 
 /**
@@ -812,7 +807,5 @@ int intel_vgpu_init_display(struct intel_vgpu *vgpu, u64 resolution)
  */
 void intel_vgpu_reset_display(struct intel_vgpu *vgpu)
 {
-#if IS_ENABLED(CPTCFG_DRM_I915_DISPLAY)
 	emulate_monitor_status_change(vgpu);
-#endif
 }

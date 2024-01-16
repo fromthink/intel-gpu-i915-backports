@@ -8,7 +8,6 @@
 
 #include <linux/types.h>
 
-#if IS_ENABLED(CPTCFG_DRM_I915_DISPLAY)
 struct drm_crtc;
 struct drm_i915_private;
 struct intel_crtc;
@@ -35,6 +34,5 @@ static inline void intel_crtc_enable_pipe_crc(struct intel_crtc *crtc)
 {
 }
 #endif
-#endif /* CPTCFG_DRM_I915_DISPLAY */
 
 #endif /* __INTEL_PIPE_CRC_H__ */

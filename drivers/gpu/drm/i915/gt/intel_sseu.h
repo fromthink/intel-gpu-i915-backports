@@ -27,7 +27,7 @@ struct drm_printer;
  * is only relevant to pre-Xe_HP platforms (Xe_HP and beyond use the
  * I915_MAX_SS_FUSE_BITS value below).
  */
-#define GEN_MAX_SS_PER_HSW_SLICE	6
+#define GEN_MAX_SS_PER_HSW_SLICE	8
 
 /*
  * Maximum number of 32-bit registers used by hardware to express the
@@ -48,8 +48,6 @@ struct drm_printer;
 #define GEN_SSEU_STRIDE(max_entries)	DIV_ROUND_UP(max_entries, BITS_PER_BYTE)
 #define GEN_MAX_SUBSLICE_STRIDE		GEN_SSEU_STRIDE(GEN_SS_MASK_SIZE)
 #define GEN_MAX_EU_STRIDE		GEN_SSEU_STRIDE(GEN_MAX_EUS_PER_SS)
-
-#define GEN_MAX_TILES		(2) /* PVC upper bound */
 
 #define GEN_DSS_PER_GSLICE	4
 #define GEN_DSS_PER_CSLICE	8
@@ -118,12 +116,6 @@ intel_sseu_from_device_info(const struct sseu_dev_info *sseu)
 	};
 
 	return value;
-}
-
-static inline unsigned int
-intel_sseu_highest_xehp_dss(intel_sseu_ss_mask_t ssmask)
-{
-	return find_last_bit(ssmask.xehp, XEHP_BITMAP_BITS(ssmask));
 }
 
 static inline bool

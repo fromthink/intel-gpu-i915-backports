@@ -62,7 +62,7 @@ static struct device *relay_to_dev(struct intel_iov_relay *relay)
 /*
  * How long should we wait for the response?
  * For default timeout use CPTCFG_DRM_I915_HEARTBEAT_INTERVAL like CTB does.
- * If hearbeat interval is not enabled then wait forever.
+ * If heartbeat interval is not enabled then wait forever.
  */
 #define RELAY_TIMEOUT	(CPTCFG_DRM_I915_HEARTBEAT_INTERVAL ?: MAX_SCHEDULE_TIMEOUT)
 
@@ -328,7 +328,7 @@ static int relay_send_and_wait(struct intel_iov_relay *relay, u32 target,
 			       u32 relay_id, const u32 *msg, u32 len,
 			       u32 *buf, u32 buf_size)
 {
-	unsigned long timeout = msecs_to_jiffies(ADJUST_TIMEOUT(RELAY_TIMEOUT));
+	unsigned long timeout = msecs_to_jiffies(RELAY_TIMEOUT);
 	u32 action;
 	u32 data0;
 	struct pending_relay pending;
@@ -351,9 +351,6 @@ static int relay_send_and_wait(struct intel_iov_relay *relay, u32 target,
 	pending.reply = -ENOMSG;
 	pending.response = buf;
 	pending.response_size = buf_size;
-
-	/* Wa:16014207253 */
-	intel_boost_fake_int_timer(relay_to_gt(relay), true);
 
 	/* list ordering does not need to match fence ordering */
 	spin_lock(&relay->lock);
@@ -395,9 +392,6 @@ unlink:
 	list_del(&pending.link);
 	spin_unlock(&relay->lock);
 
-	/* Wa:16014207253 */
-	intel_boost_fake_int_timer(relay_to_gt(relay), false);
-
 	if (unlikely(ret < 0)) {
 		RELAY_PROBE_ERROR(relay, "Unsuccessful %s.%u %#x:%u to %u (%pe) %*ph\n",
 				  hxg_type_to_string(FIELD_GET(GUC_HXG_MSG_0_TYPE, msg[0])),
@@ -411,8 +405,8 @@ unlink:
  * intel_iov_relay_send_to_vf - Send message to VF.
  * @relay: the Relay struct
  * @target: target VF number
- * @data: request payload data
- * @dat_len: length of the payload data (in dwords, can be 0)
+ * @msg: FIXME missing doc
+ * @len: FIXME missing doc
  * @buf: placeholder for the response message
  * @buf_size: size of the response message placeholder (in dwords)
  *
@@ -480,7 +474,6 @@ int intel_iov_relay_send_to_pf(struct intel_iov_relay *relay,
 	GEM_BUG_ON(relay_type != GUC_HXG_TYPE_REQUEST);
 	return relay_send_and_wait(relay, 0, relay_id, msg, len, buf, buf_size);
 }
-ALLOW_ERROR_INJECTION(intel_iov_relay_send_to_pf, ERRNO);
 
 static int relay_handle_reply(struct intel_iov_relay *relay, u32 origin,
 			      u32 relay_id, int reply, const u32 *msg, u32 len)

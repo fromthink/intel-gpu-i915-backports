@@ -27,7 +27,7 @@
 void intel_gt_pm_debugfs_forcewake_user_open(struct intel_gt *gt)
 {
 	atomic_inc(&gt->user_wakeref);
-	intel_gt_pm_get_untracked(gt);
+	intel_gt_pm_get(gt);
 	if (GRAPHICS_VER(gt->i915) >= 6)
 		intel_uncore_forcewake_user_get(gt->uncore);
 }
@@ -36,7 +36,7 @@ void intel_gt_pm_debugfs_forcewake_user_release(struct intel_gt *gt)
 {
 	if (GRAPHICS_VER(gt->i915) >= 6)
 		intel_uncore_forcewake_user_put(gt->uncore);
-	intel_gt_pm_put_untracked(gt);
+	intel_gt_pm_put(gt);
 	atomic_dec(&gt->user_wakeref);
 }
 
@@ -58,8 +58,11 @@ static int forcewake_user_release(struct inode *inode, struct file *file)
 	return 0;
 }
 
-DEFINE_I915_GT_RAW_ATTRIBUTE(forcewake_user_fops, forcewake_user_open,
-			     forcewake_user_release, NULL, NULL, NULL);
+static const struct file_operations forcewake_user_fops = {
+	.owner = THIS_MODULE,
+	.open = forcewake_user_open,
+	.release = forcewake_user_release,
+};
 
 static int fw_domains_show(struct seq_file *m, void *data)
 {
@@ -80,19 +83,6 @@ static int fw_domains_show(struct seq_file *m, void *data)
 }
 DEFINE_INTEL_GT_DEBUGFS_ATTRIBUTE(fw_domains);
 
-static void print_rc6_res(struct seq_file *m,
-			  const char *title,
-			  const i915_reg_t reg)
-{
-	struct intel_gt *gt = m->private;
-	intel_wakeref_t wakeref;
-
-	with_intel_runtime_pm(gt->uncore->rpm, wakeref)
-		seq_printf(m, "%s %u (%llu us)\n", title,
-			   intel_uncore_read(gt->uncore, reg),
-			   intel_rc6_residency_us(&gt->rc6, reg));
-}
-
 static int vlv_drpc(struct seq_file *m)
 {
 	struct intel_gt *gt = m->private;
@@ -112,8 +102,8 @@ static int vlv_drpc(struct seq_file *m)
 	seq_printf(m, "Media Power Well: %s\n",
 		   (pw_status & VLV_GTLC_PW_MEDIA_STATUS_MASK) ? "Up" : "Down");
 
-	print_rc6_res(m, "Render RC6 residency since boot:", GEN6_GT_GFX_RC6);
-	print_rc6_res(m, "Media RC6 residency since boot:", VLV_GT_MEDIA_RC6);
+	intel_rc6_print_residency(m, "Render RC6 residency since boot:", INTEL_RC6_RES_RC6);
+	intel_rc6_print_residency(m, "Media RC6 residency since boot:", INTEL_RC6_RES_VLV_MEDIA);
 
 	return fw_domains_show(m, NULL);
 }
@@ -189,22 +179,11 @@ static int gen6_drpc(struct seq_file *m)
 	}
 
 	/* Not exactly sure what this is */
-	print_rc6_res(m, "RC6 \"Locked to RPn\" residency since boot:",
-		      GEN6_GT_GFX_RC6_LOCKED);
-	print_rc6_res(m, "RC6 residency since boot:", GEN6_GT_GFX_RC6);
-
-	/*
-	 * TODO:As per BSpec:52453 GT RPM unit residency NS should be equal to
-	 * intel_rc6_rpm_unit_residency(&gt->rc6) * gt->clock_period_ns
-	 * But that is no where equivlent to GEN6_GT_GFX_RC6 NS on actual HW.
-	 * Need to figure out correct counter increment frequency from HW Team.
-	 */
-	if (GRAPHICS_VER(i915) >= 12)
-		seq_printf(m, "GT RC6 RPM Unit Residency since last RC6 exit: 0x%llx\n",
-			   intel_rc6_rpm_unit_residency(&gt->rc6));
-
-	print_rc6_res(m, "RC6+ residency since boot:", GEN6_GT_GFX_RC6p);
-	print_rc6_res(m, "RC6++ residency since boot:", GEN6_GT_GFX_RC6pp);
+	intel_rc6_print_residency(m, "RC6 \"Locked to RPn\" residency since boot:",
+				  INTEL_RC6_RES_RC6_LOCKED);
+	intel_rc6_print_residency(m, "RC6 residency since boot:", INTEL_RC6_RES_RC6);
+	intel_rc6_print_residency(m, "RC6+ residency since boot:", INTEL_RC6_RES_RC6p);
+	intel_rc6_print_residency(m, "RC6++ residency since boot:", INTEL_RC6_RES_RC6pp);
 
 	if (GRAPHICS_VER(i915) <= 7) {
 		seq_printf(m, "RC6   voltage: %dmV\n",
@@ -281,10 +260,10 @@ static int mtl_drpc(struct seq_file *m)
 {
 	struct intel_gt *gt = m->private;
 	struct intel_uncore *uncore = gt->uncore;
-	u32 gt_core_status, rcctl1;
+	u32 gt_core_status, rcctl1, mt_fwake_req;
 	u32 mtl_powergate_enable = 0, mtl_powergate_status = 0;
-	i915_reg_t reg;
 
+	mt_fwake_req = intel_uncore_read_fw(uncore, FORCEWAKE_MT);
 	gt_core_status = intel_uncore_read(uncore, MTL_MIRROR_TARGET_WP1);
 
 	rcctl1 = intel_uncore_read(uncore, GEN6_RC_CONTROL);
@@ -296,17 +275,16 @@ static int mtl_drpc(struct seq_file *m)
 		   str_yes_no(rcctl1 & GEN6_RC_CTL_RC6_ENABLE));
 	if (gt->type == GT_MEDIA) {
 		seq_printf(m, "Media Well Gating Enabled: %s\n",
-		   str_yes_no(mtl_powergate_enable & GEN9_MEDIA_PG_ENABLE));
+			   str_yes_no(mtl_powergate_enable & GEN9_MEDIA_PG_ENABLE));
 	} else {
 		seq_printf(m, "Render Well Gating Enabled: %s\n",
-		   str_yes_no(mtl_powergate_enable & GEN9_RENDER_PG_ENABLE));
+			   str_yes_no(mtl_powergate_enable & GEN9_RENDER_PG_ENABLE));
 	}
 
 	seq_puts(m, "Current RC state: ");
-
-	switch ((gt_core_status & MTL_CC_MASK) >> MTL_CC_SHIFT) {
+	switch (REG_FIELD_GET(MTL_CC_MASK, gt_core_status)) {
 	case MTL_CC0:
-		seq_puts(m, "on\n");
+		seq_puts(m, "RC0\n");
 		break;
 	case MTL_CC6:
 		seq_puts(m, "RC6\n");
@@ -316,6 +294,7 @@ static int mtl_drpc(struct seq_file *m)
 		break;
 	}
 
+	seq_printf(m, "Multi-threaded Forcewake Request: 0x%x\n", mt_fwake_req);
 	if (gt->type == GT_MEDIA)
 		seq_printf(m, "Media Power Well: %s\n",
 			   (mtl_powergate_status &
@@ -325,8 +304,8 @@ static int mtl_drpc(struct seq_file *m)
 			   (mtl_powergate_status &
 			    GEN9_PWRGT_RENDER_STATUS_MASK) ? "Up" : "Down");
 
-	reg = (gt->type == GT_MEDIA) ? MTL_MEDIA_MC6 : GEN6_GT_GFX_RC6;
-	print_rc6_res(m, "RC6 residency since boot:", reg);
+	/* Works for both render and media gt's */
+	intel_rc6_print_residency(m, "RC6 residency since boot:", INTEL_RC6_RES_RC6);
 
 	return fw_domains_show(m, NULL);
 }
@@ -339,10 +318,10 @@ static int drpc_show(struct seq_file *m, void *unused)
 	int err = -ENODEV;
 
 	with_intel_runtime_pm(gt->uncore->rpm, wakeref) {
-		if (IS_VALLEYVIEW(i915) || IS_CHERRYVIEW(i915))
-			err = vlv_drpc(m);
-		else if (MEDIA_VER(i915) >= 13)
+		if (GRAPHICS_VER_FULL(i915) >= IP_VER(12, 70))
 			err = mtl_drpc(m);
+		else if (IS_VALLEYVIEW(i915) || IS_CHERRYVIEW(i915))
+			err = vlv_drpc(m);
 		else if (GRAPHICS_VER(i915) >= 6)
 			err = gen6_drpc(m);
 		else
@@ -352,20 +331,6 @@ static int drpc_show(struct seq_file *m, void *unused)
 	return err;
 }
 DEFINE_INTEL_GT_DEBUGFS_ATTRIBUTE(drpc);
-
-static int gt_c6_residency_show(struct seq_file *m, void *unused)
-{
-	struct intel_gt *gt = m->private;
-	struct drm_i915_private *i915 = gt->i915;
-
-	if (GRAPHICS_VER(i915) < 12)
-		return -ENODEV;
-
-	seq_printf(m, "0x%llx\n", intel_rc6_rpm_unit_residency(&gt->rc6));
-
-	return 0;
-}
-DEFINE_SHOW_ATTRIBUTE(gt_c6_residency);
 
 void intel_gt_pm_frequency_dump(struct intel_gt *gt, struct drm_printer *p)
 {
@@ -427,10 +392,8 @@ void intel_gt_pm_frequency_dump(struct intel_gt *gt, struct drm_printer *p)
 		drm_puts(p, "no P-state info available\n");
 	}
 
-#if IS_ENABLED(CPTCFG_DRM_I915_DISPLAY)
-	drm_printf(p, "Current CD clock frequency: %d kHz\n", i915->cdclk.hw.cdclk);
-#endif
-	drm_printf(p, "Max CD clock frequency: %d kHz\n", i915->max_cdclk_freq);
+	drm_printf(p, "Current CD clock frequency: %d kHz\n", i915->display.cdclk.hw.cdclk);
+	drm_printf(p, "Max CD clock frequency: %d kHz\n", i915->display.cdclk.max_cdclk_freq);
 	drm_printf(p, "Max pixel clock frequency: %d kHz\n", i915->max_dotclk_freq);
 
 	intel_runtime_pm_put(uncore->rpm, wakeref);
@@ -575,7 +538,10 @@ static bool rps_eval(void *data)
 {
 	struct intel_gt *gt = data;
 
-	return HAS_RPS(gt->i915);
+	if (intel_guc_slpc_is_used(&gt->uc.guc))
+		return false;
+	else
+		return HAS_RPS(gt->i915);
 }
 
 DEFINE_INTEL_GT_DEBUGFS_ATTRIBUTE(rps_boost);
@@ -596,7 +562,11 @@ static int perf_limit_reasons_clear(void *data, u64 val)
 	struct intel_gt *gt = data;
 	intel_wakeref_t wakeref;
 
-	/* Clears the upper 16 bit ie log bits, as lower 16 bit ie status bits are read-only */
+	/*
+	 * Clear the upper 16 "log" bits, the lower 16 "status" bits are
+	 * read-only. The upper 16 "log" bits are identical to the lower 16
+	 * "status" bits except that the "log" bits remain set until cleared.
+	 */
 	with_intel_runtime_pm(gt->uncore->rpm, wakeref)
 		intel_uncore_rmw(gt->uncore, intel_gt_perf_limit_reasons_reg(gt),
 				 GT0_PERF_LIMIT_REASONS_LOG_MASK, 0);
@@ -604,8 +574,15 @@ static int perf_limit_reasons_clear(void *data, u64 val)
 	return 0;
 }
 
-DEFINE_I915_GT_SIMPLE_ATTRIBUTE(perf_limit_reasons_fops, perf_limit_reasons_get,
-				perf_limit_reasons_clear, "%llu\n");
+static bool perf_limit_reasons_eval(void *data)
+{
+	struct intel_gt *gt = data;
+
+	return i915_mmio_reg_valid(intel_gt_perf_limit_reasons_reg(gt));
+}
+
+DEFINE_SIMPLE_ATTRIBUTE(perf_limit_reasons_fops, perf_limit_reasons_get,
+			perf_limit_reasons_clear, "0x%llx\n");
 
 void intel_gt_pm_debugfs_register(struct intel_gt *gt, struct dentry *root)
 {
@@ -616,14 +593,11 @@ void intel_gt_pm_debugfs_register(struct intel_gt *gt, struct dentry *root)
 		{ "forcewake_user", &forcewake_user_fops, NULL},
 		{ "llc", &llc_fops, llc_eval },
 		{ "rps_boost", &rps_boost_fops, rps_eval },
-		{ "perf_limit_reasons", &perf_limit_reasons_fops, NULL },
+		{ "perf_limit_reasons", &perf_limit_reasons_fops, perf_limit_reasons_eval },
 	};
 
 	if (IS_SRIOV_VF(gt->i915))
 		return;
 
 	intel_gt_debugfs_register_files(root, files, ARRAY_SIZE(files), gt);
-
-	debugfs_create_file("gt_c6_residency", 0444, root,
-			    gt, &gt_c6_residency_fops);
 }

@@ -6,7 +6,6 @@
 #ifndef __ICL_DSI_REGS_H__
 #define __ICL_DSI_REGS_H__
 
-#if IS_ENABLED(CPTCFG_DRM_I915_DISPLAY)
 #include "intel_display_reg_defs.h"
 
 /* Gen11 DSI */
@@ -340,5 +339,4 @@
 #define  TA_TIMEOUT_VALUE_SHIFT		0
 #define  TA_TIMEOUT_VALUE(x)		((x) << 0)
 
-#endif /* CPTCFG_DRM_I915_DISPLAY */
 #endif /* __ICL_DSI_REGS_H__ */

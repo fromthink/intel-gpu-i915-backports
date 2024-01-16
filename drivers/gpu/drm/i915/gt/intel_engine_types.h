@@ -20,7 +20,6 @@
 #include "i915_gem.h"
 #include "i915_pmu.h"
 #include "i915_priolist_types.h"
-#include "i915_scheduler_types.h"
 #include "i915_selftest.h"
 #include "intel_sseu.h"
 #include "intel_timeline_types.h"
@@ -59,14 +58,12 @@ struct i915_perf_group;
 
 typedef u32 intel_engine_mask_t;
 #define ALL_ENGINES ((intel_engine_mask_t)~0ul)
-#define VIRTUAL_ENGINES  BIT(BITS_PER_TYPE(intel_engine_mask_t) - 1)
+#define VIRTUAL_ENGINES BIT(BITS_PER_TYPE(intel_engine_mask_t) - 1)
 
 struct intel_hw_status_page {
 	struct list_head timelines;
 	struct i915_vma *vma;
 	u32 *addr;
-
-	void (*sanitize)(struct intel_engine_cs *engine);
 };
 
 struct intel_instdone {
@@ -141,7 +138,6 @@ enum intel_engine_id {
 	CCS1,
 	CCS2,
 	CCS3,
-	CCS_MAX = CCS3,
 #define _CCS(n) (CCS0 + (n))
 	GSC0,
 	I915_NUM_ENGINES
@@ -294,16 +290,22 @@ struct intel_engine_execlists {
 	 */
 	u8 csb_head;
 
+	/* private: selftest */
 	I915_SELFTEST_DECLARE(struct st_preempt_hang preempt_hang;)
 };
 
-#define INTEL_ENGINE_CS_MAX_NAME 10
+#define INTEL_ENGINE_CS_MAX_NAME 8
 
 struct intel_engine_execlists_stats {
 	/**
 	 * @active: Number of contexts currently scheduled in.
 	 */
 	unsigned int active;
+
+	/**
+	 * @lock: Lock protecting the below fields.
+	 */
+	seqcount_t lock;
 
 	/**
 	 * @total: Total time this engine was busy.
@@ -343,7 +345,17 @@ struct intel_engine_guc_stats {
 	u64 start_gt_clk;
 };
 
-DECLARE_EWMA(irq_time, 3, 8);
+union intel_engine_tlb_inv_reg {
+	i915_reg_t	reg;
+	i915_mcr_reg_t	mcr_reg;
+};
+
+struct intel_engine_tlb_inv {
+	bool mcr;
+	union intel_engine_tlb_inv_reg reg;
+	u32 request;
+	u32 done;
+};
 
 struct intel_engine_cs {
 	struct drm_i915_private *i915;
@@ -369,15 +381,16 @@ struct intel_engine_cs {
 	u8 class;
 	u8 instance;
 
-	u8 ppgtt_size;
 	u8 irq_offset;
 
 	u16 uabi_class;
 	u16 uabi_instance;
 
-	u64 uabi_capabilities;
+	u32 uabi_capabilities;
 	u32 context_size;
 	u32 mmio_base;
+
+	struct intel_engine_tlb_inv tlb_inv;
 
 	/*
 	 * Some w/a require forcewake to be held (which prevents RC6) while
@@ -402,26 +415,32 @@ struct intel_engine_cs {
 
 	struct intel_context *hung_ce;
 
-	spinlock_t barrier_lock;
-	struct list_head barrier_tasks;
+	struct llist_head barrier_tasks;
 
 	struct intel_context *kernel_context; /* pinned */
+	struct intel_context *bind_context; /* pinned, only for BCS0 */
+	/* mark the bind context's availability status */
+	bool bind_context_ready;
+
+	/**
+	 * pinned_contexts_list: List of pinned contexts. This list is only
+	 * assumed to be manipulated during driver load- or unload time and
+	 * does therefore not have any additional protection.
+	 */
+	struct list_head pinned_contexts_list;
 
 	intel_engine_mask_t saturated; /* submitting semaphores too late? */
 
 	struct {
 		struct delayed_work work;
 		struct i915_request *systole;
-		unsigned long interrupts;
 		unsigned long blocked;
 	} heartbeat;
 
 	unsigned long serial;
 
 	unsigned long wakeref_serial;
-	intel_wakeref_t wakeref_track;
 	struct intel_wakeref wakeref;
-
 	struct file *default_state;
 
 	struct {
@@ -475,6 +494,7 @@ struct intel_engine_cs {
 	void		(*irq_disable)(struct intel_engine_cs *engine);
 	void		(*irq_handler)(struct intel_engine_cs *engine, u16 iir);
 
+	void		(*sanitize)(struct intel_engine_cs *engine);
 	int		(*resume)(struct intel_engine_cs *engine);
 
 	struct {
@@ -484,11 +504,6 @@ struct intel_engine_cs {
 		void (*cancel)(struct intel_engine_cs *engine);
 
 		void (*finish)(struct intel_engine_cs *engine);
-
-		struct work_struct notify_reset_failed;
-
-		/* count no of engine resets attempted */
-		atomic_t count;
 	} reset;
 
 	void		(*park)(struct intel_engine_cs *engine);
@@ -523,16 +538,14 @@ struct intel_engine_cs {
 	 * be irq safe.
 	 */
 	void		(*submit_request)(struct i915_request *rq);
-	void		(*remove_active_request)(struct i915_request *rq);
-
-	/*
-	 * Called on signaling of a SUBMIT_FENCE, passing along the signaling
-	 * request down to the bonded pairs.
-	 */
-	void            (*bond_execute)(struct i915_request *rq,
-					struct dma_fence *signal);
 
 	void		(*release)(struct intel_engine_cs *engine);
+
+	/*
+	 * Add / remove request from engine active tracking
+	 */
+	void		(*add_active_request)(struct i915_request *rq);
+	void		(*remove_active_request)(struct i915_request *rq);
 
 	/*
 	 * Get engine busyness and the time at which the busyness was sampled.
@@ -555,20 +568,17 @@ struct intel_engine_cs {
 
 #define I915_ENGINE_USING_CMD_PARSER BIT(0)
 #define I915_ENGINE_SUPPORTS_STATS   BIT(1)
-#define I915_ENGINE_HAS_SCHEDULER    BIT(2)
-#define I915_ENGINE_HAS_PREEMPTION   BIT(3)
-#define I915_ENGINE_HAS_SEMAPHORES   BIT(4)
-#define I915_ENGINE_HAS_TIMESLICES   BIT(5)
-#define I915_ENGINE_IS_VIRTUAL       BIT(6)
-#define I915_ENGINE_HAS_RELATIVE_MMIO BIT(7)
-#define I915_ENGINE_REQUIRES_CMD_PARSER BIT(8)
-#define I915_ENGINE_WANT_FORCED_PREEMPTION BIT(9)
-#define I915_ENGINE_HAS_RCS_REG_STATE  BIT(10)
-#define I915_ENGINE_HAS_EU_PRIORITY    BIT(11)
-#define I915_ENGINE_FIRST_RENDER_COMPUTE BIT(12)
-#define I915_ENGINE_USES_WA_HOLD_CCS_SWITCHOUT BIT(13)
-#define I915_ENGINE_HAS_EU_ATTENTION   BIT(14)
-#define I915_ENGINE_HAS_RUN_ALONE_MODE BIT(15)
+#define I915_ENGINE_HAS_PREEMPTION   BIT(2)
+#define I915_ENGINE_HAS_SEMAPHORES   BIT(3)
+#define I915_ENGINE_HAS_TIMESLICES   BIT(4)
+#define I915_ENGINE_IS_VIRTUAL       BIT(5)
+#define I915_ENGINE_HAS_RELATIVE_MMIO BIT(6)
+#define I915_ENGINE_REQUIRES_CMD_PARSER BIT(7)
+#define I915_ENGINE_WANT_FORCED_PREEMPTION BIT(8)
+#define I915_ENGINE_HAS_RCS_REG_STATE  BIT(9)
+#define I915_ENGINE_HAS_EU_PRIORITY    BIT(10)
+#define I915_ENGINE_FIRST_RENDER_COMPUTE BIT(11)
+#define I915_ENGINE_USES_WA_HOLD_SWITCHOUT BIT(12)
 	unsigned int flags;
 
 	/*
@@ -605,13 +615,6 @@ struct intel_engine_cs {
 		 * @rps: Utilisation at last RPS sampling.
 		 */
 		ktime_t rps;
-
-		struct intel_gt_stats_irq_time {
-			u64 total;
-			unsigned long count;
-			unsigned long max;
-			struct ewma_irq_time avg;
-		} irq;
 	} stats;
 
 	struct {
@@ -624,6 +627,12 @@ struct intel_engine_cs {
 
 	I915_SELFTEST_DECLARE(struct fault_attr reset_timeout);
 
+	/*
+	 * The perf group maps to one OA unit which controls one OA buffer. All
+	 * reports corresponding to this engine will be reported to this OA
+	 * buffer. An engine will map to a single OA unit, but a single OA unit
+	 * can generate reports for multiple engines.
+	 */
 	struct i915_perf_group *oa_group;
 };
 
@@ -643,12 +652,6 @@ static inline bool
 intel_engine_supports_stats(const struct intel_engine_cs *engine)
 {
 	return engine->flags & I915_ENGINE_SUPPORTS_STATS;
-}
-
-static inline bool
-intel_engine_has_scheduler(const struct intel_engine_cs *engine)
-{
-	return engine->flags & I915_ENGINE_HAS_SCHEDULER;
 }
 
 static inline bool
@@ -685,16 +688,12 @@ intel_engine_has_relative_mmio(const struct intel_engine_cs * const engine)
 }
 
 /* Wa_14014475959:dg2 */
+/* Wa_16019325821 */
+/* Wa_14019159160 */
 static inline bool
-intel_engine_uses_wa_hold_ccs_switchout(struct intel_engine_cs *engine)
+intel_engine_uses_wa_hold_switchout(struct intel_engine_cs *engine)
 {
-	return engine->flags & I915_ENGINE_USES_WA_HOLD_CCS_SWITCHOUT;
-}
-
-static inline bool
-intel_engine_has_eu_attention(const struct intel_engine_cs *engine)
-{
-	return engine->flags & I915_ENGINE_HAS_EU_ATTENTION;
+	return engine->flags & I915_ENGINE_USES_WA_HOLD_SWITCHOUT;
 }
 
 #endif /* __INTEL_ENGINE_TYPES_H__ */

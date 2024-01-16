@@ -13,7 +13,6 @@
 #include "intel_iov_event.h"
 #include "intel_iov_provisioning.h"
 #include "intel_iov_query.h"
-#include "intel_iov_relay.h"
 
 static bool eval_is_pf(void *data)
 {
@@ -84,106 +83,6 @@ static int vf_self_config_show(struct seq_file *m, void *data)
 }
 DEFINE_INTEL_GT_DEBUGFS_ATTRIBUTE(vf_self_config);
 
-#if IS_ENABLED(CPTCFG_DRM_I915_DEBUG_IOV)
-
-#define RELAY_MAX_LEN 60
-
-static ssize_t relay_to_vf_write(struct file *file, const char __user *user,
-				 size_t count, loff_t *ppos)
-{
-	struct intel_iov *iov = &((struct intel_gt *)file->private_data)->iov;
-	struct intel_runtime_pm *rpm = iov_to_gt(iov)->uncore->rpm;
-	intel_wakeref_t wakeref;
-	u32 message[1 + RELAY_MAX_LEN];	/* target + message */
-	u32 reply[RELAY_MAX_LEN];
-	int ret;
-
-	if (*ppos)
-		return 0;
-
-	ret = from_user_to_u32array(user, count, message, ARRAY_SIZE(message));
-	if (ret < 0)
-		return ret;
-
-	if (ret < 1 + GUC_HXG_MSG_MIN_LEN)
-		return -EINVAL;
-
-	if (message[0] == PFID)
-		return -EINVAL;
-
-	with_intel_runtime_pm(rpm, wakeref)
-		ret = intel_iov_relay_send_to_vf(&iov->relay, message[0],
-						 message + 1, ret - 1,
-						 reply, ARRAY_SIZE(reply));
-	if (ret < 0)
-		return ret;
-
-	return count;
-}
-
-DEFINE_I915_GT_RAW_ATTRIBUTE(relay_to_vf_fops, simple_open,
-			     NULL, NULL, relay_to_vf_write, default_llseek);
-
-static ssize_t relay_to_pf_write(struct file *file, const char __user *user,
-				 size_t count, loff_t *ppos)
-{
-	struct intel_iov *iov = &((struct intel_gt *)file->private_data)->iov;
-	struct intel_runtime_pm *rpm = iov_to_gt(iov)->uncore->rpm;
-	intel_wakeref_t wakeref;
-	u32 message[RELAY_MAX_LEN];
-	u32 reply[RELAY_MAX_LEN];
-	int ret;
-
-	if (*ppos)
-		return 0;
-
-	ret = from_user_to_u32array(user, count, message, ARRAY_SIZE(message));
-	if (ret < 0)
-		return ret;
-
-	if (ret < GUC_HXG_MSG_MIN_LEN)
-		return -EINVAL;
-
-	with_intel_runtime_pm(rpm, wakeref)
-		ret = intel_iov_relay_send_to_pf(&iov->relay, message, ret,
-						 reply, ARRAY_SIZE(reply));
-	if (ret < 0)
-		return ret;
-
-	return count;
-}
-
-DEFINE_I915_GT_RAW_ATTRIBUTE(relay_to_pf_fops, simple_open,
-			     NULL, NULL, relay_to_pf_write, default_llseek);
-
-static ssize_t relocate_ggtt_write(struct file *file, const char __user *user,
-				   size_t count, loff_t *ppos)
-{
-	struct intel_iov *iov = &((struct intel_gt *)file->private_data)->iov;
-	u32 vfid;
-	int ret;
-
-	if (*ppos)
-		return 0;
-
-	ret = kstrtou32_from_user(user, count, 0, &vfid);
-	if (ret < 0)
-		return ret;
-
-	if (!vfid || vfid > pf_get_totalvfs(iov))
-		return -EINVAL;
-
-	ret = intel_iov_provisioning_move_ggtt(iov, vfid);
-	if (ret < 0)
-		return ret;
-
-	return count;
-}
-
-DEFINE_I915_GT_RAW_ATTRIBUTE(relocate_ggtt_fops, simple_open,
-			     NULL, NULL, relocate_ggtt_write, default_llseek);
-#endif /* CPTCFG_DRM_I915_DEBUG_IOV */
-
 /**
  * intel_iov_debugfs_register - Register IOV specific entries in GT debugfs.
  * @iov: the IOV struct
@@ -200,11 +99,6 @@ void intel_iov_debugfs_register(struct intel_iov *iov, struct dentry *root)
 		{ "doorbells_provisioning", &dbs_provisioning_fops, eval_is_pf },
 		{ "adverse_events", &adverse_events_fops, eval_is_pf },
 		{ "self_config", &vf_self_config_fops, eval_is_vf },
-#if IS_ENABLED(CPTCFG_DRM_I915_DEBUG_IOV)
-		{ "relay_to_vf", &relay_to_vf_fops, eval_is_pf },
-		{ "relay_to_pf", &relay_to_pf_fops, eval_is_vf },
-		{ "relocate_ggtt", &relocate_ggtt_fops, eval_is_pf },
-#endif
 	};
 	struct dentry *dir;
 

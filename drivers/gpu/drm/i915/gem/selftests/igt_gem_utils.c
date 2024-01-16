@@ -97,7 +97,7 @@ igt_emit_store_dw(struct i915_vma *vma,
 		goto err;
 	}
 
-	err = i915_vma_pin(vma, 0, 0, PIN_USER | PIN_ZONE_48);
+	err = i915_vma_pin(vma, 0, 0, PIN_USER);
 	if (err)
 		goto err;
 
@@ -130,19 +130,11 @@ int igt_gpu_fill_dw(struct intel_context *ce,
 		goto err_batch;
 	}
 
-	i915_vma_lock(batch);
-	err = i915_request_await_object(rq, batch->obj, false);
-	if (err == 0)
-		err = i915_vma_move_to_active(batch, rq, 0);
-	i915_vma_unlock(batch);
+	err = igt_vma_move_to_active_unlocked(batch, rq, 0);
 	if (err)
 		goto skip_request;
 
-	i915_vma_lock(vma);
-	err = i915_request_await_object(rq, vma->obj, true);
-	if (err == 0)
-		err = i915_vma_move_to_active(vma, rq, EXEC_OBJECT_WRITE);
-	i915_vma_unlock(vma);
+	err = igt_vma_move_to_active_unlocked(vma, rq, EXEC_OBJECT_WRITE);
 	if (err)
 		goto skip_request;
 

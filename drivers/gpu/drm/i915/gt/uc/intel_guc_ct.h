@@ -70,7 +70,6 @@ struct intel_guc_ct {
 	} ctbs;
 
 	struct tasklet_struct receive_tasklet;
-	struct mutex send_mutex;
 
 	/** @wq: wait queue for g2h chanenl */
 	wait_queue_head_t wq;
@@ -95,16 +94,8 @@ struct intel_guc_ct {
 #endif
 	} requests;
 
-	I915_SELFTEST_DECLARE(int (*rcv_override)(struct intel_guc_ct *ct, const u32 *msg));
-
 	/** @stall_time: time of first time a CTB submission is stalled */
 	ktime_t stall_time;
-
-#if IS_ENABLED(CPTCFG_DRM_I915_DEBUG_GEM)
-	int dead_ct_reason;
-	bool dead_ct_reported;
-	struct work_struct dead_ct_worker;
-#endif
 
 	/* FIXME: MTL cache coherency issue - HSD 22016122933 */
 	struct {
@@ -118,6 +109,12 @@ struct intel_guc_ct {
 		 */
 		struct delayed_work work;
 	} mtl_workaround;
+
+#if IS_ENABLED(CPTCFG_DRM_I915_DEBUG_GUC)
+	int dead_ct_reason;
+	bool dead_ct_reported;
+	struct work_struct dead_ct_worker;
+#endif
 };
 
 void intel_guc_ct_init_early(struct intel_guc_ct *ct);

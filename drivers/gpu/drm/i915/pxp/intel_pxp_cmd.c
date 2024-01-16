@@ -3,15 +3,17 @@
  * Copyright(c) 2020, Intel Corporation. All rights reserved.
  */
 
-#include "intel_pxp.h"
-#include "intel_pxp_cmd.h"
-#include "intel_pxp_session.h"
 #include "gt/intel_context.h"
 #include "gt/intel_engine_pm.h"
 #include "gt/intel_gpu_commands.h"
 #include "gt/intel_ring.h"
 
 #include "i915_trace.h"
+
+#include "intel_pxp.h"
+#include "intel_pxp_cmd.h"
+#include "intel_pxp_session.h"
+#include "intel_pxp_types.h"
 
 /* stall until prior PXP and MFX/HCP/HUC objects are cmopleted */
 #define MFX_WAIT_PXP (MFX_WAIT | \
@@ -80,22 +82,24 @@ static u32 *pxp_emit_wait(u32 *cs)
 
 static void pxp_request_commit(struct i915_request *rq)
 {
+	struct i915_sched_attr attr = { .priority = I915_PRIORITY_MAX };
 	struct intel_timeline * const tl = i915_request_timeline(rq);
 
 	lockdep_unpin_lock(&tl->mutex, rq->cookie);
 
 	trace_i915_request_add(rq);
 	__i915_request_commit(rq);
-	__i915_request_queue(rq, I915_PRIORITY_MAX);
+	__i915_request_queue(rq, &attr);
 
 	mutex_unlock(&tl->mutex);
 }
 
-int intel_pxp_terminate_session(struct intel_pxp *pxp, u32 id)
+int intel_pxp_terminate_sessions(struct intel_pxp *pxp, long mask)
 {
 	struct i915_request *rq;
 	struct intel_context *ce = pxp->ce;
 	u32 *cs;
+	int idx;
 	int err = 0;
 
 	if (!intel_pxp_is_enabled(pxp))
@@ -111,13 +115,14 @@ int intel_pxp_terminate_session(struct intel_pxp *pxp, u32 id)
 			goto out_rq;
 	}
 
-	cs = intel_ring_begin(rq, SESSION_TERMINATION_LEN(1) + WAIT_LEN);
+	cs = intel_ring_begin(rq, SESSION_TERMINATION_LEN(hweight32(mask)) + WAIT_LEN);
 	if (IS_ERR(cs)) {
 		err = PTR_ERR(cs);
 		goto out_rq;
 	}
 
-	cs = pxp_emit_session_termination(cs, id);
+	for_each_set_bit(idx, &mask, INTEL_PXP_MAX_HWDRM_SESSIONS)
+		cs = pxp_emit_session_termination(cs, idx);
 	cs = pxp_emit_wait(cs);
 
 	intel_ring_advance(rq, cs);

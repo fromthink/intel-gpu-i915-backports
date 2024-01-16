@@ -43,11 +43,14 @@ bool i915_sriov_pf_is_auto_provisioning_enabled(struct drm_i915_private *i915);
 int i915_sriov_pf_set_auto_provisioning(struct drm_i915_private *i915, bool enable);
 
 int i915_sriov_suspend_prepare(struct drm_i915_private *i915);
-int i915_sriov_suspend_late(struct drm_i915_private *i915);
-int i915_sriov_resume_early(struct drm_i915_private *i915);
 int i915_sriov_resume(struct drm_i915_private *i915);
 
-/* VF only */
-void i915_sriov_vf_start_migration_recovery(struct drm_i915_private *i915);
+#if IS_ENABLED(CPTCFG_DRM_I915_DEBUG)
+void assert_graphics_ip_ver_ready(const struct drm_i915_private *i915);
+void assert_media_ip_ver_ready(const struct drm_i915_private *i915);
+#else
+static inline void assert_graphics_ip_ver_ready(const struct drm_i915_private *i915) { }
+static inline void assert_media_ip_ver_ready(const struct drm_i915_private *i915) { }
+#endif
 
 #endif /* __I915_SRIOV_H__ */

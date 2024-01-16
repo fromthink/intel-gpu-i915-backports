@@ -29,6 +29,18 @@
 #include "i915_params.h"
 #include "i915_drv.h"
 
+DECLARE_DYNDBG_CLASSMAP(drm_debug_classes, DD_CLASS_TYPE_DISJOINT_BITS, 0,
+			"DRM_UT_CORE",
+			"DRM_UT_DRIVER",
+			"DRM_UT_KMS",
+			"DRM_UT_PRIME",
+			"DRM_UT_ATOMIC",
+			"DRM_UT_VBL",
+			"DRM_UT_STATE",
+			"DRM_UT_LEASE",
+			"DRM_UT_DP",
+			"DRM_UT_DRMRES");
+
 #define i915_param_named(name, T, perm, desc) \
 	module_param_named(name, i915_modparams.name, T, perm); \
 	MODULE_PARM_DESC(name, desc)
@@ -55,18 +67,18 @@ i915_param_named(modeset, int, 0400,
 	"Use kernel modesetting [KMS] (0=disable, "
 	"1=on, -1=force vga console preference [default])");
 
-i915_param_named_unsafe(force_pch, int, 0400,
-	"Force PCH type on boot (-1=auto detected by PCI ID, "
-	"0=PCH_NONE, see enum intel_pch for additional values)");
-
 i915_param_named_unsafe(enable_dc, int, 0400,
 	"Enable power-saving display C-states. "
 	"(-1=auto [default]; 0=disable; 1=up to DC5; 2=up to DC6; "
 	"3=up to DC5 with DC3CO; 4=up to DC6 with DC3CO)");
 
 i915_param_named_unsafe(enable_fbc, int, 0400,
-	"Enable frame buffer compression for power savings "
+	"Enable frame buffer compression for power savings; "
 	"(default: -1 (use per-chip default))");
+
+i915_param_named_unsafe(enable_rc6, bool, 0400,
+	"Enable power-saving render C-state 6; "
+	"(default: true)");
 
 i915_param_named_unsafe(lvds_channel_mode, int, 0400,
 	 "Specify LVDS channel mode "
@@ -82,9 +94,6 @@ i915_param_named_unsafe(vbt_sdvo_panel_type, int, 0400,
 
 i915_param_named_unsafe(reset, uint, 0400,
 	"Attempt GPU resets (0=disabled, 1=full gpu reset, 2=engine reset [default])");
-
-i915_param_named_unsafe(allow_non_persist_without_reset, bool, 0400,
-	"Allow non-persistent contexts even if reset is disabled (default: false)");
 
 i915_param_named_unsafe(vbt_firmware, charp, 0400,
 	"Load VBT from specified file under /lib/firmware");
@@ -116,18 +125,21 @@ i915_param_named_unsafe(enable_psr2_sel_fetch, bool, 0400,
 	"(0=disabled, 1=enabled) "
 	"Default: 0");
 
-i915_param_named_unsafe(force_probe, charp, 0400,
-	"Force probe the driver for specified devices. "
-	"See CPTCFG_DRM_I915_FORCE_PROBE for details.");
+i915_param_named_unsafe(enable_sagv, bool, 0600,
+	"Enable system agent voltage/frequency scaling (SAGV) (default: true)");
 
-i915_param_named_unsafe(enable_secure_batch, bool, 0400,
-	"Enable for legacy tests I915_EXEC_SECURE. (default: 0)");
+i915_param_named_unsafe(force_probe, charp, 0400,
+	"Force probe options for specified supported devices. "
+	"See CPTCFG_DRM_I915_FORCE_PROBE for details.");
 
 i915_param_named_unsafe(disable_power_well, int, 0400,
 	"Disable display power wells when possible "
 	"(-1=auto [default], 0=power wells always on, 1=power wells disabled when possible)");
 
 i915_param_named_unsafe(enable_ips, int, 0400, "Enable IPS (default: true)");
+
+i915_param_named_unsafe(enable_dpt, bool, 0400,
+	"Enable display page table (DPT) (default: true)");
 
 i915_param_named(fastboot, int, 0400,
 	"Try to skip unnecessary mode sets at boot time "
@@ -145,7 +157,8 @@ i915_param_named_unsafe(force_reset_modeset_test, bool, 0400,
 i915_param_named_unsafe(invert_brightness, int, 0400,
 	"Invert backlight brightness "
 	"(-1 force normal, 0 machine defaults, 1 force inversion), please "
-	"contact your Intel support representative, if your machine needs it. "
+	"report PCI device ID, subsystem vendor and subsystem device ID "
+	"to dri-devel@lists.freedesktop.org, if your machine needs it. "
 	"It will then be included in an upcoming module version.");
 
 i915_param_named(disable_display, bool, 0400,
@@ -176,9 +189,6 @@ i915_param_named_unsafe(enable_guc, int, 0400,
 	"Required functionality can be selected using bitmask values. "
 	"(-1=auto [default], 0=disable, 1=GuC submission, 2=HuC load)");
 
-i915_param_named_unsafe(guc_feature_flags, uint, 0400,
-	"GuC feature flags. Requires GuC to be loaded. (0=none [default])");
-
 i915_param_named(guc_log_level, int, 0400,
 	"GuC firmware logging level. Requires GuC to be loaded. "
 	"(-1=auto [default], 0=disable, 1..4=enable with verbosity min..max)");
@@ -195,9 +205,6 @@ i915_param_named(guc_log_size_capture, int, 0400,
 	"GuC error capture register dump buffer size (in MB)"
 	"(-1=auto [default], NB: max = 4, other restrictions apply)");
 
-i915_param_named(timeout_multiplier, int, 0600,
-	"Timeout multiplier for debug");
-
 i915_param_named_unsafe(guc_firmware_path, charp, 0400,
 	"GuC firmware path to use instead of the default one");
 
@@ -210,209 +217,81 @@ i915_param_named_unsafe(dmc_firmware_path, charp, 0400,
 i915_param_named_unsafe(gsc_firmware_path, charp, 0400,
 	"GSC firmware path to use instead of the default one");
 
-#if IS_ENABLED(CPTCFG_DRM_I915_DEBUG_MOCS)
-i915_param_named_unsafe(mocs_table_path, charp, 0400,
-			"Load customised mocs table from /lib/firmware instead of built-in.");
-#endif
-
 i915_param_named_unsafe(enable_dp_mst, bool, 0400,
 	"Enable multi-stream transport (MST) for new DisplayPort sinks. (default: true)");
 
 #if IS_ENABLED(CPTCFG_DRM_I915_DEBUG)
-i915_param_named_unsafe(inject_probe_failure, int, 0400,
+i915_param_named_unsafe(inject_probe_failure, uint, 0400,
 	"Force an error after a number of failure check points (0:disabled (default), N:force failure at the Nth failure check point)");
-#endif
-
-#if IS_ENABLED(CPTCFG_DRM_I915_DEBUG)
-i915_param_named_unsafe(ppgtt_size, uint, 0400,
-			"Force an ppgtt_size to be n bits wide (0:disabled (default))");
 #endif
 
 i915_param_named(enable_dpcd_backlight, int, 0400,
 	"Enable support for DPCD backlight control"
 	"(-1=use per-VBT LFP backlight type setting [default], 0=disabled, 1=enable, 2=force VESA interface, 3=force Intel interface)");
 
-i915_param_named_unsafe(enable_rc6, bool, 0400,
-	"Enable power-saving render C-state 6. (default: true)");
-i915_param_named_unsafe(rc6_ignore_steppings, bool, 0400,
-	"Allow RC6 to be enabled on steppings where it would be disabled. (default: false)");
-
-#if IS_ENABLED(CPTCFG_DRM_I915_CHICKEN_SOFT_PG)
-i915_param_named_unsafe(enable_softpg, bool, 0400,
-	"Enable software controlled power-gating. (default: false)");
-#endif
-
-i915_param_named_unsafe(enable_rps, bool, 0400,
-	"Enable host/guc based turbo/rps feature. (default: true)");
-
-i915_param_named_unsafe(force_host_pm, bool, 0400,
-	"Force host control of turbo and rc6 features. (default: false)");
-
-i915_param_named_unsafe(enable_pagefault, bool, 0600,
-	"Enable device page fault. (default: false)");
-
-i915_param_named_unsafe(engine_mocs_uncacheable, bool, 0600,
-	"Mark engines uncacheable. (default: false)");
-
-i915_param_named(enable_force_miss_ftlb, bool, 0600,
-		 "Only applies to PVC. Force first level tlb misses (default: true)");
-
-i915_param_named_unsafe(dump_ppgtt, bool, 0600,
-	"Dump the PPGTT table contents during submissions (default: false)");
-
-i915_param_named_unsafe(enable_compute_engines, bool, 0400,
-	"Enable Compute engine support (default: true)");
-
-i915_param_named(ctx_run_alone, bool, 0600,
-	"Set run alone mode for all lrcs submitted to RCS or CCS");
-
 #if IS_ENABLED(CPTCFG_DRM_I915_GVT)
 i915_param_named(enable_gvt, bool, 0400,
 	"Enable support for Intel GVT-g graphics virtualization host support(default:false)");
 #endif
 
+#if CPTCFG_DRM_I915_REQUEST_TIMEOUT
+i915_param_named_unsafe(request_timeout_ms, uint, 0600,
+			"Default request/fence/batch buffer expiration timeout.");
+#endif
+
 i915_param_named_unsafe(lmem_size, uint, 0400,
 			"Set the lmem size(in MiB) for each region. (default: 0, all memory)");
+i915_param_named_unsafe(lmem_bar_size, uint, 0400,
+			"Set the lmem bar size(in MiB).");
 
 i915_param_named(max_vfs, uint, 0400,
 	"Limit number of virtual functions to allocate. "
 	"(0 = no VFs [default]; N = allow up to N VFs)");
 
-#if IS_ENABLED(CPTCFG_DRM_I915_DEBUG_IOV)
-i915_param_named_unsafe(vfs_flr_mask, ulong, 0600,
-	"Bitmask to enable (1) or disable (0) cleaning by PF VF's resources "
-	"(GGTT and LMEM) after FLR (default: ~0 - cleaning enable for all VFs) "
-	"Bit number indicates VF number, e.g. bit 1 indicates VF1");
-#endif
+i915_param_named(enable_mtl_rcs_ccs_wa, bool, 0400,
+	"Enable the RCS/CCS switchout hold workaround for MTL (only some workloads are affected by issue and w/a has a performance penalty) (default:false)");
 
-i915_param_named_unsafe(debug_eu, int, 0400,
-	"Enable EU debug capabilities (default: 0)");
+i915_param_named(force_disable_ccs, int, 0400,
+	"Force to disable CCS engine. "
+	"(0 = fallback to default [default]; 1 = disable CCS)");
 
-i915_param_named_unsafe(debugger_timeout_ms, uint, 0400,
-	"Setup debugger disconnect timeout in milliseconds (default: 3000, 0 never)");
-
-i915_param_named_unsafe(debugger_log_level, int, 0600,
-	"EU debugger log level (-1 = default, 0=none, 1=err, 2=warn, 3=info, 4=verbose)");
-
-i915_param_named_unsafe(guc_log_destination, uint, 0400,
-	"Set the destination for GuC log buffers (0=memory [default], 1=NPK, 2=memory+NPK)");
-
-i915_param_named_unsafe(ring_mask, uint, 0400,
-	"Mask of engine rings to enable. (default: all supported engines)");
-
-i915_param_named_unsafe(enable_hw_throttle_blt, bool, 0400,
-	"Enable hardware throttling BLT on XEHPSDV A0. (default: yes)");
-
-i915_param_named_unsafe(enable_fake_int_wa, bool, 0400,
-			"Enable fake interrupts via polling timer w/a for multi-tile platforms. (default: true)");
-
-#if IS_ENABLED(CPTCFG_DRM_I915_DEBUG_CONTIGUOUS)
-i915_param_named_unsafe(force_alloc_contig, int, 0400,
-	"Force allocation of LMEM and SMEM objects from physically contiguous pages. "
-	"0=disabled [default], 1=SMEM only, 2=LMEM only, 3=both");
-#endif
-
-i915_param_named_unsafe(prelim_override_p2p_dist, uint, 0400,
-			"Flags to determine P2P behavior: "
-			"Use kernel configured behavior (default: 0), "
-			"Override distance check (1), "
-			"Fabric path only (2)");
-
-i915_param_named_unsafe(page_sz_mask, uint, 0600,
-			"mask to force the huge page sizes\n"
-			"bit0 4K page, bit1 64K page bit2 2M page, bit3 1G page size");
-
-i915_param_named_unsafe(debug_pages, uint, 0400,
-			"Extra pages allocated for debug (default=0, Bit 31 indicates LMEM)");
-
-i915_param_named_unsafe(enable_mem_fence, bool, 0400,
-			"Set this true to enable MEM_FENCE workaround (default: false");
-
-i915_param_named_unsafe(force_driver_flr, int, 0400,
-			"Set this to enforce doing or skipping a driver-FLR at MMIO init and fini"
-			"-1=driver decides[default], 0=skip driver flr, 1=trigger driver flr");
-
-i915_param_named_unsafe(disable_bo_chunking, bool, 0600,
-	"Disable buffer object chunking feature (default: false)");
-
-i915_param_named_unsafe(enable_full_ps64, bool, 0400,
-			"enable full PS64 support (PVC+) (default: true)");
-
-i915_param_named_unsafe(enable_resizeable_bar, bool, 0400,
-			"enable resizeable bar support (default: true)");
-
-/*
- * This module parameter is needed because SRIOV PF and IAF are mutually
- * exclusive (see HSDES #14014623804).  Until this is fixed, the driver
- * needs to be able to enable/disable the IAF infrastructure (specifically
- * Device Physical Addressing).  Since there will be no enable/disable for the
- * SRIOV PF path, this parameter is needed to explicitly disable IAF when
- * SRIOV PF is required.
- */
-i915_param_named(enable_iaf, bool, 0400, "Enable IAF feature (default: true)");
-
-#if IS_ENABLED(CPTCFG_DRM_I915_ATS)
-i915_param_named_unsafe(address_translation_services, bool, 0400,
-			"Enable Address Translation Services (ATS) (default: false)");
-#endif
-
-i915_param_named_unsafe(max_tiles, uint, 0400,
-			"Max number of tiles to be initialized (default=4)");
-
-i915_param_named_unsafe(enable_compression, uint, 0400,
-			"enable compression for devices which support it");
-
-i915_param_named_unsafe(enable_gsc, bool, 0400,
-			"Enable or disable gsc (default: true");
-
-i915_param_named_unsafe(enable_pcode_handshake, bool, 0400,
-			"Enable or disable pcode handshake support (default: true");
-
-i915_param_named_unsafe(enable_256B, bool, 0400,
-			"Set this false to disable 256B access via chicken bit");
-
-i915_param_named_unsafe(enable_gt_reset, bool, 0400,
-			"Set this false to force per engine reset");
-
-/*
- * All user PTE will point to a valid page (to avoid triggering
- * GPU pagefaults), when user space has not enabled pagefault on a VM.
- * When there is no backing store defined by the user for
- * the virtual address, the PTE will instead be redirected to a per-ppGTT
- * scratch page. By default, the contents of that page will be zero, but
- * with poison_scratch enabled the contents of that page will be a random
- * 32b value (most significant byte 0x6b for recognisability). By using a
- * unique value for the scratch contents, it is easier to detect when
- * debugging, but may change results if the scratch value is inadvertently
- * used.
- */
-
-i915_param_named_unsafe(poison_scratch, bool, 0400,
-			"Set this true to poison scratch page (default: false)");
-
-i915_param_named_unsafe(enable_spi, bool, 0400,
-			"Set this false to prevent i915.spi driver load");
-
-static __always_inline void _print_param(struct drm_printer *p,
-					 const char *name,
-					 const char *type,
-					 const void *x)
+static void _param_print_bool(struct drm_printer *p, const char *name,
+			      bool val)
 {
-	if (!__builtin_strcmp(type, "bool"))
-		drm_printf(p, "i915.%s=%s\n", name,
-			   str_yes_no(*(const bool *)x));
-	else if (!__builtin_strcmp(type, "int"))
-		drm_printf(p, "i915.%s=%d\n", name, *(const int *)x);
-	else if (!__builtin_strcmp(type, "unsigned int"))
-		drm_printf(p, "i915.%s=%u\n", name, *(const unsigned int *)x);
-	else if (!__builtin_strcmp(type, "unsigned long"))
-		drm_printf(p, "i915.%s=%lu\n", name, *(const unsigned long *)x);
-	else if (!__builtin_strcmp(type, "char *"))
-		drm_printf(p, "i915.%s=%s\n", name, *(const char **)x);
-	else
-		WARN_ONCE(1, "no printer defined for param type %s (i915.%s)\n",
-			  type, name);
+	drm_printf(p, "i915.%s=%s\n", name, str_yes_no(val));
 }
+
+static void _param_print_int(struct drm_printer *p, const char *name,
+			     int val)
+{
+	drm_printf(p, "i915.%s=%d\n", name, val);
+}
+
+static void _param_print_uint(struct drm_printer *p, const char *name,
+			      unsigned int val)
+{
+	drm_printf(p, "i915.%s=%u\n", name, val);
+}
+
+static void _param_print_ulong(struct drm_printer *p, const char *name,
+			       unsigned long val)
+{
+	drm_printf(p, "i915.%s=%lu\n", name, val);
+}
+
+static void _param_print_charp(struct drm_printer *p, const char *name,
+			       const char *val)
+{
+	drm_printf(p, "i915.%s=%s\n", name, val);
+}
+
+#define _param_print(p, name, val)				\
+	_Generic(val,						\
+		 bool: _param_print_bool,			\
+		 int: _param_print_int,				\
+		 unsigned int: _param_print_uint,		\
+		 unsigned long: _param_print_ulong,		\
+		 char *: _param_print_charp)(p, name, val)
 
 /**
  * i915_params_dump - dump i915 modparams
@@ -423,37 +302,48 @@ static __always_inline void _print_param(struct drm_printer *p,
  */
 void i915_params_dump(const struct i915_params *params, struct drm_printer *p)
 {
-#define PRINT(T, x, ...) _print_param(p, #x, #T, &params->x);
+#define PRINT(T, x, ...) _param_print(p, #x, params->x);
 	I915_PARAMS_FOR_EACH(PRINT);
 #undef PRINT
 }
 
-static __always_inline void dup_param(const char *type, void *x)
+static void _param_dup_charp(char **valp)
 {
-	if (!__builtin_strcmp(type, "char *"))
-		*(void **)x = kstrdup(*(void **)x, GFP_ATOMIC);
+	*valp = kstrdup(*valp, GFP_ATOMIC);
 }
+
+static void _param_nop(void *valp)
+{
+}
+
+#define _param_dup(valp)				\
+	_Generic(valp,					\
+		 char **: _param_dup_charp,		\
+		 default: _param_nop)(valp)
 
 void i915_params_copy(struct i915_params *dest, const struct i915_params *src)
 {
 	*dest = *src;
-#define DUP(T, x, ...) dup_param(#T, &dest->x);
+#define DUP(T, x, ...) _param_dup(&dest->x);
 	I915_PARAMS_FOR_EACH(DUP);
 #undef DUP
 }
 
-static __always_inline void free_param(const char *type, void *x)
+static void _param_free_charp(char **valp)
 {
-	if (!__builtin_strcmp(type, "char *")) {
-		kfree(*(void **)x);
-		*(void **)x = NULL;
-	}
+	kfree(*valp);
+	*valp = NULL;
 }
+
+#define _param_free(valp)				\
+	_Generic(valp,					\
+		 char **: _param_free_charp,		\
+		 default: _param_nop)(valp)
 
 /* free the allocated members, *not* the passed in params itself */
 void i915_params_free(struct i915_params *params)
 {
-#define FREE(T, x, ...) free_param(#T, &params->x);
+#define FREE(T, x, ...) _param_free(&params->x);
 	I915_PARAMS_FOR_EACH(FREE);
 #undef FREE
 }

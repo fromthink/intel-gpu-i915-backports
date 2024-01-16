@@ -12,9 +12,8 @@
 #include "gt/intel_engine_types.h"
 
 #include "abi/guc_actions_abi.h"
-#include "abi/guc_actions_slpc_abi.h"
-#include "abi/guc_actions_privileged_abi.h"
 #include "abi/guc_actions_pf_abi.h"
+#include "abi/guc_actions_slpc_abi.h"
 #include "abi/guc_actions_vf_abi.h"
 #include "abi/guc_errors_abi.h"
 #include "abi/guc_communication_mmio_abi.h"
@@ -43,7 +42,6 @@ static inline const char *hxg_type_to_string(u32 type)
 }
 
 /* Payload length only i.e. don't include G2H header length */
-#define G2H_LEN_DW_SCHED_ENGINE_MODE_SET	2
 #define G2H_LEN_DW_SCHED_CONTEXT_MODE_SET	2
 #define G2H_LEN_DW_DEREGISTER_CONTEXT		1
 #define G2H_LEN_DW_INVALIDATE_TLB		1
@@ -120,17 +118,17 @@ static inline const char *hxg_type_to_string(u32 type)
 #define   GUC_WA_GAM_CREDITS		BIT(10)
 #define   GUC_WA_DUAL_QUEUE		BIT(11)
 #define   GUC_WA_RCS_RESET_BEFORE_RC6	BIT(13)
-#define   GUC_WA_CONTEXT_ISOLATION	BIT(15)
 #define   GUC_WA_PRE_PARSER		BIT(14)
+#define   GUC_WA_CONTEXT_ISOLATION	BIT(15)
+#define   GUC_WA_RCS_CCS_SWITCHOUT	BIT(16)
 #define   GUC_WA_HOLD_CCS_SWITCHOUT	BIT(17)
 #define   GUC_WA_POLLCS			BIT(18)
-#define   GUC_WA_RENDER_RST_RC6_EXIT	BIT(19)
 #define   GUC_WA_RCS_REGS_IN_CCS_REGS_LIST	BIT(21)
 #define   GUC_WA_ENABLE_TSC_CHECK_ON_RC6	BIT(22)
+#define   GUC_WA_DISABLE_GSC_RESET_IN_VF	BIT(23)
 
 #define GUC_CTL_FEATURE			2
 #define   GUC_CTL_ENABLE_SLPC		BIT(2)
-#define   GUC_CTL_ENABLE_RESET_ON_CAT	BIT(8)
 #define   GUC_CTL_DISABLE_SCHEDULER	BIT(14)
 
 #define GUC_CTL_DEBUG			3
@@ -143,9 +141,6 @@ static inline const char *hxg_type_to_string(u32 type)
 #define	  GUC_LOG_VERBOSITY_MIN		0
 #define	  GUC_LOG_VERBOSITY_MAX		3
 #define	  GUC_LOG_VERBOSITY_MASK	0x0000000f
-#define	  GUC_LOG_DESTINATION_MEM		0
-#define	  GUC_LOG_DESTINATION_NPK		1
-#define	  GUC_LOG_DESTINATION_MEM_AND_NPK	2
 #define	  GUC_LOG_DESTINATION_MASK	(3 << 4)
 #define   GUC_LOG_DISABLED		(1 << 6)
 #define   GUC_PROFILE_ENABLED		(1 << 7)
@@ -336,51 +331,6 @@ struct guc_update_scheduling_policy {
 	u32 data[MAX_SCHEDULING_POLICY_SIZE];
 } __packed;
 
-/* Page fault structures */
-
-struct access_counter_desc {
-	u32 dw0;
-#define ACCESS_COUNTER_TYPE	BIT(0)
-#define ACCESS_COUNTER_SUBG_LO	GENMASK(31, 1)
-
-	u32 dw1;
-#define ACCESS_COUNTER_SUBG_HI	BIT(0)
-#define ACCESS_COUNTER_RSVD0	GENMASK(2, 1)
-#define ACCESS_COUNTER_ENG_INSTANCE	GENMASK(8, 3)
-#define ACCESS_COUNTER_ENG_CLASS	GENMASK(11, 9)
-#define ACCESS_COUNTER_ASID	GENMASK(31, 12)
-
-	u32 dw2;
-#define ACCESS_COUNTER_VFID	GENMASK(5, 0)
-#define ACCESS_COUNTER_RSVD1	GENMASK(7, 6)
-#define ACCESS_COUNTER_GRANULARITY	GENMASK(10, 8)
-#define ACCESS_COUNTER_RSVD2	GENMASK(16, 11)
-#define ACCESS_COUNTER_VIRTUAL_ADDR_RANGE_LO	GENMASK(31, 17)
-
-	u32 dw3;
-#define ACCESS_COUNTER_VIRTUAL_ADDR_RANGE_HI	GENMASK(31, 0)
-} __packed;
-
-enum guc_um_queue_type {
-	GUC_UM_HW_QUEUE_PAGE_FAULT = 0,
-	GUC_UM_HW_QUEUE_PAGE_FAULT_RESPONSE,
-	GUC_UM_HW_QUEUE_ACCESS_COUNTER,
-	GUC_UM_HW_QUEUE_MAX
-};
-
-struct guc_um_queue_params {
-	u64 base_dpa;
-	u32 base_ggtt_address;
-	u32 size_in_bytes;
-	u32 rsvd[4];
-} __packed;
-
-struct guc_um_init_params {
-	u64 page_response_timeout_in_us;
-	u32 rsvd[6];
-	struct guc_um_queue_params queue_params[GUC_UM_HW_QUEUE_MAX];
-} __packed;
-
 #define GUC_POWER_UNSPECIFIED	0
 #define GUC_POWER_D0		1
 #define GUC_POWER_D1		2
@@ -500,11 +450,14 @@ struct guc_ads {
 	u32 golden_context_lrca[GUC_MAX_ENGINE_CLASSES];
 	u32 eng_state_size[GUC_MAX_ENGINE_CLASSES];
 	u32 private_data;
-	u32 um_init_data;
+	u32 reserved2;
 	u32 capture_instance[GUC_CAPTURE_LIST_INDEX_MAX][GUC_MAX_ENGINE_CLASSES];
 	u32 capture_class[GUC_CAPTURE_LIST_INDEX_MAX][GUC_MAX_ENGINE_CLASSES];
 	u32 capture_global[GUC_CAPTURE_LIST_INDEX_MAX];
-	u32 reserved[14];
+	u32 wa_klv_addr_lo;
+	u32 wa_klv_addr_hi;
+	u32 wa_klv_size;
+	u32 reserved[11];
 } __packed;
 
 /* Engine usage stats */
@@ -568,78 +521,10 @@ struct guc_log_buffer_state {
 	u32 version;
 } __packed;
 
-enum intel_guc_fault_reply_type {
-	PAGE_FAULT_REPLY_ACCESS = 0,
-	PAGE_FAULT_REPLY_ENGINE,
-	PAGE_FAULT_REPLY_VFID,
-	PAGE_FAULT_REPLY_ALL,
-	PAGE_FAULT_REPLY_INVALID
-};
-
-enum intel_guc_response_desc_type {
-	TLB_INVALIDATION_DESC = 0,
-	FAULT_RESPONSE_DESC
-};
-
-struct intel_guc_pagefault_desc {
-	u32 dw0;
-#define PAGE_FAULT_DESC_FAULT_LEVEL	GENMASK(2, 0)
-#define PAGE_FAULT_DESC_SRC_ID		GENMASK(10, 3)
-#define PAGE_FAULT_DESC_RSVD_0		GENMASK(18, 11)
-#define PAGE_FAULT_DESC_ENG_INSTANCE	GENMASK(24, 19)
-#define PAGE_FAULT_DESC_ENG_CLASS	GENMASK(27, 25)
-#define PAGE_FAULT_DESC_PDATA_LO	GENMASK(31, 28)
-
-	u32 dw1;
-#define PAGE_FAULT_DESC_PDATA_HI	GENMASK(11, 0)
-#define PAGE_FAULT_DESC_PDATA_HI_SHIFT	4
-#define PAGE_FAULT_DESC_ASID		GENMASK(31, 12)
-
-	u32 dw2;
-#define PAGE_FAULT_DESC_ACCESS_TYPE	GENMASK(1, 0)
-#define PAGE_FAULT_DESC_FAULT_TYPE	GENMASK(3, 2)
-#define PAGE_FAULT_DESC_VFID		GENMASK(9, 4)
-#define PAGE_FAULT_DESC_RSVD_1		GENMASK(11, 10)
-#define PAGE_FAULT_DESC_VIRTUAL_ADDR_LO	GENMASK(31, 12)
-#define PAGE_FAULT_DESC_VIRTUAL_ADDR_LO_SHIFT 12
-
-	u32 dw3;
-#define PAGE_FAULT_DESC_VIRTUAL_ADDR_HI	GENMASK(31, 0)
-#define PAGE_FAULT_DESC_VIRTUAL_ADDR_HI_SHIFT 32
-} __packed;
-
-struct intel_guc_pagefault_reply {
-	u32 dw0;
-#define PAGE_FAULT_REPLY_VALID		BIT(0)
-#define PAGE_FAULT_REPLY_SUCCESS	BIT(1)
-#define PAGE_FAULT_REPLY_REPLY		GENMASK(4, 2)
-#define PAGE_FAULT_REPLY_RSVD_0		GENMASK(9, 5)
-#define PAGE_FAULT_REPLY_DESC_TYPE	GENMASK(11, 10)
-#define PAGE_FAULT_REPLY_ASID		GENMASK(31, 12)
-
-	u32 dw1;
-#define PAGE_FAULT_REPLY_VFID		GENMASK(5, 0)
-#define PAGE_FAULT_REPLY_RSVD_1		BIT(6)
-#define PAGE_FAULT_REPLY_ENG_INSTANCE	GENMASK(12, 7)
-#define PAGE_FAULT_REPLY_ENG_CLASS	GENMASK(15, 13)
-#define PAGE_FAULT_REPLY_PDATA		GENMASK(31, 16)
-
-	u32 dw2;
-#define PAGE_FAULT_REPLY_RSVD_2		GENMASK(31, 0)
-} __packed;
-
 /* This action will be programmed in C1BC - SOFT_SCRATCH_15_REG */
 enum intel_guc_recv_message {
 	INTEL_GUC_RECV_MSG_CRASH_DUMP_POSTED = BIT(1),
 	INTEL_GUC_RECV_MSG_EXCEPTION = BIT(30),
 };
-
-#define INTEL_GUC_SUPPORTS_TLB_INVALIDATION(guc) \
-	((intel_guc_ct_enabled(&(guc)->ct)) && \
-	 (intel_guc_submission_is_used(guc)) && \
-	 (GRAPHICS_VER(guc_to_gt((guc))->i915) >= 12))
-#define INTEL_GUC_SUPPORTS_TLB_INVALIDATION_SELECTIVE(guc) \
-	(INTEL_GUC_SUPPORTS_TLB_INVALIDATION(guc) && \
-	HAS_SELECTIVE_TLB_INVALIDATION(guc_to_gt(guc)->i915))
 
 #endif

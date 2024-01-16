@@ -24,39 +24,31 @@
 #ifndef __INTEL_FRONTBUFFER_H__
 #define __INTEL_FRONTBUFFER_H__
 
-#include "i915_active_types.h"
-struct drm_i915_private;
-
-
-enum fb_op_origin {
-	ORIGIN_CPU = 0,
-#if IS_ENABLED(CPTCFG_DRM_I915_DISPLAY)
-	ORIGIN_CS,
-	ORIGIN_FLIP,
-	ORIGIN_DIRTYFB,
-	ORIGIN_CURSOR_UPDATE,
-#endif
-};
-
-struct intel_frontbuffer {
-#if IS_ENABLED(CPTCFG_DRM_I915_DISPLAY)
-	struct kref ref;
-	atomic_t bits;
-	struct i915_active write;
-#endif
-	struct drm_i915_gem_object *obj;
-#if IS_ENABLED(CPTCFG_DRM_I915_DISPLAY)
-	struct rcu_head rcu;
-#endif
-};
-
-#if IS_ENABLED(CPTCFG_DRM_I915_DISPLAY)
-
 #include <linux/atomic.h>
 #include <linux/bits.h>
 #include <linux/kref.h>
 
-#include "gem/i915_gem_object_types.h"
+#include "i915_active_types.h"
+
+struct drm_i915_private;
+
+enum fb_op_origin {
+	ORIGIN_CPU = 0,
+	ORIGIN_CS,
+	ORIGIN_FLIP,
+	ORIGIN_DIRTYFB,
+	ORIGIN_CURSOR_UPDATE,
+};
+
+struct intel_frontbuffer {
+	struct kref ref;
+	atomic_t bits;
+	struct i915_active write;
+	struct drm_i915_gem_object *obj;
+	struct rcu_head rcu;
+
+	struct work_struct flush_work;
+};
 
 /*
  * Frontbuffer tracking bits. Set in obj->frontbuffer_bits while a gem bo is
@@ -83,33 +75,6 @@ void intel_frontbuffer_flip(struct drm_i915_private *i915,
 			    unsigned frontbuffer_bits);
 
 void intel_frontbuffer_put(struct intel_frontbuffer *front);
-
-static inline struct intel_frontbuffer *
-__intel_frontbuffer_get(const struct drm_i915_gem_object *obj)
-{
-	struct intel_frontbuffer *front;
-
-	if (likely(!rcu_access_pointer(obj->frontbuffer)))
-		return NULL;
-
-	rcu_read_lock();
-	do {
-		front = rcu_dereference(obj->frontbuffer);
-		if (!front)
-			break;
-
-		if (unlikely(!kref_get_unless_zero(&front->ref)))
-			continue;
-
-		if (likely(front == rcu_access_pointer(obj->frontbuffer)))
-			break;
-
-		intel_frontbuffer_put(front);
-	} while (1);
-	rcu_read_unlock();
-
-	return front;
-}
 
 struct intel_frontbuffer *
 intel_frontbuffer_get(struct drm_i915_gem_object *obj);
@@ -172,17 +137,10 @@ static inline void intel_frontbuffer_flush(struct intel_frontbuffer *front,
 	__intel_fb_flush(front, origin, frontbuffer_bits);
 }
 
+void intel_frontbuffer_queue_flush(struct intel_frontbuffer *front);
+
 void intel_frontbuffer_track(struct intel_frontbuffer *old,
 			     struct intel_frontbuffer *new,
 			     unsigned int frontbuffer_bits);
-#else
 
-static inline void intel_frontbuffer_put(struct intel_frontbuffer *front) { return; }
-static inline struct intel_frontbuffer *__intel_frontbuffer_get(
-		const struct drm_i915_gem_object *obj) { return 0; }
-static inline bool intel_frontbuffer_invalidate(struct intel_frontbuffer *front,
-						enum fb_op_origin origin) { return 0; }
-static inline void intel_frontbuffer_flush(struct intel_frontbuffer *front,
-					   enum fb_op_origin origin) { return; }
-#endif /* CPTCFG_DRM_I915_DISPLAY */
 #endif /* __INTEL_FRONTBUFFER_H__ */

@@ -32,9 +32,11 @@
  *
  */
 
+#include "display/intel_dp_aux_regs.h"
+#include "display/intel_gmbus_regs.h"
+#include "gvt.h"
 #include "i915_drv.h"
 #include "i915_reg.h"
-#include "gvt.h"
 
 #define GMBUS1_TOTAL_BYTES_SHIFT 16
 #define GMBUS1_TOTAL_BYTES_MASK 0x1ff
@@ -78,7 +80,6 @@ static unsigned char edid_get_byte(struct intel_vgpu *vgpu)
 	return chr;
 }
 
-#if IS_ENABLED(CPTCFG_DRM_I915_DISPLAY)
 static inline int cnp_get_port_from_gmbus0(u32 gmbus0)
 {
 	int port_select = gmbus0 & _GMBUS_PIN_SEL_MASK;
@@ -124,7 +125,6 @@ static inline int get_port_from_gmbus0(u32 gmbus0)
 		port = PORT_D;
 	return port;
 }
-#endif
 
 static void reset_gmbus_controller(struct intel_vgpu *vgpu)
 {
@@ -138,9 +138,7 @@ static void reset_gmbus_controller(struct intel_vgpu *vgpu)
 static int gmbus0_mmio_write(struct intel_vgpu *vgpu,
 			unsigned int offset, void *p_data, unsigned int bytes)
 {
-#if IS_ENABLED(CPTCFG_DRM_I915_DISPLAY)
 	struct drm_i915_private *i915 = vgpu->gvt->gt->i915;
-#endif
 	int port, pin_select;
 
 	memcpy(&vgpu_vreg(vgpu, offset), p_data, bytes);
@@ -151,7 +149,7 @@ static int gmbus0_mmio_write(struct intel_vgpu *vgpu,
 
 	if (pin_select == 0)
 		return 0;
-#if IS_ENABLED(CPTCFG_DRM_I915_DISPLAY)
+
 	if (IS_BROXTON(i915))
 		port = bxt_get_port_from_gmbus0(pin_select);
 	else if (IS_COFFEELAKE(i915) || IS_COMETLAKE(i915))
@@ -160,7 +158,7 @@ static int gmbus0_mmio_write(struct intel_vgpu *vgpu,
 		port = get_port_from_gmbus0(pin_select);
 	if (drm_WARN_ON(&i915->drm, port < 0))
 		return 0;
-#endif
+
 	vgpu->display.i2c_edid.state = I2C_GMBUS;
 	vgpu->display.i2c_edid.gmbus.phase = GMBUS_IDLE_PHASE;
 
@@ -465,10 +463,6 @@ static inline int get_aux_ch_reg(unsigned int offset)
 	return reg;
 }
 
-#define AUX_CTL_MSG_LENGTH(reg) \
-	((reg & DP_AUX_CH_CTL_MESSAGE_SIZE_MASK) >> \
-		DP_AUX_CH_CTL_MESSAGE_SIZE_SHIFT)
-
 /**
  * intel_gvt_i2c_handle_aux_ch_write - emulate AUX channel register write
  * @vgpu: a vGPU
@@ -497,7 +491,8 @@ void intel_gvt_i2c_handle_aux_ch_write(struct intel_vgpu *vgpu,
 		return;
 	}
 
-	msg_length = AUX_CTL_MSG_LENGTH(value);
+	msg_length = REG_FIELD_GET(DP_AUX_CH_CTL_MESSAGE_SIZE_MASK, value);
+
 	// check the msg in DATA register.
 	msg = vgpu_vreg(vgpu, offset + 4);
 	addr = (msg >> 8) & 0xffff;
@@ -512,8 +507,7 @@ void intel_gvt_i2c_handle_aux_ch_write(struct intel_vgpu *vgpu,
 	ret_msg_size = (((op & 0x1) == GVT_AUX_I2C_READ) ? 2 : 1);
 	vgpu_vreg(vgpu, offset) =
 		DP_AUX_CH_CTL_DONE |
-		((ret_msg_size << DP_AUX_CH_CTL_MESSAGE_SIZE_SHIFT) &
-		DP_AUX_CH_CTL_MESSAGE_SIZE_MASK);
+		DP_AUX_CH_CTL_MESSAGE_SIZE(ret_msg_size);
 
 	if (msg_length == 3) {
 		if (!(op & GVT_AUX_I2C_MOT)) {

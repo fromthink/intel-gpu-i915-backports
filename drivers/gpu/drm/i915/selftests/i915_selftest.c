@@ -24,6 +24,8 @@
 #include <linux/random.h>
 
 #include "gt/intel_gt_pm.h"
+#include "gt/uc/intel_gsc_fw.h"
+
 #include "i915_driver.h"
 #include "i915_drv.h"
 #include "i915_selftest.h"
@@ -46,12 +48,6 @@ int i915_live_sanitycheck(struct drm_i915_private *i915)
 	return 0;
 }
 
-int i915_wip_sanitycheck(struct drm_i915_private *i915)
-{
-	pr_info("%s: %s() - ok!\n", i915->drm.driver->name, __func__);
-	return 0;
-}
-
 enum {
 #define selftest(name, func) mock_##name,
 #include "i915_mock_selftests.h"
@@ -61,12 +57,6 @@ enum {
 enum {
 #define selftest(name, func) live_##name,
 #include "i915_live_selftests.h"
-#undef selftest
-};
-
-enum {
-#define selftest(name, func) wip_##name,
-#include "i915_wip_selftests.h"
 #undef selftest
 };
 
@@ -97,12 +87,6 @@ static struct selftest live_selftests[] = {
 };
 #undef selftest
 
-#define selftest(n, f) [wip_##n] = { .name = #n, { .live = f } },
-static struct selftest wip_selftests[] = {
-#include "i915_wip_selftests.h"
-};
-#undef selftest
-
 #define selftest(n, f) [perf_##n] = { .name = #n, { .live = f } },
 static struct selftest perf_selftests[] = {
 #include "i915_perf_selftests.h"
@@ -125,15 +109,6 @@ module_param_named(id, live_selftests[live_##n].enabled, bool, 0400);
 #undef selftest_0
 #undef param
 
-#if IS_ENABLED(CPTCFG_DRM_I915_DEBUG)
-#define param(n) __PASTE(igt__, __PASTE(__LINE__, __wip_##n))
-#define selftest_0(n, func, id) \
-module_param_named(id, wip_selftests[wip_##n].enabled, bool, 0400);
-#include "i915_wip_selftests.h"
-#undef selftest_0
-#undef param
-#endif
-
 #define param(n) __PASTE(igt__, __PASTE(__LINE__, __perf_##n))
 #define selftest_0(n, func, id) \
 module_param_named(id, perf_selftests[perf_##n].enabled, bool, 0400);
@@ -154,6 +129,26 @@ static void set_default_test_all(struct selftest *st, unsigned int count)
 		st[i].enabled = true;
 }
 
+static void
+__wait_gsc_proxy_completed(struct drm_i915_private *i915)
+{
+	bool need_to_wait = (IS_ENABLED(CONFIG_INTEL_MEI_GSC_PROXY) &&
+			     i915->media_gt &&
+			     HAS_ENGINE(i915->media_gt, GSC0) &&
+			     intel_uc_fw_is_loadable(&i915->media_gt->uc.gsc.fw));
+	/*
+	 * The gsc proxy component depends on the kernel component driver load ordering
+	 * and in corner cases (the first time after an IFWI flash), init-completion
+	 * firmware flows take longer.
+	 */
+	unsigned long timeout_ms = 8000;
+
+	if (need_to_wait &&
+	    (wait_for(intel_gsc_uc_fw_proxy_init_done(&i915->media_gt->uc.gsc, true),
+	    timeout_ms)))
+		pr_info(DRIVER_NAME "Timed out waiting for gsc_proxy_completion!\n");
+}
+
 static int __run_selftests(const char *name,
 			   struct selftest *st,
 			   unsigned int count,
@@ -161,8 +156,11 @@ static int __run_selftests(const char *name,
 {
 	int err = 0;
 
+	if (data)
+		__wait_gsc_proxy_completed(data);
+
 	while (!i915_selftest.random_seed)
-		i915_selftest.random_seed = get_random_int();
+		i915_selftest.random_seed = get_random_u32();
 
 	i915_selftest.timeout_jiffies =
 		i915_selftest.timeout_ms ?
@@ -241,30 +239,6 @@ int i915_live_selftests(struct pci_dev *pdev)
 
 	if (i915_selftest.live < 0) {
 		i915_selftest.live = -ENOTTY;
-		return 1;
-	}
-
-	return 0;
-}
-
-int i915_wip_selftests(struct pci_dev *pdev)
-{
-	int err;
-
-	if (!i915_selftest.wip)
-		return 0;
-
-	if (!IS_ENABLED(CPTCFG_DRM_I915_DEBUG))
-		return 0;
-
-	err = run_selftests(wip, pdev_to_i915(pdev));
-	if (err) {
-		i915_selftest.wip = err;
-		return err;
-	}
-
-	if (i915_selftest.wip < 0) {
-		i915_selftest.wip = -ENOTTY;
 		return 1;
 	}
 
@@ -408,8 +382,6 @@ int __i915_subtests(const char *caller,
 		if (!apply_subtest_filter(caller, st->name))
 			continue;
 
-		tracing_snapshot_alloc();
-
 		err = setup(data);
 		if (err) {
 			pr_err(DRIVER_NAME "/%s: setup failed for %s\n",
@@ -488,11 +460,6 @@ MODULE_PARM_DESC(mock_selftests, "Run selftests before loading, using mock hardw
 
 module_param_named_unsafe(live_selftests, i915_selftest.live, int, 0400);
 MODULE_PARM_DESC(live_selftests, "Run selftests after driver initialisation on the live system (0:disabled [default], 1:run tests then continue, -1:run tests then exit module)");
-
-#if IS_ENABLED(CPTCFG_DRM_I915_DEBUG)
-module_param_named_unsafe(wip_selftests, i915_selftest.wip, int, 0400);
-MODULE_PARM_DESC(wip_selftests, "Run work-in-progress selftests after driver initialisation on the live system (0:disabled [default], 1:run tests then continue, -1:run tests then exit module)");
-#endif
 
 module_param_named_unsafe(perf_selftests, i915_selftest.perf, int, 0400);
 MODULE_PARM_DESC(perf_selftests, "Run performance orientated selftests after driver initialisation on the live system (0:disabled [default], 1:run tests then continue, -1:run tests then exit module)");

@@ -5,6 +5,7 @@
 
 #include <linux/sort.h>
 
+#include "gt/intel_gt_print.h"
 #include "i915_selftest.h"
 #include "intel_engine_regs.h"
 #include "intel_gpu_commands.h"
@@ -112,19 +113,13 @@ static int __measure_timestamps(struct intel_context *ce,
 
 	/* Run the request for a 100us, sampling timestamps before/after */
 	local_irq_disable();
-	*dt = local_clock();
-
 	write_semaphore(&sema[2], 0);
-	while (READ_ONCE(sema[1]) == 0) /* wait for the gpu to begin */
+	while (READ_ONCE(sema[1]) == 0) /* wait for the gpu to catch up */
 		cpu_relax();
-
+	*dt = local_clock();
 	udelay(100);
-
-	write_semaphore(&sema[2], 1);
-	while (READ_ONCE(sema[3]) == 0) /* wait for the gpu to finish */
-		cpu_relax();
-
 	*dt = local_clock() - *dt;
+	write_semaphore(&sema[2], 1);
 	local_irq_enable();
 
 	if (i915_request_wait(rq, 0, HZ / 2) < 0) {
@@ -173,26 +168,6 @@ static int __live_engine_timestamps(struct intel_engine_cs *engine)
 	if (3 * dt > 4 * d_ring || 4 * dt < 3 * d_ring) {
 		pr_err("%s Mismatch between ring timestamp and walltime!\n",
 		       engine->name);
-		pr_info("walltime: [%lld, %lld, %lld, %lld, %lld] ns\n",
-			st[0], st[1], st[2], st[3], st[4]);
-		pr_info("ring timestamp in ticks: [%lld, %lld, %lld, %lld, %lld]\n",
-			s_ring[0], s_ring[1], s_ring[2], s_ring[3], s_ring[4]);
-		pr_info("ring timestamp in ns: [%lld, %lld, %lld, %lld, %lld]\n",
-			intel_gt_clock_interval_to_ns(engine->gt, s_ring[0]),
-			intel_gt_clock_interval_to_ns(engine->gt, s_ring[1]),
-			intel_gt_clock_interval_to_ns(engine->gt, s_ring[2]),
-			intel_gt_clock_interval_to_ns(engine->gt, s_ring[3]),
-			intel_gt_clock_interval_to_ns(engine->gt, s_ring[4]));
-		pr_info("ctx timestamp in ticks: [%lld, %lld, %lld, %lld, %lld]\n",
-			s_ctx[0], s_ctx[1], s_ctx[2], s_ctx[3], s_ctx[4]);
-		pr_info("ctx timestamp in ns: [%lld, %lld, %lld, %lld, %lld]\n",
-			intel_gt_clock_interval_to_ns(engine->gt, s_ctx[0]),
-			intel_gt_clock_interval_to_ns(engine->gt, s_ctx[1]),
-			intel_gt_clock_interval_to_ns(engine->gt, s_ctx[2]),
-			intel_gt_clock_interval_to_ns(engine->gt, s_ctx[3]),
-			intel_gt_clock_interval_to_ns(engine->gt, s_ctx[4]));
-		pr_info("walltime in ns: [%lld, %lld, %lld, %lld, %lld] ns\n",
-			st[0], st[1], st[2], st[3], st[4]);
 		return -EINVAL;
 	}
 
@@ -343,7 +318,7 @@ static int live_engine_busy_stats(void *arg)
 		ENGINE_TRACE(engine, "measuring busy time\n");
 		preempt_disable();
 		de = intel_engine_get_busy_time(engine, &t[0]);
-		mdelay(10);
+		mdelay(100);
 		de = ktime_sub(intel_engine_get_busy_time(engine, &t[1]), de);
 		preempt_enable();
 		dt = ktime_sub(t[1], t[0]);
@@ -428,7 +403,7 @@ static int live_engine_pm(void *arg)
 
 			/* gt wakeref is async (deferred to workqueue) */
 			if (intel_gt_pm_wait_for_idle(gt)) {
-				pr_err("GT failed to idle\n");
+				gt_err(gt, "GT failed to idle\n");
 				return -EINVAL;
 			}
 		}

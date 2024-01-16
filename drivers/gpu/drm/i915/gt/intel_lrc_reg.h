@@ -30,18 +30,6 @@
 
 #define GEN9_CTX_RING_MI_MODE		0x54
 
-/* GEN12+ Reg State Context */
-#define GEN12_CTX_SEMAPHORE_TOKEN		(0x1a + 1)
-#define PVC_CTX_ACC_CTR_THOLD			(0x2a + 1)
-#define PVC_CTX_PASID				(0x2c + 1)
-#define PVC_CTX_ASID				(0x2e + 1)
-#define XEHPSDV_CTX_CCS_PWR_CLK_STATE		(0x4B + 1)
-#define PVC_CTX_CCS_PWR_CLK_STATE		(0x56 + 1)
-
-#define ACC_GRANULARITY_S	20
-#define ACC_TRIGGER_S		0
-#define ACC_NOTIFY_S		16
-
 /* VF Reg State Context */
 #define GEN12_CTX_LRM_HEADER_0			0x50
 #define GEN12_CTX_INT_MASK_REG			0x51

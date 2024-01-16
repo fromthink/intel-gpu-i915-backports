@@ -8,10 +8,11 @@
 
 #include "intel_runtime_pm.h"
 #include "intel_wakeref.h"
+#include "i915_drv.h"
 
 int __intel_wakeref_get_first(struct intel_wakeref *wf)
 {
-	intel_wakeref_t wakeref = intel_runtime_pm_get(wf->rpm);
+	intel_wakeref_t wakeref = intel_runtime_pm_get(&wf->i915->runtime_pm);
 	int err = 0;
 
 	/*
@@ -41,7 +42,7 @@ int __intel_wakeref_get_first(struct intel_wakeref *wf)
 unlock:
 	mutex_unlock(&wf->mutex);
 	if (unlikely(wakeref))
-		intel_runtime_pm_put(wf->rpm, wakeref);
+		intel_runtime_pm_put(&wf->i915->runtime_pm, wakeref);
 
 	return err;
 }
@@ -59,15 +60,12 @@ static void ____intel_wakeref_put_last(struct intel_wakeref *wf)
 		INTEL_WAKEREF_BUG_ON(!wf->wakeref);
 		wakeref = xchg(&wf->wakeref, 0);
 		wake_up_var(&wf->wakeref);
-#if IS_ENABLED(CPTCFG_DRM_I915_DEBUG_WAKEREF)
-		ref_tracker_dir_exit(&wf->debug);
-#endif
 	}
 
 unlock:
 	mutex_unlock(&wf->mutex);
 	if (wakeref)
-		intel_runtime_pm_put(wf->rpm, wakeref);
+		intel_runtime_pm_put(&wf->i915->runtime_pm, wakeref);
 }
 
 void __intel_wakeref_put_last(struct intel_wakeref *wf, unsigned long flags)
@@ -76,7 +74,7 @@ void __intel_wakeref_put_last(struct intel_wakeref *wf, unsigned long flags)
 
 	/* Assume we are not in process context and so cannot sleep. */
 	if (flags & INTEL_WAKEREF_PUT_ASYNC || !mutex_trylock(&wf->mutex)) {
-		mod_delayed_work(system_wq, &wf->work,
+		mod_delayed_work(wf->i915->unordered_wq, &wf->work,
 				 FIELD_GET(INTEL_WAKEREF_PUT_DELAY, flags));
 		return;
 	}
@@ -96,12 +94,11 @@ static void __intel_wakeref_put_work(struct work_struct *wrk)
 }
 
 void __intel_wakeref_init(struct intel_wakeref *wf,
-			  struct intel_runtime_pm *rpm,
+			  struct drm_i915_private *i915,
 			  const struct intel_wakeref_ops *ops,
-			  struct intel_wakeref_lockclass *key,
-			  const char *name)
+			  struct intel_wakeref_lockclass *key)
 {
-	wf->rpm = rpm;
+	wf->i915 = i915;
 	wf->ops = ops;
 
 	__mutex_init(&wf->mutex, "wakeref.mutex", &key->mutex);
@@ -111,10 +108,6 @@ void __intel_wakeref_init(struct intel_wakeref *wf,
 	INIT_DELAYED_WORK(&wf->work, __intel_wakeref_put_work);
 	lockdep_init_map(&wf->work.work.lockdep_map,
 			 "wakeref.work", &key->work, 0);
-
-#if IS_ENABLED(CPTCFG_DRM_I915_DEBUG_WAKEREF)
-	ref_tracker_dir_init(&wf->debug, INTEL_REFTRACK_DEAD_COUNT, name);
-#endif
 }
 
 int intel_wakeref_wait_for_idle(struct intel_wakeref *wf)
@@ -123,16 +116,12 @@ int intel_wakeref_wait_for_idle(struct intel_wakeref *wf)
 
 	might_sleep();
 
-	/* Beware re-arming wakerefs; recheck after flushing the callback */
-	do {
-		err = wait_var_event_killable(&wf->wakeref,
-					      !intel_wakeref_is_active(wf));
-		if (err)
-			return err;
+	err = wait_var_event_killable(&wf->wakeref,
+				      !intel_wakeref_is_active(wf));
+	if (err)
+		return err;
 
-		intel_wakeref_unlock_wait(wf);
-	} while (intel_wakeref_is_active(wf));
-
+	intel_wakeref_unlock_wait(wf);
 	return 0;
 }
 
@@ -148,17 +137,17 @@ static void wakeref_auto_timeout(struct timer_list *t)
 	wakeref = fetch_and_zero(&wf->wakeref);
 	spin_unlock_irqrestore(&wf->lock, flags);
 
-	intel_runtime_pm_put(wf->rpm, wakeref);
+	intel_runtime_pm_put(&wf->i915->runtime_pm, wakeref);
 }
 
 void intel_wakeref_auto_init(struct intel_wakeref_auto *wf,
-			     struct intel_runtime_pm *rpm)
+			     struct drm_i915_private *i915)
 {
 	spin_lock_init(&wf->lock);
 	timer_setup(&wf->timer, wakeref_auto_timeout, 0);
 	refcount_set(&wf->count, 0);
 	wf->wakeref = 0;
-	wf->rpm = rpm;
+	wf->i915 = i915;
 }
 
 void intel_wakeref_auto(struct intel_wakeref_auto *wf, unsigned long timeout)
@@ -172,13 +161,14 @@ void intel_wakeref_auto(struct intel_wakeref_auto *wf, unsigned long timeout)
 	}
 
 	/* Our mission is that we only extend an already active wakeref */
-	assert_rpm_wakelock_held(wf->rpm);
+	assert_rpm_wakelock_held(&wf->i915->runtime_pm);
 
 	if (!refcount_inc_not_zero(&wf->count)) {
 		spin_lock_irqsave(&wf->lock, flags);
 		if (!refcount_inc_not_zero(&wf->count)) {
 			INTEL_WAKEREF_BUG_ON(wf->wakeref);
-			wf->wakeref = intel_runtime_pm_get_if_in_use(wf->rpm);
+			wf->wakeref =
+				intel_runtime_pm_get_if_in_use(&wf->i915->runtime_pm);
 			refcount_set(&wf->count, 1);
 		}
 		spin_unlock_irqrestore(&wf->lock, flags);

@@ -4,11 +4,9 @@
  */
 
 #include "gem/i915_gem_lmem.h"
-#include "gem/i915_gem_region.h"
 
 #include "gen8_engine_cs.h"
 #include "i915_drv.h"
-#include "i915_memcpy.h"
 #include "i915_perf.h"
 #include "i915_reg.h"
 #include "intel_context.h"
@@ -64,7 +62,6 @@ static void set_offsets(u32 *regs,
 
 	while (*data) {
 		u8 count, flags;
-		u32 cmd;
 
 		if (*data & BIT(7)) { /* skip */
 			count = *data++ & ~BIT(7);
@@ -76,12 +73,12 @@ static void set_offsets(u32 *regs,
 		flags = *data >> 6;
 		data++;
 
-		cmd = MI_LOAD_REGISTER_IMM(count);
+		*regs = MI_LOAD_REGISTER_IMM(count);
 		if (flags & POSTED)
-			cmd |= MI_LRI_FORCE_POSTED;
+			*regs |= MI_LRI_FORCE_POSTED;
 		if (GRAPHICS_VER(engine->i915) >= 11)
-			cmd |= MI_LRI_LRM_CS_MMIO;
-		*regs++ = cmd;
+			*regs |= MI_LRI_LRM_CS_MMIO;
+		regs++;
 
 		GEM_BUG_ON(!count);
 		do {
@@ -743,6 +740,9 @@ static int lrc_ring_bb_offset(const struct intel_engine_cs *engine)
 		return 0x70;
 	else if (GRAPHICS_VER(engine->i915) >= 9)
 		return 0x64;
+	else if (GRAPHICS_VER(engine->i915) >= 8 &&
+		 engine->class == RENDER_CLASS)
+		return 0xc4;
 	else
 		return -1;
 }
@@ -802,7 +802,8 @@ static int lrc_ring_cmd_buf_cctl(const struct intel_engine_cs *engine)
 		 * simply to match the RCS context image layout.
 		 */
 		return 0xc6;
-	else if (engine->class != RENDER_CLASS)
+	else if (engine->class != RENDER_CLASS &&
+		 engine->class != COMPUTE_CLASS)
 		return -1;
 	else if (GRAPHICS_VER(engine->i915) >= 12)
 		return 0xb6;
@@ -835,23 +836,36 @@ lrc_setup_indirect_ctx(u32 *regs,
 		       u32 ctx_bb_ggtt_addr,
 		       u32 size)
 {
-	/*
-	 * NB: wa_bb are only run during context restore, and never if the
-	 * context restore is inhibited [CTX_CTRL_ENGINE_CTX_RESTORE_INHIBIT].
-	 */
-
-	/* Pointer to wa_bb instructions to execute */
-
 	GEM_BUG_ON(!size);
 	GEM_BUG_ON(!IS_ALIGNED(size, CACHELINE_BYTES));
 	GEM_BUG_ON(lrc_ring_indirect_ptr(engine) == -1);
 	regs[lrc_ring_indirect_ptr(engine) + 1] =
 		ctx_bb_ggtt_addr | (size / CACHELINE_BYTES);
 
-	/* When to run wa_bb during context restore (cacheline offset) */
 	GEM_BUG_ON(lrc_ring_indirect_offset(engine) == -1);
 	regs[lrc_ring_indirect_offset(engine) + 1] =
 		lrc_ring_indirect_offset_default(engine) << 6;
+}
+
+static bool ctx_needs_runalone(const struct intel_context *ce)
+{
+	struct i915_gem_context *gem_ctx;
+	bool ctx_is_protected = false;
+
+	/*
+	 * On MTL and newer platforms, protected contexts require setting
+	 * the LRC run-alone bit or else the encryption will not happen.
+	 */
+	if (GRAPHICS_VER_FULL(ce->engine->i915) >= IP_VER(12, 70) &&
+	    (ce->engine->class == COMPUTE_CLASS || ce->engine->class == RENDER_CLASS)) {
+		rcu_read_lock();
+		gem_ctx = rcu_dereference(ce->gem_context);
+		if (gem_ctx)
+			ctx_is_protected = gem_ctx->uses_protected_content;
+		rcu_read_unlock();
+	}
+
+	return ctx_is_protected;
 }
 
 static void init_common_regs(u32 * const regs,
@@ -869,18 +883,14 @@ static void init_common_regs(u32 * const regs,
 	if (GRAPHICS_VER(engine->i915) < 11)
 		ctl |= _MASKED_BIT_DISABLE(CTX_CTRL_ENGINE_CTX_SAVE_INHIBIT |
 					   CTX_CTRL_RS_CTX_ENABLE);
-	if (engine->flags & I915_ENGINE_HAS_RUN_ALONE_MODE) {
-		ctl |= _MASKED_BIT_DISABLE(CTX_CTRL_RUN_ALONE);
-		if (test_bit(CONTEXT_RUNALONE, &ce->flags) ||
-		     engine->i915->params.ctx_run_alone)
-			ctl |= CTX_CTRL_RUN_ALONE;
-	}
+	if (ctx_needs_runalone(ce))
+		ctl |= _MASKED_BIT_ENABLE(GEN12_CTX_CTRL_RUNALONE_MODE);
 	regs[CTX_CONTEXT_CONTROL] = ctl;
 
 	regs[CTX_TIMESTAMP] = ce->stats.runtime.last;
 
 	loc = lrc_ring_bb_offset(engine);
-	if  (loc != -1)
+	if (loc != -1)
 		regs[loc + 1] = 0;
 }
 
@@ -905,6 +915,22 @@ static void init_wa_bb_regs(u32 * const regs,
 	}
 }
 
+static void init_ppgtt_regs(u32 *regs, const struct i915_ppgtt *ppgtt)
+{
+	if (i915_vm_is_4lvl(&ppgtt->vm)) {
+		/* 64b PPGTT (48bit canonical)
+		 * PDP0_DESCRIPTOR contains the base address to PML4 and
+		 * other PDP Descriptors are ignored.
+		 */
+		ASSIGN_CTX_PML4(ppgtt, regs);
+	} else {
+		ASSIGN_CTX_PDP(ppgtt, regs, 3);
+		ASSIGN_CTX_PDP(ppgtt, regs, 2);
+		ASSIGN_CTX_PDP(ppgtt, regs, 1);
+		ASSIGN_CTX_PDP(ppgtt, regs, 0);
+	}
+}
+
 static struct i915_ppgtt *vm_alias(struct i915_address_space *vm)
 {
 	if (i915_is_ggtt(vm))
@@ -913,8 +939,7 @@ static struct i915_ppgtt *vm_alias(struct i915_address_space *vm)
 		return i915_vm_to_ppgtt(vm);
 }
 
-static void
-init_vf_irq_reg_state(u32 *regs, const struct intel_engine_cs *engine)
+static void init_vf_irq_reg_state(u32 *regs, const struct intel_engine_cs *engine)
 {
 	struct i915_vma *vma = engine->gt->iov.vf.irq.vma;
 
@@ -935,28 +960,6 @@ init_vf_irq_reg_state(u32 *regs, const struct intel_engine_cs *engine)
 	regs[GEN12_CTX_INT_STATUS_REPORT_PTR + 1] = i915_ggtt_offset(vma) + I915_VF_IRQ_STATUS;
 	regs[GEN12_CTX_INT_SRC_REPORT_PTR] = i915_mmio_reg_offset(GEN12_RING_INT_SRC(0));
 	regs[GEN12_CTX_INT_SRC_REPORT_PTR + 1] = i915_ggtt_offset(vma) + I915_VF_IRQ_SOURCE;
-}
-
-/*
- * The token format in MI_SEMAPHORE_WAIT is just a number, when we're
- * programming the context, the token becomes a bit number (1 << token).
- * For XEHPSDV slightly different, but similar conceptually.
- */
-static u32 token_ctx_value(const struct intel_context *ce)
-{
-	const struct i915_gem_context *ctx;
-	u32 token = 0;
-
-	rcu_read_lock();
-	ctx = rcu_dereference(ce->gem_context);
-	if (ctx)
-		token = ctx->semaphore_token;
-	rcu_read_unlock();
-
-	if (HAS_SEMAPHORE_XEHPSDV(ce->engine->i915))
-		return XEHPSDV_ENGINE_SEMAPHORE_TOKEN_CTX_VALUE(token);
-	else
-		return GEN12_ENGINE_SEMAPHORE_TOKEN_CTX_VALUE(token);
 }
 
 static void __reset_stop_ring(u32 *regs, const struct intel_engine_cs *engine)
@@ -992,13 +995,14 @@ static void __lrc_init_regs(u32 *regs,
 	set_offsets(regs, reg_offsets(engine), engine, inhibit);
 
 	init_common_regs(regs, ce, engine, inhibit);
-	init_wa_bb_regs(regs, engine);
+	init_ppgtt_regs(regs, vm_alias(ce->vm));
 
-	if (GRAPHICS_VER(engine->i915) >= 12)
-		regs[GEN12_CTX_SEMAPHORE_TOKEN] = token_ctx_value(ce);
+	init_wa_bb_regs(regs, engine);
 
 	if (HAS_MEMORY_IRQ_STATUS(engine->i915))
 		init_vf_irq_reg_state(regs, engine);
+
+	__reset_stop_ring(regs, engine);
 }
 
 void lrc_init_regs(const struct intel_context *ce,
@@ -1014,132 +1018,29 @@ void lrc_reset_regs(const struct intel_context *ce,
 	__reset_stop_ring(ce->lrc_reg_state, engine);
 }
 
-#define REDZONE_INTERVAL (5ull * NSEC_PER_SEC)
-#define REDZONE_KTIME (I915_GTT_PAGE_SIZE - 64)
-
 static void
 set_redzone(void *vaddr, const struct intel_engine_cs *engine)
 {
-	const int len = REDZONE_KTIME;
-
 	if (!IS_ENABLED(CPTCFG_DRM_I915_DEBUG_GEM))
 		return;
 
 	vaddr += engine->context_size;
 
-	memset(vaddr, CONTEXT_REDZONE, len);
-	*(ktime_t *)(vaddr + len) = -REDZONE_INTERVAL; /* check at least once */
-}
-
-static bool __check_red_cl(const void *vaddr)
-{
-	char stack[80];
-	char *s = stack;
-
-	s = PTR_ALIGN(s, 16);
-	if (!i915_memcpy_from_wc(s, vaddr, 64))
-		memcpy(s, vaddr, 64);
-
-	return memchr_inv(s, CONTEXT_REDZONE, 64) == NULL;
-}
-
-static void hexdump(struct drm_printer *m, const void *buf, size_t len)
-{
-	const size_t rowsize = 8 * sizeof(u32);
-	size_t pos;
-
-	for (pos = 0; pos < len; pos += rowsize) {
-		char line[128];
-
-		hex_dump_to_buffer(buf + pos, len - pos, rowsize, sizeof(u32), line, sizeof(line),
-				   false);
-		drm_printf(m, "[%04zx] %s\n", pos, line);
-
-	}
-}
-
-static bool lrc_check_regs(const struct intel_context *ce,
-			   const struct intel_engine_cs *engine)
-{
-	const struct intel_ring *ring = ce->ring;
-	u32 *regs = ce->lrc_reg_state;
-	bool valid = true;
-	int x;
-
-	if (regs[CTX_RING_START] != i915_ggtt_offset(ring->vma)) {
-		pr_err("%s: context submitted with incorrect RING_START [%08x], expected %08x\n",
-		       engine->name,
-		       regs[CTX_RING_START],
-		       i915_ggtt_offset(ring->vma));
-		regs[CTX_RING_START] = i915_ggtt_offset(ring->vma);
-		valid = false;
-	}
-
-	if ((regs[CTX_RING_CTL] & ~(RING_WAIT | RING_WAIT_SEMAPHORE)) !=
-	    (RING_CTL_SIZE(ring->size) | RING_VALID)) {
-		pr_err("%s: context submitted with incorrect RING_CTL [%08x], expected %08x\n",
-		       engine->name,
-		       regs[CTX_RING_CTL],
-		       (u32)(RING_CTL_SIZE(ring->size) | RING_VALID));
-		regs[CTX_RING_CTL] = RING_CTL_SIZE(ring->size) | RING_VALID;
-		valid = false;
-	}
-
-	x = lrc_ring_mi_mode(engine);
-	if (x != -1 && regs[x + 1] & (regs[x + 1] >> 16) & STOP_RING) {
-		pr_err("%s: context submitted with STOP_RING [%08x] in RING_MI_MODE\n",
-		       engine->name, regs[x + 1]);
-		regs[x + 1] &= ~STOP_RING;
-		regs[x + 1] |= STOP_RING << 16;
-		valid = false;
-	}
-
-	return valid;
+	memset(vaddr, CONTEXT_REDZONE, I915_GTT_PAGE_SIZE);
 }
 
 static void
-check_redzone(struct intel_context *ce)
+check_redzone(const void *vaddr, const struct intel_engine_cs *engine)
 {
-	const void *vaddr = (void *)ce->lrc_reg_state - LRC_STATE_OFFSET;
-	const struct intel_engine_cs *engine = ce->engine;
-	const int len = REDZONE_KTIME;
-	ktime_t now, *last;
-
 	if (!IS_ENABLED(CPTCFG_DRM_I915_DEBUG_GEM))
 		return;
 
-	GEM_BUG_ON(!i915_gem_object_mem_idle(ce->state->obj));
-
 	vaddr += engine->context_size;
-	last = (void *)vaddr + len;
 
-	now = ktime_get();
-	if (ktime_before(now, ktime_add(*last, REDZONE_INTERVAL)))
-		return;
-	*last = now;
-
-	/*
-	 * Check the first cacheline; most likely to be overwritten,
-	 * and double check a cacheline chosen at random.
-	 */
-	if (!__check_red_cl(vaddr) ||
-	    !__check_red_cl(vaddr + ALIGN_DOWN(lower_32_bits(now) % len, 64))) {
-		struct drm_printer p = drm_debug_printer(__func__);
-
+	if (memchr_inv(vaddr, CONTEXT_REDZONE, I915_GTT_PAGE_SIZE))
 		drm_err_once(&engine->i915->drm,
-			     "%s context redzone overwritten @ %zu!\n",
-			     engine->name,
-			     memchr_inv(vaddr, CONTEXT_REDZONE, len) - vaddr);
-		hexdump(&p, vaddr, REDZONE_KTIME);
-		*last = KTIME_MAX; /* never check again */
-	}
-
-	if (!lrc_check_regs(ce, engine)) {
-		drm_err_once(&engine->i915->drm,
-			     "%s: Invalid lrc state found during submission\n",
+			     "%s context redzone overwritten!\n",
 			     engine->name);
-		*last = KTIME_MAX;
-	}
 }
 
 static u32 context_wa_bb_offset(const struct intel_context *ce)
@@ -1166,22 +1067,17 @@ void lrc_init_state(struct intel_context *ce,
 {
 	bool inhibit = true;
 
-	GEM_BUG_ON(!i915_gem_object_mem_idle(ce->state->obj));
-
 	set_redzone(state, engine);
 
-	/* Clear the ppHWSP (inc. per-context counters) */
-	if (!test_bit(CONTEXT_VALID_BIT, &ce->flags))
-		memset(state, 0, LRC_STATE_OFFSET);
-
 	if (engine->default_state) {
-		shmem_read(engine->default_state, /* exclude ppHWSP */
-			   LRC_STATE_OFFSET,
-			   state + LRC_STATE_OFFSET,
-			   engine->context_size - LRC_STATE_OFFSET);
+		shmem_read(engine->default_state, 0,
+			   state, engine->context_size);
 		__set_bit(CONTEXT_VALID_BIT, &ce->flags);
 		inhibit = false;
 	}
+
+	/* Clear the ppHWSP (inc. per-context counters) */
+	memset(state, 0, PAGE_SIZE);
 
 	/* Clear the indirect wa and storage */
 	if (ce->wa_bb_page)
@@ -1237,7 +1133,6 @@ __lrc_alloc_state(struct intel_context *ce, struct intel_engine_cs *engine)
 
 	if (GRAPHICS_VER(engine->i915) >= 12) {
 		ce->wa_bb_page = context_size / PAGE_SIZE;
-		GEM_BUG_ON(context_wa_bb_offset(ce) != context_size);
 		context_size += PAGE_SIZE;
 	}
 
@@ -1246,12 +1141,21 @@ __lrc_alloc_state(struct intel_context *ce, struct intel_engine_cs *engine)
 		context_size += PARENT_SCRATCH_SIZE;
 	}
 
-	if (HAS_LMEM(engine->i915))
-		obj = intel_gt_object_create_lmem(engine->gt, context_size, 0);
-	else
+	obj = i915_gem_object_create_lmem(engine->i915, context_size,
+					  I915_BO_ALLOC_PM_VOLATILE);
+	if (IS_ERR(obj)) {
 		obj = i915_gem_object_create_shmem(engine->i915, context_size);
-	if (IS_ERR(obj))
-		return ERR_CAST(obj);
+		if (IS_ERR(obj))
+			return ERR_CAST(obj);
+
+		/*
+		 * Wa_22016122933: For Media version 13.0, all Media GT shared
+		 * memory needs to be mapped as WC on CPU side and UC (PAT
+		 * index 2) on GPU side.
+		 */
+		if (intel_gt_needs_wa_22016122933(engine->gt))
+			i915_gem_object_set_cache_coherency(obj, I915_CACHE_NONE);
+	}
 
 	vma = i915_vma_instance(obj, &engine->gt->ggtt->vm, NULL);
 	if (IS_ERR(vma)) {
@@ -1263,36 +1167,11 @@ __lrc_alloc_state(struct intel_context *ce, struct intel_engine_cs *engine)
 }
 
 static struct intel_timeline *
-pphwsp_timeline(struct intel_engine_cs *engine,
-		struct i915_vma *state,
-		u32 addr)
-{
-	return __intel_timeline_create(engine->gt, state,
-				       addr | INTEL_TIMELINE_RELATIVE_CONTEXT);
-}
-
-static struct intel_timeline *
-pinned_timeline(struct intel_context *ce,
-		struct intel_engine_cs *engine,
-		struct i915_vma *state)
+pinned_timeline(struct intel_context *ce, struct intel_engine_cs *engine)
 {
 	struct intel_timeline *tl = fetch_and_zero(&ce->timeline);
 
-	return pphwsp_timeline(engine, state, page_unmask_bits(tl));
-}
-
-static bool use_pphwsp(struct intel_engine_cs *engine, struct i915_vma *state)
-{
-	if (IS_SRIOV_VF(engine->i915))
-		return true;
-
-	if (intel_engine_has_semaphores(engine))
-		return false;
-
-	if (i915_gem_object_is_lmem(state->obj))
-		return false;
-
-	return true;
+	return intel_timeline_create_from_engine(engine, page_unmask_bits(tl));
 }
 
 int lrc_alloc(struct intel_context *ce, struct intel_engine_cs *engine)
@@ -1317,14 +1196,11 @@ int lrc_alloc(struct intel_context *ce, struct intel_engine_cs *engine)
 		struct intel_timeline *tl;
 
 		/*
-		 * Use a dynamically allocated cacheline for sharing breadcrumbs
-		 * with HW semapphores, and ppHWSP for everything else
-		 * including perma-pinned kernel contexts.
+		 * Use the static global HWSP for the kernel context, and
+		 * a dynamically allocated cacheline for everyone else.
 		 */
 		if (unlikely(ce->timeline))
-			tl = pinned_timeline(ce, engine, vma);
-		else if (use_pphwsp(engine, vma))
-			tl = pphwsp_timeline(engine, vma, I915_GEM_HWS_SEQNO_ADDR);
+			tl = pinned_timeline(ce, engine);
 		else
 			tl = intel_timeline_create(engine->gt);
 		if (IS_ERR(tl)) {
@@ -1332,36 +1208,7 @@ int lrc_alloc(struct intel_context *ce, struct intel_engine_cs *engine)
 			goto err_ring;
 		}
 
-		/*
-		 * To support mutex_lock_nest_lock(), lockdep requires the
-		 * outer/inner (our parent/child contexts) to be of distinct
-		 * lockclasses.
-		 *
-		 * Like lockdep_set_subclass() but we need to preserve the
-		 * original lockclass name.
-		 */
-#if IS_ENABLED(CONFIG_LOCKDEP)
-		lockdep_init_map_waits(&tl->mutex.dep_map,
-				       tl->mutex.dep_map.name,
-				       tl->mutex.dep_map.key,
-				       intel_context_is_child(ce),
-				       tl->mutex.dep_map.wait_type_inner,
-				       tl->mutex.dep_map.wait_type_outer);
-		/*
-		 * Due to an interesting quirk in lockdep's internal debug
-		 * tracking, after setting a subclass we must ensure the lock
-		 * is used. Otherwise, nr_unused_locks is incremented once too
-		 * often.
-		 */
-		might_lock(&tl->mutex);
-#endif
-
 		ce->timeline = tl;
-	}
-
-	if (GEM_WARN_ON(ce->timeline->gt->ggtt != engine->gt->ggtt)) {
-		err = -EINVAL;
-		goto err_ring;
 	}
 
 	ce->ring = ring;
@@ -1378,26 +1225,12 @@ err_vma:
 
 void lrc_reset(struct intel_context *ce)
 {
-	void *vaddr;
-
 	GEM_BUG_ON(!intel_context_is_pinned(ce));
 
-	/*
-	 * The HWSP is volatile, and may have been lost while inactive,
-	 * e.g. across suspend/resume. Be paranoid, and ensure that
-	 * the HWSP value matches our seqno so we don't proclaim
-	 * the next request as already complete.
-	 */
-	intel_timeline_reset_seqno(ce->timeline);
-	intel_ring_reset(ce->ring, 0);
-
-	vaddr = ce->lrc_reg_state;
-	vaddr -= LRC_STATE_OFFSET;
+	intel_ring_reset(ce->ring, ce->ring->emit);
 
 	/* Scrub away the garbage */
-	__clear_bit(CONTEXT_VALID_BIT, &ce->flags);
-	lrc_init_state(ce, ce->engine, vaddr);
-
+	lrc_init_regs(ce, ce->engine, true);
 	ce->lrc.lrca = lrc_update_regs(ce, ce->engine, ce->ring->tail);
 }
 
@@ -1411,7 +1244,7 @@ lrc_pre_pin(struct intel_context *ce,
 	GEM_BUG_ON(!i915_vma_is_pinned(ce->state));
 
 	*vaddr = i915_gem_object_pin_map(ce->state->obj,
-					 i915_coherent_map_type(ce->engine->i915,
+					 i915_coherent_map_type(ce->engine->gt,
 								ce->state->obj,
 								false) |
 					 I915_MAP_OVERRIDE);
@@ -1435,13 +1268,12 @@ lrc_pin(struct intel_context *ce,
 
 void lrc_unpin(struct intel_context *ce)
 {
-	lrc_update_runtime(ce);
 	if (unlikely(ce->parallel.last_rq)) {
 		i915_request_put(ce->parallel.last_rq);
 		ce->parallel.last_rq = NULL;
 	}
-
-	check_redzone(ce);
+	check_redzone((void *)ce->lrc_reg_state - LRC_STATE_OFFSET,
+		      ce->engine);
 }
 
 void lrc_post_unpin(struct intel_context *ce)
@@ -1536,29 +1368,6 @@ gen12_emit_cmd_buf_wa(const struct intel_context *ce, u32 *cs)
 }
 
 /*
- * On DG2 during context restore of a preempted context in GPGPU mode,
- * RCS restore hang is detected. This is extremely timing dependent.
- * To address this below sw wabb is implemented for DG2 A steppings.
- */
-static u32 *
-dg2_emit_rcs_hang_wabb(const struct intel_context *ce, u32 *cs)
-{
-	*cs++ = MI_LOAD_REGISTER_IMM(1);
-	*cs++ = i915_mmio_reg_offset(GEN12_STATE_ACK_DEBUG(ce->engine->mmio_base));
-	*cs++ = 0x21;
-
-	*cs++ = MI_LOAD_REGISTER_REG;
-	*cs++ = i915_mmio_reg_offset(RING_NOPID(ce->engine->mmio_base));
-	*cs++ = i915_mmio_reg_offset(XEHP_CULLBIT1);
-
-	*cs++ = MI_LOAD_REGISTER_REG;
-	*cs++ = i915_mmio_reg_offset(RING_NOPID(ce->engine->mmio_base));
-	*cs++ = i915_mmio_reg_offset(XEHP_CULLBIT2);
-
-	return cs;
-}
-
-/*
  * The bspec's tuning guide asks us to program a vertical watermark value of
  * 0x3FF.  However this register is not saved/restored properly by the
  * hardware, so we're required to apply the desired value via INDIRECT_CTX
@@ -1576,174 +1385,38 @@ dg2_emit_draw_watermark_setting(u32 *cs)
 }
 
 static u32 *
+gen12_invalidate_state_cache(u32 *cs)
+{
+	*cs++ = MI_LOAD_REGISTER_IMM(1);
+	*cs++ = i915_mmio_reg_offset(GEN12_CS_DEBUG_MODE2);
+	*cs++ = _MASKED_BIT_ENABLE(INSTRUCTION_STATE_CACHE_INVALIDATE);
+	return cs;
+}
+
+static u32 *
 gen12_emit_indirect_ctx_rcs(const struct intel_context *ce, u32 *cs)
 {
 	cs = gen12_emit_timestamp_wa(ce, cs);
 	cs = gen12_emit_cmd_buf_wa(ce, cs);
 	cs = gen12_emit_restore_scratch(ce, cs);
 
-	/* Wa_22011450934:dg2 */
-	if (IS_DG2_GRAPHICS_STEP(ce->engine->i915, G10, STEP_A0, STEP_B0) ||
-	    IS_DG2_GRAPHICS_STEP(ce->engine->i915, G11, STEP_A0, STEP_B0))
-		cs = dg2_emit_rcs_hang_wabb(ce, cs);
-
 	/* Wa_16013000631:dg2 */
-	if (IS_DG2_GRAPHICS_STEP(ce->engine->i915, G10, STEP_B0, STEP_C0) ||
-	    IS_DG2_G11(ce->engine->i915))
+	if (IS_DG2_G11(ce->engine->i915))
 		cs = gen8_emit_pipe_control(cs, PIPE_CONTROL_INSTRUCTION_CACHE_INVALIDATE, 0);
 
-	/* hsdes: 1809175790 */
-	if (!HAS_FLAT_CCS(ce->engine->i915))
-		cs = gen12_emit_aux_table_inv(ce->engine->gt,
-					      cs, GEN12_GFX_CCS_AUX_NV);
+	cs = gen12_emit_aux_table_inv(ce->engine, cs);
+
+	/* Wa_18022495364 */
+	if (IS_GFX_GT_IP_RANGE(ce->engine->gt, IP_VER(12, 0), IP_VER(12, 10)))
+		cs = gen12_invalidate_state_cache(cs);
 
 	/* Wa_16014892111 */
-	if (IS_DG2(ce->engine->i915))
+	if (IS_GFX_GT_IP_STEP(ce->engine->gt, IP_VER(12, 70), STEP_A0, STEP_B0) ||
+	    IS_GFX_GT_IP_STEP(ce->engine->gt, IP_VER(12, 71), STEP_A0, STEP_B0) ||
+	    IS_DG2(ce->engine->i915))
 		cs = dg2_emit_draw_watermark_setting(cs);
 
 	return cs;
-}
-
-/*
- * Set memory fence address and call MI_MEM_FENCE as part of context
- * restore to ensure that all the writes are flushed and the ring and
- * batches in there are properly visible to the GPU.
- */
-static u32 *gen12_emit_indirectctx_bb(const struct intel_context *ce, u32 *cs)
-{
-	u64 mfence_addr;
-
-	if (!HAS_MEM_FENCE_SUPPORT(ce->engine->i915) || !ce->vm->mfence.vma)
-		return cs;
-
-	mfence_addr = ce->vm->mfence.vma->node.start;
-	*cs++ = STATE_SYSTEM_MEM_FENCE_ADDRESS;
-	*cs++ = lower_32_bits(mfence_addr);
-	*cs++ = upper_32_bits(mfence_addr);
-	*cs++ = MI_MEM_FENCE | MI_ACQUIRE_ENABLE;
-
-	return cs;
-}
-
-/*
- * Once we're done with our own work, we need to explicitly re-load GPR regs
- * from the context image again to put GPR regs back at their original values.
- */
-static u32 *emit_restore_gpr(const struct intel_context *ce, u32 *cs, int count)
-{
-	u32 mem = i915_ggtt_offset(ce->state) + LRC_STATE_OFFSET +
-		(lrc_ring_gpr0(ce->engine) + 1) * sizeof(u32);
-	u32 gpr = i915_mmio_reg_offset(GEN8_RING_CS_GPR(0, 0));
-	int i;
-
-	GEM_BUG_ON(lrc_ring_gpr0(ce->engine) == -1);
-
-	for (i = 0; i < 2 * count; i++) { /* each GPR is 64b; 2 LRM each */
-		*cs++ = MI_LOAD_REGISTER_MEM_GEN8 |
-			MI_SRM_LRM_GLOBAL_GTT |
-			MI_LRI_LRM_CS_MMIO;
-		*cs++ = gpr;
-		*cs++ = mem;
-		*cs++ = 0;
-
-		gpr += sizeof(u32);
-		mem += 2 * sizeof(u32);
-	}
-
-	return cs;
-}
-
-static u32 *xehpc_emit_credits_wa(const struct intel_context *ce, u32 *cs)
-{
-	enum { ID = 0, INSTANCE, RSHIFT, WRITEMASK, __NUM_GPR };
-
-	/*
-	 * We need to set the PCIe credits (BCS_SWCTRL) to use based on the
-	 * engine.
-	 * 64B (SWCTRL:2 == 1) on even engines (bcs0,2,4,6,8),
-	 * 256B (SWCTRL:2 == 0) on odd engines (bcs1,3,5,7).
-	 *
-	 * To handle virtual engines that may be transferred unknown between
-	 * physical engines, we set the credits inside context restore by
-	 * inspecting which engine we are running on (using CS_ENGINE_ID).
-	 */
-
-	*cs++ = MI_LOAD_REGISTER_REG |
-		MI_LRR_SOURCE_CS_MMIO |
-		MI_LRR_DEST_CS_MMIO;
-	*cs++ = i915_mmio_reg_offset(RING_ID(0));
-	*cs++ = i915_mmio_reg_offset(GEN8_RING_CS_GPR(0, ID));
-	*cs++ = MI_LOAD_REGISTER_IMM(6) | MI_LRI_DEST_CS_MMIO;
-	*cs++ = i915_mmio_reg_offset(GEN8_RING_CS_GPR(0, INSTANCE));
-	/*
-	 * RING_ENGINE_ID_LSB is useful to decide even/odd engine
-	 * instance
-	 */
-	*cs++ = RING_ENGINE_ID_LSB; /* RING_ENGINE_ID:instance mask */
-	*cs++ = i915_mmio_reg_offset(GEN8_RING_CS_GPR_UDW(0, INSTANCE));
-	*cs++ = 0;
-	*cs++ = i915_mmio_reg_offset(GEN8_RING_CS_GPR(0, RSHIFT));
-	/* Right shifter to shift RING_ID to BCS_SWCTRL (bit 2)*/
-	*cs++ = 2; /* rshifter */
-	*cs++ = i915_mmio_reg_offset(GEN8_RING_CS_GPR_UDW(0, RSHIFT));
-	*cs++ = 0;
-	*cs++ = i915_mmio_reg_offset(GEN8_RING_CS_GPR(0, WRITEMASK));
-	*cs++ = BCS_ENGINE_SWCTL_DISABLE_256B << 16; /* SWCTL mask */
-	*cs++ = i915_mmio_reg_offset(GEN8_RING_CS_GPR_UDW(0, WRITEMASK));
-	*cs++ = 0;
-
-	/* SWCTL:2 = ~CS_ENGINE_ID:4 */
-	*cs++ = MI_MATH(16);
-
-	/*
-	 * To determine whether the engine is even or odd, we just need to
-	 * know whether that particular engine index is even or odd (low
-	 * bit is 0). We don't care what the value of the upper bits are.
-	 */
-	*cs++ = MI_MATH_LOAD(MI_MATH_REG_SRCA, MI_MATH_REG(ID));
-	*cs++ = MI_MATH_LOAD(MI_MATH_REG_SRCB, MI_MATH_REG(INSTANCE));
-	*cs++ = MI_MATH_AND; /* instance = CS_ENGINE_ID & BIT(4) */
-	*cs++ = MI_MATH_STORE(MI_MATH_REG(ID), MI_MATH_REG_ACCU);
-
-	/*
-	 * Make sure 1 represents even here per 256B disable definition
-	 * in BCS_ENGINE_SWCTL, since we want 256B disabled on even engine
-	 * instances only.
-	 */
-	*cs++ = MI_MATH_LOAD(MI_MATH_REG_SRCA, MI_MATH_REG(ID));
-	*cs++ = MI_MATH_LOAD(MI_MATH_REG_SRCB, MI_MATH_REG(INSTANCE));
-	*cs++ = MI_MATH_XOR; /* even = instance ^ BIT(4) */
-	*cs++ = MI_MATH_STORE(MI_MATH_REG(ID), MI_MATH_REG_ACCU);
-
-	/*
-	 * Now that we know 1 is even, we want to disable 256B by shifting
-	 * that bit 4 (1 if even) down to bit 2 which is the 256B disable
-	 * bit in BCS_ENGINE_SWCTL.
-	 */
-	*cs++ = MI_MATH_LOAD(MI_MATH_REG_SRCA, MI_MATH_REG(ID));
-	*cs++ = MI_MATH_LOAD(MI_MATH_REG_SRCB, MI_MATH_REG(RSHIFT));
-	*cs++ = MI_MATH_SHR; /* dis_256B = even >> 2: BIT(4) -> BIT(2) */
-	*cs++ = MI_MATH_STORE(MI_MATH_REG(ID), MI_MATH_REG_ACCU);
-
-	/* Now set the mask bit to ensure the set/clear of dis_256B takes effect */
-	*cs++ = MI_MATH_LOAD(MI_MATH_REG_SRCA, MI_MATH_REG(ID));
-	*cs++ = MI_MATH_LOAD(MI_MATH_REG_SRCB, MI_MATH_REG(WRITEMASK));
-	*cs++ = MI_MATH_OR; /* swctl = dis_256B | BIT(2) << 16 */
-	*cs++ = MI_MATH_STORE(MI_MATH_REG(ID), MI_MATH_REG_ACCU);
-
-	*cs++ = MI_LOAD_REGISTER_REG |
-		MI_LRR_SOURCE_CS_MMIO |
-		MI_LRR_DEST_CS_MMIO;
-	*cs++ = i915_mmio_reg_offset(GEN8_RING_CS_GPR(0, ID));
-	*cs++ = i915_mmio_reg_offset(BCS_ENGINE_SWCTL(0));
-
-	return emit_restore_gpr(ce, cs, __NUM_GPR);
-}
-
-static u32 need_credits_wa(const struct intel_engine_cs *engine)
-{
-	return engine->class == COPY_ENGINE_CLASS &&
-		IS_PONTEVECCHIO(engine->i915);
 }
 
 static u32 *
@@ -1751,31 +1424,15 @@ gen12_emit_indirect_ctx_xcs(const struct intel_context *ce, u32 *cs)
 {
 	cs = gen12_emit_timestamp_wa(ce, cs);
 	cs = gen12_emit_restore_scratch(ce, cs);
-	cs = gen12_emit_indirectctx_bb(ce, cs);
-
-	/* Wa_16017236439:pvc */
-	if (need_credits_wa(ce->engine))
-		cs = xehpc_emit_credits_wa(ce, cs);
 
 	/* Wa_16013000631:dg2 */
-	if (IS_DG2_GRAPHICS_STEP(ce->engine->i915, G10, STEP_B0, STEP_C0) ||
-	    IS_DG2_G11(ce->engine->i915))
+	if (IS_DG2_G11(ce->engine->i915))
 		if (ce->engine->class == COMPUTE_CLASS)
 			cs = gen8_emit_pipe_control(cs,
 						    PIPE_CONTROL_INSTRUCTION_CACHE_INVALIDATE,
 						    0);
 
-	/* hsdes: 1809175790 */
-	if (!HAS_FLAT_CCS(ce->engine->i915)) {
-		if (ce->engine->class == VIDEO_DECODE_CLASS)
-			cs = gen12_emit_aux_table_inv(ce->engine->gt,
-						      cs, GEN12_VD0_AUX_NV);
-		else if (ce->engine->class == VIDEO_ENHANCEMENT_CLASS)
-			cs = gen12_emit_aux_table_inv(ce->engine->gt,
-						      cs, GEN12_VE0_AUX_NV);
-	}
-
-	return cs;
+	return gen12_emit_aux_table_inv(ce->engine, cs);
 }
 
 static void
@@ -1838,7 +1495,7 @@ static u32 lrc_descriptor(const struct intel_context *ce)
 	u32 desc;
 
 	desc = INTEL_LEGACY_32B_CONTEXT;
-	if (i915_vm_lvl(ce->vm) >= 4)
+	if (i915_vm_is_4lvl(ce->vm))
 		desc = INTEL_LEGACY_64B_CONTEXT;
 	desc <<= GEN8_CTX_ADDRESSING_MODE_SHIFT;
 
@@ -1847,22 +1504,6 @@ static u32 lrc_descriptor(const struct intel_context *ce)
 		desc |= GEN8_CTX_L3LLC_COHERENT;
 
 	return i915_ggtt_offset(ce->state) | desc;
-}
-
-static void set_ppgtt_regs(u32 *regs, const struct i915_ppgtt *ppgtt)
-{
-	if (i915_vm_lvl(&ppgtt->vm) >= 4) {
-		/* 64b PPGTT (48bit canonical)
-		 * PDP0_DESCRIPTOR contains the base address to PML4 and
-		 * other PDP Descriptors are ignored.
-		 */
-		ASSIGN_CTX_PML4(ppgtt, regs);
-	} else {
-		ASSIGN_CTX_PDP(ppgtt, regs, 3);
-		ASSIGN_CTX_PDP(ppgtt, regs, 2);
-		ASSIGN_CTX_PDP(ppgtt, regs, 1);
-		ASSIGN_CTX_PDP(ppgtt, regs, 0);
-	}
 }
 
 u32 lrc_update_regs(const struct intel_context *ce,
@@ -1879,8 +1520,6 @@ u32 lrc_update_regs(const struct intel_context *ce,
 	regs[CTX_RING_HEAD] = head;
 	regs[CTX_RING_TAIL] = ring->tail;
 	regs[CTX_RING_CTL] = RING_CTL_SIZE(ring->size) | RING_VALID;
-
-	set_ppgtt_regs(regs, vm_alias(ce->vm));
 
 	/* RPCS */
 	if (engine->class == RENDER_CLASS) {
@@ -1909,6 +1548,46 @@ void lrc_update_offsets(struct intel_context *ce,
 			struct intel_engine_cs *engine)
 {
 	set_offsets(ce->lrc_reg_state, reg_offsets(engine), engine, false);
+}
+
+void lrc_check_regs(const struct intel_context *ce,
+		    const struct intel_engine_cs *engine,
+		    const char *when)
+{
+	const struct intel_ring *ring = ce->ring;
+	u32 *regs = ce->lrc_reg_state;
+	bool valid = true;
+	int x;
+
+	if (regs[CTX_RING_START] != i915_ggtt_offset(ring->vma)) {
+		pr_err("%s: context submitted with incorrect RING_START [%08x], expected %08x\n",
+		       engine->name,
+		       regs[CTX_RING_START],
+		       i915_ggtt_offset(ring->vma));
+		regs[CTX_RING_START] = i915_ggtt_offset(ring->vma);
+		valid = false;
+	}
+
+	if ((regs[CTX_RING_CTL] & ~(RING_WAIT | RING_WAIT_SEMAPHORE)) !=
+	    (RING_CTL_SIZE(ring->size) | RING_VALID)) {
+		pr_err("%s: context submitted with incorrect RING_CTL [%08x], expected %08x\n",
+		       engine->name,
+		       regs[CTX_RING_CTL],
+		       (u32)(RING_CTL_SIZE(ring->size) | RING_VALID));
+		regs[CTX_RING_CTL] = RING_CTL_SIZE(ring->size) | RING_VALID;
+		valid = false;
+	}
+
+	x = lrc_ring_mi_mode(engine);
+	if (x != -1 && regs[x + 1] & (regs[x + 1] >> 16) & STOP_RING) {
+		pr_err("%s: context submitted with STOP_RING [%08x] in RING_MI_MODE\n",
+		       engine->name, regs[x + 1]);
+		regs[x + 1] &= ~STOP_RING;
+		regs[x + 1] |= STOP_RING << 16;
+		valid = false;
+	}
+
+	WARN_ONCE(!valid, "Invalid lrc state found %s submission\n", when);
 }
 
 /*
@@ -2171,13 +1850,9 @@ void lrc_init_wa_ctx(struct intel_engine_cs *engine)
 retry:
 	err = i915_gem_object_lock(wa_ctx->vma->obj, &ww);
 	if (!err)
-		err = i915_ggtt_pin_for_gt(wa_ctx->vma, &ww, 0, PIN_HIGH);
+		err = i915_ggtt_pin(wa_ctx->vma, &ww, 0, PIN_HIGH);
 	if (err)
 		goto err;
-
-	err = i915_vma_wait_for_bind(wa_ctx->vma);
-	if (err)
-		goto err_unpin;
 
 	batch = i915_gem_object_pin_map(wa_ctx->vma->obj, I915_MAP_WB);
 	if (IS_ERR(batch)) {

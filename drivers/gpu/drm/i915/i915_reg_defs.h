@@ -143,6 +143,54 @@
  */
 #define REG_FIELD_GET64(__mask, __val)	((u64)FIELD_GET(__mask, __val))
 
+/**
+ * REG_BIT16() - Prepare a u16 bit value
+ * @__n: 0-based bit number
+ *
+ * Local wrapper for BIT() to force u16, with compile time
+ * checks.
+ *
+ * @return: Value with bit @__n set.
+ */
+#define REG_BIT16(__n)                                                   \
+	((u16)(BIT(__n) +                                                \
+	       BUILD_BUG_ON_ZERO(__is_constexpr(__n) &&         \
+				 ((__n) < 0 || (__n) > 15))))
+
+/**
+ * REG_GENMASK16() - Prepare a continuous u8 bitmask
+ * @__high: 0-based high bit
+ * @__low: 0-based low bit
+ *
+ * Local wrapper for GENMASK() to force u16, with compile time
+ * checks.
+ *
+ * @return: Continuous bitmask from @__high to @__low, inclusive.
+ */
+#define REG_GENMASK16(__high, __low)                                     \
+	((u16)(GENMASK(__high, __low) +                                  \
+	       BUILD_BUG_ON_ZERO(__is_constexpr(__high) &&      \
+				 __is_constexpr(__low) &&               \
+				 ((__low) < 0 || (__high) > 15 || (__low) > (__high)))))
+
+/**
+ * REG_FIELD_PREP16() - Prepare a u16 bitfield value
+ * @__mask: shifted mask defining the field's length and position
+ * @__val: value to put in the field
+ *
+ * Local copy of FIELD_PREP16() to generate an integer constant
+ * expression, force u8 and for consistency with
+ * REG_FIELD_GET16(), REG_BIT16() and REG_GENMASK16().
+ *
+ * @return: @__val masked and shifted into the field defined by @__mask.
+ */
+#define REG_FIELD_PREP16(__mask, __val)                                          \
+	((u16)((((typeof(__mask))(__val) << __bf_shf(__mask)) & (__mask)) +      \
+	       BUILD_BUG_ON_ZERO(!__is_constexpr(__mask)) +             \
+	       BUILD_BUG_ON_ZERO((__mask) == 0 || (__mask) > U16_MAX) +          \
+	       BUILD_BUG_ON_ZERO(!IS_POWER_OF_2((__mask) + (1ULL << __bf_shf(__mask)))) + \
+	       BUILD_BUG_ON_ZERO(__builtin_choose_expr(__is_constexpr(__val), (~((__mask) >> __bf_shf(__mask)) & (__val)), 0))))
+
 #define __MASKED_FIELD(mask, value) ((mask) << 16 | (value))
 #define _MASKED_FIELD(mask, value) ({					   \
 	if (__builtin_constant_p(mask))					   \
@@ -222,6 +270,8 @@ typedef struct {
 	u32 reg;
 } i915_mcr_reg_t;
 
+#define MCR_REG(offset)	((const i915_mcr_reg_t){ .reg = (offset) })
+
 #define INVALID_MMIO_REG _MMIO(0)
 
 /*
@@ -233,7 +283,5 @@ typedef struct {
 	_Generic((r), i915_reg_t: (r).reg, i915_mcr_reg_t: (r).reg)
 #define i915_mmio_reg_equal(a, b) (i915_mmio_reg_offset(a) == i915_mmio_reg_offset(b))
 #define i915_mmio_reg_valid(r) (!i915_mmio_reg_equal(r, INVALID_MMIO_REG))
-
-#define TD_ATT_MAX				3
 
 #endif /* __I915_REG_DEFS__ */

@@ -1,6 +1,6 @@
-// SPDX-License-Identifier: MIT
+/* SPDX-License-Identifier: MIT */
 /*
- * Copyright © 2020 Intel Corporation
+ * Copyright © 2022 Intel Corporation
  */
 
 #ifndef __SYSFS_GT_PM_H__
@@ -11,6 +11,5 @@
 #include "intel_gt_types.h"
 
 void intel_gt_sysfs_pm_init(struct intel_gt *gt, struct kobject *kobj);
-void intel_gt_sysfs_pm_remove(struct intel_gt *gt, struct kobject *kobj);
 
 #endif /* SYSFS_RC6_H */

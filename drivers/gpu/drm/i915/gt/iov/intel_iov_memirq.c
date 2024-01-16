@@ -7,21 +7,21 @@
 #include "intel_iov_memirq.h"
 #include "intel_iov_reg.h"
 #include "intel_iov_utils.h"
+#include "gem/i915_gem_lmem.h"
 #include "gem/i915_gem_region.h"
 #include "gt/intel_breadcrumbs.h"
 #include "gt/intel_gt.h"
-#include "gt/intel_gt_irq.h"
+#include "gt/intel_gt_print.h"
 #include "gt/intel_gt_regs.h"
 #include "gt/uc/abi/guc_actions_vf_abi.h"
 
 #ifdef CPTCFG_DRM_I915_DEBUG_IOV
-#define MEMIRQ_DEBUG(_gt, _f, ...) \
-	drm_dbg(&(_gt)->i915->drm, "IRQ%u " _f, (_gt)->info.id, ##__VA_ARGS__)
+#define MEMIRQ_DEBUG(_gt, _f, ...) gt_dbg((_gt), "IRQ " _f, ##__VA_ARGS__)
 #else
-#define MEMIRQ_DEBUG(_gt, ...) typecheck(struct intel_gt *, _gt)
+#define MEMIRQ_DEBUG(...)
 #endif
 
-/**
+/*
  * Memory based irq page layout
  * We use a single page to contain the different objects used for memory
  * based irq (which are also called "page" in the specs, even if they
@@ -32,7 +32,7 @@
  *   status vectors for each unit. Each bit in the interrupt vectors is
  *   converted to a byte, with the byte being set to 0xFF when an
  *   interrupt is triggered; interrupt vectors are 16b big so each unit
- *   gets 16B. One space is reseved for each bit in one of the
+ *   gets 16B. One space is reserved for each bit in one of the
  *   GEN11_GT_INTR_DWx registers, so this object needs a total of 1024B.
  *   This object needs to be 4k aligned.
  *
@@ -49,9 +49,7 @@
 static int vf_create_memirq_data(struct intel_iov *iov)
 {
 	struct drm_i915_private *i915 = iov_to_i915(iov);
-	struct intel_gt *gt = iov_to_gt(iov);
 	struct drm_i915_gem_object *obj;
-	struct intel_memory_region *mem;
 	void *vaddr;
 	int err;
 	u32 *enable_vector;
@@ -60,16 +58,15 @@ static int vf_create_memirq_data(struct intel_iov *iov)
 	GEM_BUG_ON(!HAS_MEMORY_IRQ_STATUS(i915));
 	GEM_BUG_ON(iov->vf.irq.obj);
 
-	mem = i915->mm.regions[INTEL_REGION_SMEM];
-	obj = i915_gem_object_create_region(mem, SZ_4K,
-					    I915_BO_ALLOC_VOLATILE |
-					    I915_BO_CPU_CLEAR);
+	obj = i915_gem_object_create_shmem(i915, SZ_4K);
 	if (IS_ERR(obj)) {
 		err = PTR_ERR(obj);
 		goto out;
 	}
 
-	vaddr = i915_gem_object_pin_map_unlocked(obj, i915_coherent_map_type(i915, obj, true));
+	vaddr = i915_gem_object_pin_map_unlocked(obj,
+						 i915_coherent_map_type(iov_to_gt(iov), obj,
+									    true));
 	if (IS_ERR(vaddr)) {
 		err = PTR_ERR(vaddr);
 		goto out_obj;
@@ -78,16 +75,9 @@ static int vf_create_memirq_data(struct intel_iov *iov)
 	iov->vf.irq.obj = obj;
 	iov->vf.irq.vaddr = vaddr;
 
-	enable_vector = (u32*)(vaddr + I915_VF_IRQ_ENABLE);
-
-	/* Wa:16014207253 */
-	if (gt->fake_int.enabled) {
-		drm_info(&gt->i915->drm, "Using fake interrupt w/a, gt = %d\n", gt->info.id);
-		*enable_vector = 0x0;
-	} else {
-		/*XXX: we should start with all irqs disabled: 0xffff0000 */
-		*enable_vector = 0xffff;
-	}
+	enable_vector = (u32 *)(vaddr + I915_VF_IRQ_ENABLE);
+	/*XXX: we should start with all irqs disabled: 0xffff0000 */
+	*enable_vector = 0xffff;
 
 	return 0;
 
@@ -122,9 +112,9 @@ static int vf_map_memirq_data(struct intel_iov *iov)
 	return 0;
 
 out_vma:
-	__i915_vma_put(vma);
+	i915_gem_object_put(iov->vf.irq.obj);
 out:
-	IOV_DEBUG(iov, "failed %d\n", err);
+	IOV_DEBUG(iov, "failed %pe\n", ERR_PTR(err));
 	return err;
 }
 
@@ -163,7 +153,7 @@ int intel_iov_memirq_init(struct intel_iov *iov)
 }
 
 /**
- * intel_iov_irq_fini - Release data used by memory based interrupts.
+ * intel_iov_memirq_fini - Release data used by memory based interrupts.
  * @iov: the IOV struct
  *
  * Release data used by memory based interrupts.
@@ -177,11 +167,11 @@ void intel_iov_memirq_fini(struct intel_iov *iov)
 }
 
 /**
- * intel_iov_memirq_prepare_guc - Prepare GuC to use memory based interrrupts.
+ * intel_iov_memirq_prepare_guc - Prepare GuC to use memory based interrupts.
  * @iov: the IOV struct
  *
  * Register Interrupt Source Report page and Interrupt Status Report page
- * within GuC to correctly handle memory based interrrupts from GuC.
+ * within GuC to correctly handle memory based interrupts from GuC.
  *
  * Return: 0 on success or a negative error code on failure.
  */
@@ -226,7 +216,7 @@ failed:
 void intel_iov_memirq_reset(struct intel_iov *iov)
 {
 	u8 *irq = iov->vf.irq.vaddr;
-	u32 *val = (u32*)(irq + I915_VF_IRQ_ENABLE);
+	u32 *val = (u32 *)(irq + I915_VF_IRQ_ENABLE);
 
 	GEM_BUG_ON(!intel_iov_is_vf(iov));
 
@@ -243,7 +233,7 @@ void intel_iov_memirq_reset(struct intel_iov *iov)
 void intel_iov_memirq_postinstall(struct intel_iov *iov)
 {
 	u8 *irq = iov->vf.irq.vaddr;
-	u32 *val = (u32*)(irq + I915_VF_IRQ_ENABLE);
+	u32 *val = (u32 *)(irq + I915_VF_IRQ_ENABLE);
 
 	GEM_BUG_ON(!intel_iov_is_vf(iov));
 
@@ -259,7 +249,8 @@ static void __engine_mem_irq_handler(struct intel_engine_cs *engine, u8 *status)
 
 	if (READ_ONCE(status[ilog2(GT_RENDER_USER_INTERRUPT)]) == 0xFF) {
 		WRITE_ONCE(status[ilog2(GT_RENDER_USER_INTERRUPT)], 0x00);
-		intel_engine_cs_irq(engine, -1);
+		intel_engine_signal_breadcrumbs(engine);
+		tasklet_hi_schedule(&engine->sched_engine->tasklet);
 	}
 }
 

@@ -45,8 +45,8 @@ static s32 scale_log_param(struct intel_guc_log *log, const struct guc_log_secti
 		return section->default_val;
 
 	/* Check for 32-bit overflow */
-	if (param >= SZ_4K) {
-		drm_err(&guc_to_gt(log_to_guc(log))->i915->drm, "Size too large for GuC %s log: %dMB!",
+	if (overflows_type(param * (s64) SZ_1M, param)) {
+		gt_err(guc_to_gt(log_to_guc(log)), "Size too large for GuC %s log: %dMB!",
 			section->name, param);
 		return section->default_val;
 	}
@@ -166,7 +166,7 @@ u32 intel_guc_log_section_size_capture(struct intel_guc_log *log)
 	return log->sizes[GUC_LOG_SECTIONS_CAPTURE].bytes;
 }
 
-u32 intel_guc_log_size(struct intel_guc_log *log)
+static u32 intel_guc_log_size(struct intel_guc_log *log)
 {
 	/*
 	 *  GuC Log buffer Layout:
@@ -193,12 +193,6 @@ u32 intel_guc_log_size(struct intel_guc_log *log)
 		intel_guc_log_section_size_crash(log) +
 		intel_guc_log_section_size_debug(log) +
 		intel_guc_log_section_size_capture(log);
-}
-
-#define GUC_LOG_RELAY_SUBBUF_COUNT 8
-u32 intel_guc_log_relay_subbuf_count(struct intel_guc_log *log)
-{
-	return GUC_LOG_RELAY_SUBBUF_COUNT;
 }
 
 /**
@@ -310,11 +304,7 @@ static int remove_buf_file_callback(struct dentry *dentry)
 }
 
 /* relay channel callbacks */
-#ifdef BPM_CONST_STRUCT_RCHAN_CALLBACKS_NOT_PRESENT
-static struct rchan_callbacks relay_callbacks = {
-#else
 static const struct rchan_callbacks relay_callbacks = {
-#endif
 	.subbuf_start = subbuf_start_callback,
 	.create_buf_file = create_buf_file_callback,
 	.remove_buf_file = remove_buf_file_callback,
@@ -494,16 +484,13 @@ static void _guc_log_copy_debuglogs_for_relay(struct intel_guc_log *log)
 
 		/* Just copy the newly written data */
 		if (read_offset > write_offset) {
-			if (!i915_memcpy_from_wc(dst_data, src_data, write_offset))
-				i915_unaligned_memcpy_from_wc(dst_data, src_data, write_offset);
+			i915_memcpy_from_wc(dst_data, src_data, write_offset);
 			bytes_to_copy = buffer_size - read_offset;
 		} else {
 			bytes_to_copy = write_offset - read_offset;
 		}
-		if (!i915_memcpy_from_wc(dst_data + read_offset,
-					 src_data + read_offset, bytes_to_copy))
-			i915_unaligned_memcpy_from_wc(dst_data + read_offset,
-						      src_data + read_offset, bytes_to_copy);
+		i915_memcpy_from_wc(dst_data + read_offset,
+				    src_data + read_offset, bytes_to_copy);
 
 		src_data += buffer_size;
 		dst_data += buffer_size;
@@ -558,7 +545,7 @@ void intel_guc_log_init_early(struct intel_guc_log *log)
 static int guc_log_relay_create(struct intel_guc_log *log)
 {
 	struct intel_guc *guc = log_to_guc(log);
-	struct drm_i915_private *dev_priv = guc_to_gt(guc)->i915;
+	struct drm_i915_private *i915 = guc_to_gt(guc)->i915;
 	struct rchan *guc_log_relay_chan;
 	size_t n_subbufs, subbuf_size;
 	int ret;
@@ -578,15 +565,15 @@ static int guc_log_relay_create(struct intel_guc_log *log)
 	 * latency, for consuming the logs from relay. Also doesn't take
 	 * up too much memory.
 	 */
-	n_subbufs = intel_guc_log_relay_subbuf_count(log);
+	n_subbufs = 8;
 
 	if (!guc->dbgfs_node)
 		return -ENOENT;
 
-	guc_log_relay_chan = relay_open("guc_log_relay_chan",
+	guc_log_relay_chan = relay_open("guc_log",
 					guc->dbgfs_node,
 					subbuf_size, n_subbufs,
-					&relay_callbacks, dev_priv);
+					&relay_callbacks, i915);
 	if (!guc_log_relay_chan) {
 		guc_err(guc, "Couldn't create relay channel for logging\n");
 
@@ -611,7 +598,7 @@ static void guc_log_relay_destroy(struct intel_guc_log *log)
 static void guc_log_copy_debuglogs_for_relay(struct intel_guc_log *log)
 {
 	struct intel_guc *guc = log_to_guc(log);
-	struct drm_i915_private *dev_priv = guc_to_gt(guc)->i915;
+	struct drm_i915_private *i915 = guc_to_gt(guc)->i915;
 	intel_wakeref_t wakeref;
 
 	_guc_log_copy_debuglogs_for_relay(log);
@@ -620,7 +607,7 @@ static void guc_log_copy_debuglogs_for_relay(struct intel_guc_log *log)
 	 * Generally device is expected to be active only at this
 	 * time, so get/put should be really quick.
 	 */
-	with_intel_runtime_pm(&dev_priv->runtime_pm, wakeref)
+	with_intel_runtime_pm(&i915->runtime_pm, wakeref)
 		guc_action_flush_log_complete(guc);
 }
 
@@ -702,7 +689,7 @@ void intel_guc_log_destroy(struct intel_guc_log *log)
 int intel_guc_log_set_level(struct intel_guc_log *log, u32 level)
 {
 	struct intel_guc *guc = log_to_guc(log);
-	struct drm_i915_private *dev_priv = guc_to_gt(guc)->i915;
+	struct drm_i915_private *i915 = guc_to_gt(guc)->i915;
 	intel_wakeref_t wakeref;
 	int ret = 0;
 
@@ -716,12 +703,12 @@ int intel_guc_log_set_level(struct intel_guc_log *log, u32 level)
 	if (level < GUC_LOG_LEVEL_DISABLED || level > GUC_LOG_LEVEL_MAX)
 		return -EINVAL;
 
-	mutex_lock(&dev_priv->drm.struct_mutex);
+	mutex_lock(&i915->drm.struct_mutex);
 
 	if (log->level == level)
 		goto out_unlock;
 
-	with_intel_runtime_pm(&dev_priv->runtime_pm, wakeref)
+	with_intel_runtime_pm(&i915->runtime_pm, wakeref)
 		ret = guc_action_control_log(guc,
 					     GUC_LOG_LEVEL_IS_VERBOSE(level),
 					     GUC_LOG_LEVEL_IS_ENABLED(level),
@@ -734,14 +721,14 @@ int intel_guc_log_set_level(struct intel_guc_log *log, u32 level)
 	log->level = level;
 
 out_unlock:
-	mutex_unlock(&dev_priv->drm.struct_mutex);
+	mutex_unlock(&i915->drm.struct_mutex);
 
 	return ret;
 }
 
 bool intel_guc_log_relay_created(const struct intel_guc_log *log)
 {
-	return log->relay.buf_in_use;
+	return log->buf_addr;
 }
 
 int intel_guc_log_relay_open(struct intel_guc_log *log)

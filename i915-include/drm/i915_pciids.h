@@ -588,6 +588,7 @@
 	INTEL_VGA_DEVICE(0x4551, info), \
 	INTEL_VGA_DEVICE(0x4555, info), \
 	INTEL_VGA_DEVICE(0x4557, info), \
+	INTEL_VGA_DEVICE(0x4570, info), \
 	INTEL_VGA_DEVICE(0x4571, info)
 
 /* JSL */
@@ -684,14 +685,18 @@
 	INTEL_VGA_DEVICE(0xA78A, info), \
 	INTEL_VGA_DEVICE(0xA78B, info)
 
+/* RPL-U */
+#define INTEL_RPLU_IDS(info) \
+	INTEL_VGA_DEVICE(0xA721, info), \
+	INTEL_VGA_DEVICE(0xA7A1, info), \
+	INTEL_VGA_DEVICE(0xA7A9, info)
+
 /* RPL-P */
 #define INTEL_RPLP_IDS(info) \
+	INTEL_RPLU_IDS(info), \
 	INTEL_VGA_DEVICE(0xA720, info), \
-	INTEL_VGA_DEVICE(0xA721, info), \
 	INTEL_VGA_DEVICE(0xA7A0, info), \
-	INTEL_VGA_DEVICE(0xA7A1, info), \
-	INTEL_VGA_DEVICE(0xA7A8, info), \
-	INTEL_VGA_DEVICE(0xA7A9, info)
+	INTEL_VGA_DEVICE(0xA7A8, info)
 
 /* DG2 */
 #define INTEL_DG2_G10_IDS(info) \
@@ -725,8 +730,7 @@
 	INTEL_DG2_G12_IDS(info)
 
 #define INTEL_ATS_M150_IDS(info) \
-	INTEL_VGA_DEVICE(0x56C0, info), \
-	INTEL_VGA_DEVICE(0x56C2, info)
+	INTEL_VGA_DEVICE(0x56C0, info)
 
 #define INTEL_ATS_M75_IDS(info) \
 	INTEL_VGA_DEVICE(0x56C1, info)
@@ -734,31 +738,17 @@
 #define INTEL_ATS_M_IDS(info) \
 	INTEL_ATS_M150_IDS(info), \
 	INTEL_ATS_M75_IDS(info)
+
 /* MTL */
-#define INTEL_MTL_M_IDS(info) \
-	INTEL_VGA_DEVICE(0x7D40, info), \
-	INTEL_VGA_DEVICE(0x7D60, info)
-
-#define INTEL_MTL_P_IDS(info) \
-	INTEL_VGA_DEVICE(0x7D45, info), \
-	INTEL_VGA_DEVICE(0x7D55, info), \
-	INTEL_VGA_DEVICE(0x7DD5, info)
-
 #define INTEL_MTL_IDS(info) \
-	INTEL_MTL_M_IDS(info), \
-	INTEL_MTL_P_IDS(info)
-
-/* PVC */
-#define INTEL_PVC_IDS(info) \
-	INTEL_VGA_DEVICE(0x0B69, info), \
-	INTEL_VGA_DEVICE(0x0B6E, info), \
-	INTEL_VGA_DEVICE(0x0BD0, info), \
-	INTEL_VGA_DEVICE(0x0BD5, info), \
-	INTEL_VGA_DEVICE(0x0BD6, info), \
-	INTEL_VGA_DEVICE(0x0BD7, info), \
-	INTEL_VGA_DEVICE(0x0BD8, info), \
-	INTEL_VGA_DEVICE(0x0BD9, info), \
-	INTEL_VGA_DEVICE(0x0BDA, info), \
-	INTEL_VGA_DEVICE(0x0BDB, info)
+	INTEL_VGA_DEVICE(0x7D40, info), \
+	INTEL_VGA_DEVICE(0x7D41, info), \
+	INTEL_VGA_DEVICE(0x7D45, info), \
+	INTEL_VGA_DEVICE(0x7D51, info), \
+	INTEL_VGA_DEVICE(0x7D55, info), \
+	INTEL_VGA_DEVICE(0x7D60, info), \
+	INTEL_VGA_DEVICE(0x7D67, info), \
+	INTEL_VGA_DEVICE(0x7DD1, info), \
+	INTEL_VGA_DEVICE(0x7DD5, info)
 
 #endif /* _I915_PCIIDS_H */

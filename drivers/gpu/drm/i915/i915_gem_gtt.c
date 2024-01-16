@@ -44,7 +44,8 @@ int i915_gem_gtt_prepare_pages(struct drm_i915_gem_object *obj,
 		 * try again - if there are no more pages to remove from
 		 * the DMA remapper, i915_gem_shrink will return 0.
 		 */
-	} while (i915_gem_shrink(to_i915(obj->base.dev),
+		GEM_BUG_ON(obj->mm.pages == pages);
+	} while (i915_gem_shrink(NULL, to_i915(obj->base.dev),
 				 obj->base.size >> PAGE_SHIFT, NULL,
 				 I915_SHRINK_BOUND |
 				 I915_SHRINK_UNBOUND));
@@ -56,15 +57,21 @@ void i915_gem_gtt_finish_pages(struct drm_i915_gem_object *obj,
 			       struct sg_table *pages)
 {
 	struct drm_i915_private *i915 = to_i915(obj->base.dev);
+	struct i915_ggtt *ggtt = to_gt(i915)->ggtt;
 
-	dma_unmap_sg_attrs(i915->drm.dev, pages->sgl, pages->nents,
-			DMA_BIDIRECTIONAL,
-			DMA_ATTR_SKIP_CPU_SYNC);
+	/* XXX This does not prevent more requests being submitted! */
+	if (unlikely(ggtt->do_idle_maps))
+		/* Wait a bit, in the hope it avoids the hang */
+		usleep_range(100, 250);
+
+	dma_unmap_sg(i915->drm.dev, pages->sgl, pages->nents,
+		     DMA_BIDIRECTIONAL);
 }
 
 /**
  * i915_gem_gtt_reserve - reserve a node in an address_space (GTT)
  * @vm: the &struct i915_address_space
+ * @ww: An optional struct i915_gem_ww_ctx.
  * @node: the &struct drm_mm_node (typically i915_vma.mode)
  * @size: how much space to allocate inside the GTT,
  *        must be #I915_GTT_PAGE_SIZE aligned
@@ -88,6 +95,7 @@ void i915_gem_gtt_finish_pages(struct drm_i915_gem_object *obj,
  * asked to wait for eviction and interrupted.
  */
 int i915_gem_gtt_reserve(struct i915_address_space *vm,
+			 struct i915_gem_ww_ctx *ww,
 			 struct drm_mm_node *node,
 			 u64 size, u64 offset, unsigned long color,
 			 unsigned int flags)
@@ -112,7 +120,7 @@ int i915_gem_gtt_reserve(struct i915_address_space *vm,
 	if (flags & PIN_NOEVICT)
 		return -ENOSPC;
 
-	err = i915_gem_evict_for_node(vm, node, flags);
+	err = i915_gem_evict_for_node(vm, ww, node, flags);
 	if (err == 0)
 		err = drm_mm_reserve_node(&vm->mm, node);
 
@@ -129,12 +137,12 @@ static u64 random_offset(u64 start, u64 end, u64 len, u64 align)
 	range = round_down(end - len, align) - round_up(start, align);
 	if (range) {
 		if (sizeof(unsigned long) == sizeof(u64)) {
-			addr = get_random_long();
+			addr = get_random_u64();
 		} else {
-			addr = get_random_int();
+			addr = get_random_u32();
 			if (range > U32_MAX) {
 				addr <<= 32;
-				addr |= get_random_int();
+				addr |= get_random_u32();
 			}
 		}
 		div64_u64_rem(addr, range, &addr);
@@ -147,6 +155,7 @@ static u64 random_offset(u64 start, u64 end, u64 len, u64 align)
 /**
  * i915_gem_gtt_insert - insert a node into an address_space (GTT)
  * @vm: the &struct i915_address_space
+ * @ww: An optional struct i915_gem_ww_ctx.
  * @node: the &struct drm_mm_node (typically i915_vma.node)
  * @size: how much space to allocate inside the GTT,
  *        must be #I915_GTT_PAGE_SIZE aligned
@@ -179,6 +188,7 @@ static u64 random_offset(u64 start, u64 end, u64 len, u64 align)
  * asked to wait for eviction and interrupted.
  */
 int i915_gem_gtt_insert(struct i915_address_space *vm,
+			struct i915_gem_ww_ctx *ww,
 			struct drm_mm_node *node,
 			u64 size, u64 alignment, unsigned long color,
 			u64 start, u64 end, unsigned int flags)
@@ -264,7 +274,7 @@ int i915_gem_gtt_insert(struct i915_address_space *vm,
 	 */
 	offset = random_offset(start, end,
 			       size, alignment ?: I915_GTT_MIN_ALIGNMENT);
-	err = i915_gem_gtt_reserve(vm, node, size, offset, color, flags);
+	err = i915_gem_gtt_reserve(vm, ww, node, size, offset, color, flags);
 	if (err != -ENOSPC)
 		return err;
 
@@ -272,7 +282,7 @@ int i915_gem_gtt_insert(struct i915_address_space *vm,
 		return -ENOSPC;
 
 	/* Randomly selected placement is pinned, do a search */
-	err = i915_gem_evict_something(vm, size, alignment, color,
+	err = i915_gem_evict_something(vm, ww, size, alignment, color,
 				       start, end, flags);
 	if (err)
 		return err;
@@ -280,28 +290,6 @@ int i915_gem_gtt_insert(struct i915_address_space *vm,
 	return drm_mm_insert_node_in_range(&vm->mm, node,
 					   size, alignment, color,
 					   start, end, DRM_MM_INSERT_EVICT);
-}
-
-struct drm_mm_node *i915_gem_gtt_lookup(struct i915_address_space *vm, u64 addr)
-{
-	struct drm_mm_node *node;
-	u64 page_size, start, end;
-
-	lockdep_assert_held(&vm->mutex);
-
-	if (unlikely(!(addr < vm->total)))
-		return NULL;
-
-	page_size = BIT(__ffs(INTEL_INFO(vm->i915)->page_sizes));
-	start = round_down(addr, page_size);
-	end = start + page_size;
-
-	drm_mm_for_each_node_in_range(node, &vm->mm, start, end)
-		if (addr >= node->start && addr < node->start + node->size &&
-		    drm_mm_node_allocated(node))
-			return node;
-
-	return NULL;
 }
 
 #if IS_ENABLED(CPTCFG_DRM_I915_SELFTEST)

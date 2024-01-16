@@ -7,23 +7,21 @@
 #ifndef __I915_GEM_OBJECT_TYPES_H__
 #define __I915_GEM_OBJECT_TYPES_H__
 
-#ifdef BPM_MMU_INTERVAL_NOTIFIER_NOTIFIER_NOT_PRESENT
-#include <linux/i915_gem_mmu_notifier.h>
-#else
 #include <linux/mmu_notifier.h>
-#endif
 
 #include <drm/drm_gem.h>
-#include <drm/ttm/ttm_bo_api.h>
+#include <drm/ttm/ttm_bo.h>
 #include <uapi/drm/i915_drm.h>
 
 #include "i915_active.h"
 #include "i915_selftest.h"
+#include "i915_vma_resource.h"
 
 #include "gt/intel_gt_defines.h"
 
 struct drm_i915_gem_object;
 struct intel_fronbuffer;
+struct intel_memory_region;
 
 /*
  * struct i915_lut_handle tracks the fast lookups from handle to vma used
@@ -39,10 +37,11 @@ struct i915_lut_handle {
 
 struct drm_i915_gem_object_ops {
 	unsigned int flags;
-#define I915_GEM_OBJECT_HAS_IOMEM	BIT(1)
-#define I915_GEM_OBJECT_IS_SHRINKABLE	BIT(2)
-#define I915_GEM_OBJECT_IS_PROXY	BIT(3)
-#define I915_GEM_OBJECT_NO_MMAP		BIT(4)
+#define I915_GEM_OBJECT_IS_SHRINKABLE			BIT(1)
+/* Skip the shrinker management in set_pages/unset_pages */
+#define I915_GEM_OBJECT_SELF_MANAGED_SHRINK_LIST	BIT(2)
+#define I915_GEM_OBJECT_IS_PROXY			BIT(3)
+#define I915_GEM_OBJECT_NO_MMAP				BIT(4)
 
 	/* Interface between the GEM object and its backing storage.
 	 * get_pages() is called once prior to the use of the associated set
@@ -58,16 +57,36 @@ struct drm_i915_gem_object_ops {
 	 * reap pages for the shrinker).
 	 */
 	int (*get_pages)(struct drm_i915_gem_object *obj);
-	int (*put_pages)(struct drm_i915_gem_object *obj,
-			 struct sg_table *pages);
-	void (*truncate)(struct drm_i915_gem_object *obj);
-	void (*writeback)(struct drm_i915_gem_object *obj);
+	void (*put_pages)(struct drm_i915_gem_object *obj,
+			  struct sg_table *pages);
+	int (*truncate)(struct drm_i915_gem_object *obj);
+	/**
+	 * shrink - Perform further backend specific actions to facilate
+	 * shrinking.
+	 * @obj: The gem object
+	 * @flags: Extra flags to control shrinking behaviour in the backend
+	 *
+	 * Possible values for @flags:
+	 *
+	 * I915_GEM_OBJECT_SHRINK_WRITEBACK - Try to perform writeback of the
+	 * backing pages, if supported.
+	 *
+	 * I915_GEM_OBJECT_SHRINK_NO_GPU_WAIT - Don't wait for the object to
+	 * idle.  Active objects can be considered later. The TTM backend for
+	 * example might have aync migrations going on, which don't use any
+	 * i915_vma to track the active GTT binding, and hence having an unbound
+	 * object might not be enough.
+	 */
+#define I915_GEM_OBJECT_SHRINK_WRITEBACK   BIT(0)
+#define I915_GEM_OBJECT_SHRINK_NO_GPU_WAIT BIT(1)
+	int (*shrink)(struct drm_i915_gem_object *obj, unsigned int flags);
 
 	int (*pread)(struct drm_i915_gem_object *obj,
 		     const struct drm_i915_gem_pread *arg);
 	int (*pwrite)(struct drm_i915_gem_object *obj,
 		      const struct drm_i915_gem_pwrite *arg);
 	u64 (*mmap_offset)(struct drm_i915_gem_object *obj);
+	void (*unmap_virtual)(struct drm_i915_gem_object *obj);
 
 	int (*dmabuf_export)(struct drm_i915_gem_object *obj);
 
@@ -84,6 +103,15 @@ struct drm_i915_gem_object_ops {
 	 * delayed_free - Override the default delayed free implementation
 	 */
 	void (*delayed_free)(struct drm_i915_gem_object *obj);
+
+	/**
+	 * migrate - Migrate object to a different region either for
+	 * pinning or for as long as the object lock is held.
+	 */
+	int (*migrate)(struct drm_i915_gem_object *obj,
+		       struct intel_memory_region *mr,
+		       unsigned int flags);
+
 	void (*release)(struct drm_i915_gem_object *obj);
 
 	const struct vm_operations_struct *mmap_ops;
@@ -168,6 +196,12 @@ enum i915_cache_level {
 	 * engine.
 	 */
 	I915_CACHE_WT,
+	/**
+	 * @I915_MAX_CACHE_LEVEL:
+	 *
+	 * Mark the last entry in the enum. Used for defining cachelevel_to_pat
+	 * array for cache_level to pat translation table.
+	 */
 	I915_MAX_CACHE_LEVEL,
 };
 
@@ -184,6 +218,7 @@ enum i915_mmap_type {
 	I915_MMAP_TYPE_WC,
 	I915_MMAP_TYPE_WB,
 	I915_MMAP_TYPE_UC,
+	I915_MMAP_TYPE_FIXED,
 };
 
 struct i915_mmap_offset {
@@ -202,16 +237,6 @@ struct i915_gem_object_page_iter {
 	struct mutex lock; /* protects this cache */
 };
 
-struct i915_resv {
-	struct dma_resv base;
-	union {
-		struct kref refcount;
-		struct rcu_head rcu;
-	};
-};
-
-#define I915_BO_MIN_CHUNK_SIZE	SZ_64K
-
 struct drm_i915_gem_object {
 	/*
 	 * We might have reason to revisit the below since it wastes
@@ -225,19 +250,6 @@ struct drm_i915_gem_object {
 	};
 
 	const struct drm_i915_gem_object_ops *ops;
-
-	unsigned long *nodes;
-	unsigned long mempol;
-	int maxnode;
-
-	struct rb_root_cached segments;
-	struct rb_node segment_node;
-	unsigned long segment_offset;
-	struct drm_i915_gem_object *parent;
-
-	/* VM pointer if the object is private to a VM; NULL otherwise */
-	struct i915_address_space *vm;
-	struct list_head priv_obj_link;
 
 	struct {
 		/**
@@ -285,7 +297,10 @@ struct drm_i915_gem_object {
 	 * when i915_gem_ww_ctx_backoff() or i915_gem_ww_ctx_fini() are called.
 	 */
 	struct list_head obj_link;
-	struct i915_resv *shares_resv;
+	/**
+	 * @shared_resv_from: The object shares the resv from this vm.
+	 */
+	struct i915_address_space *shares_resv_from;
 
 	union {
 		struct rcu_head rcu;
@@ -293,7 +308,8 @@ struct drm_i915_gem_object {
 	};
 
 	/**
-	 * Whether the object is currently in the GGTT mmap.
+	 * Whether the object is currently in the GGTT or any other supported
+	 * fake offset mmap backed by lmem.
 	 */
 	unsigned int userfault_count;
 	struct list_head userfault_link;
@@ -306,51 +322,86 @@ struct drm_i915_gem_object {
 	I915_SELFTEST_DECLARE(struct list_head st_link);
 
 	unsigned long flags;
-#define I915_BO_ALLOC_CONTIGUOUS BIT(0)
-#define I915_BO_ALLOC_VOLATILE   BIT(1)
-#define I915_BO_ALLOC_USER       BIT(2)
-#define I915_BO_ALLOC_IGNORE_MIN_PAGE_SIZE     BIT(3)
-#define I915_BO_ALLOC_CHUNK_4K   BIT(4)
-#define I915_BO_ALLOC_CHUNK_64K  BIT(5)
-#define I915_BO_ALLOC_CHUNK_2M   BIT(6)
-#define I915_BO_ALLOC_CHUNK_1G   BIT(7)
+#define I915_BO_ALLOC_CONTIGUOUS  BIT(0)
+#define I915_BO_ALLOC_VOLATILE    BIT(1)
+#define I915_BO_ALLOC_CPU_CLEAR   BIT(2)
+#define I915_BO_ALLOC_USER        BIT(3)
+/* Object is allowed to lose its contents on suspend / resume, even if pinned */
+#define I915_BO_ALLOC_PM_VOLATILE BIT(4)
+/* Object needs to be restored early using memcpy during resume */
+#define I915_BO_ALLOC_PM_EARLY    BIT(5)
+/*
+ * Object is likely never accessed by the CPU. This will prioritise the BO to be
+ * allocated in the non-mappable portion of lmem. This is merely a hint, and if
+ * dealing with userspace objects the CPU fault handler is free to ignore this.
+ */
+#define I915_BO_ALLOC_GPU_ONLY	  BIT(6)
+#define I915_BO_ALLOC_CCS_AUX	  BIT(7)
+/*
+ * Object is allowed to retain its initial data and will not be cleared on first
+ * access if used along with I915_BO_ALLOC_USER. This is mainly to keep
+ * preallocated framebuffer data intact while transitioning it to i915drmfb.
+ */
+#define I915_BO_PREALLOC	  BIT(8)
 #define I915_BO_ALLOC_FLAGS (I915_BO_ALLOC_CONTIGUOUS | \
 			     I915_BO_ALLOC_VOLATILE | \
+			     I915_BO_ALLOC_CPU_CLEAR | \
 			     I915_BO_ALLOC_USER | \
-			     I915_BO_ALLOC_IGNORE_MIN_PAGE_SIZE | \
-			     I915_BO_ALLOC_CHUNK_4K | \
-			     I915_BO_ALLOC_CHUNK_64K | \
-			     I915_BO_ALLOC_CHUNK_2M | \
-			     I915_BO_ALLOC_CHUNK_1G)
-#define I915_BO_STRUCT_PAGE	BIT(8)
-#define I915_BO_READONLY	BIT(9)
-#define I915_BO_HAS_BACKING_STORE	BIT(10)
-#define I915_TILING_QUIRK_BIT	11 /* unknown swizzling; do not release! */
-#define I915_BO_PROTECTED	BIT(12)
-#define I915_BO_SKIP_CLEAR	BIT(13)
-#define I915_BO_CPU_CLEAR	BIT(14)
-#define I915_BO_FAULT_CLEAR	BIT(15)
-#define I915_BO_SYNC_HINT	BIT(16)
-#define I915_BO_FABRIC		BIT(17)
-
+			     I915_BO_ALLOC_PM_VOLATILE | \
+			     I915_BO_ALLOC_PM_EARLY | \
+			     I915_BO_ALLOC_GPU_ONLY | \
+			     I915_BO_ALLOC_CCS_AUX | \
+			     I915_BO_PREALLOC)
+#define I915_BO_READONLY          BIT(9)
+#define I915_TILING_QUIRK_BIT     10 /* unknown swizzling; do not release! */
+#define I915_BO_PROTECTED         BIT(11)
+	/**
+	 * @mem_flags - Mutable placement-related flags
+	 *
+	 * These are flags that indicate specifics of the memory region
+	 * the object is currently in. As such they are only stable
+	 * either under the object lock or if the object is pinned.
+	 */
+	unsigned int mem_flags;
+#define I915_BO_FLAG_STRUCT_PAGE BIT(0) /* Object backed by struct pages */
+#define I915_BO_FLAG_IOMEM       BIT(1) /* Object backed by IO memory */
 	/**
 	 * @pat_index: The desired PAT index.
 	 *
 	 * See hardware specification for valid PAT indices for each platform.
-	 * This field used to contain a value of enum i915_cache_level. It's
-	 * changed to an unsigned int because PAT indices are being used by
-	 * both UMD and KMD for caching policy control after GEN12.
-	 * For backward compatibility, this field will continue to contain
-	 * value of i915_cache_level for pre-GEN12 platforms so that the PTE
-	 * encode functions for these legacy platforms can stay the same.
+	 * This field replaces the @cache_level that contains a value of enum
+	 * i915_cache_level since PAT indices are being used by both userspace
+	 * and kernel mode driver for caching policy control after GEN12.
 	 * In the meantime platform specific tables are created to translate
 	 * i915_cache_level into pat index, for more details check the macros
 	 * defined i915/i915_pci.c, e.g. PVC_CACHELEVEL.
+	 * For backward compatibility, this field contains values exactly match
+	 * the entries of enum i915_cache_level for pre-GEN12 platforms (See
+	 * LEGACY_CACHELEVEL), so that the PTE encode functions for these
+	 * legacy platforms can stay the same.
 	 */
-	unsigned int pat_index:4;
-
+	unsigned int pat_index:6;
+	/**
+	 * @pat_set_by_user: Indicate whether pat_index is set by user space
+	 *
+	 * This field is set to false by default, only set to true if the
+	 * pat_index is set by user space. By design, user space is capable of
+	 * managing caching behavior by setting pat_index, in which case this
+	 * kernel mode driver should never touch the pat_index.
+	 */
+	unsigned int pat_set_by_user:1;
 	/**
 	 * @cache_coherent:
+	 *
+	 * Note: with the change above which replaced @cache_level with pat_index,
+	 * the use of @cache_coherent is limited to the objects created by kernel
+	 * or by userspace without pat index specified.
+	 * Check for @pat_set_by_user to find out if an object has pat index set
+	 * by userspace. The ioctl's to change cache settings have also been
+	 * disabled for the objects with pat index set by userspace. Please don't
+	 * assume @cache_coherent having the flags set as describe here. A helper
+	 * function i915_gem_object_has_cache_level() provides one way to bypass
+	 * the use of this field.
 	 *
 	 * Track whether the pages are coherent with the GPU if reading or
 	 * writing through the CPU caches. The largely depends on the
@@ -425,6 +476,16 @@ struct drm_i915_gem_object {
 	/**
 	 * @cache_dirty:
 	 *
+	 * Note: with the change above which replaced cache_level with pat_index,
+	 * the use of @cache_dirty is limited to the objects created by kernel
+	 * or by userspace without pat index specified.
+	 * Check for @pat_set_by_user to find out if an object has pat index set
+	 * by userspace. The ioctl's to change cache settings have also been
+	 * disabled for the objects with pat_index set by userspace. Please don't
+	 * assume @cache_dirty is set as describe here. Also see helper function
+	 * i915_gem_object_has_cache_level() for possible ways to bypass the use
+	 * of this field.
+	 *
 	 * Track if we are we dirty with writes through the CPU cache for this
 	 * object. As a result reading directly from main memory might yield
 	 * stale data.
@@ -484,10 +545,8 @@ struct drm_i915_gem_object {
 	 */
 	unsigned int cache_dirty:1;
 
-	/**
-	 * @evict_locked: Whether @obj_link sits on the eviction_list
-	 */
-	bool evict_locked:1;
+	/* @is_dpt: Object houses a display page table (DPT) */
+	unsigned int is_dpt:1;
 
 	/**
 	 * @read_domains: Read memory domains.
@@ -542,38 +601,59 @@ struct drm_i915_gem_object {
 		 */
 		atomic_t shrink_pin;
 
-		struct intel_memory_region_link {
-			/**
-			 * Memory region for this object.
-			 */
-			struct intel_memory_region *mem;
+		/**
+		 * @ttm_shrinkable: True when the object is using shmem pages
+		 * underneath. Protected by the object lock.
+		 */
+		bool ttm_shrinkable;
 
-			/**
-			 * Element within memory_region->objects or region->purgeable
-			 * if the object is marked as DONTNEED. Access is protected by
-			 * region->obj_lock.
-			 */
-			struct list_head link;
-		} region;
+		/**
+		 * @unknown_state: Indicate that the object is effectively
+		 * borked. This is write-once and set if we somehow encounter a
+		 * fatal error when moving/clearing the pages, and we are not
+		 * able to fallback to memcpy/memset, like on small-BAR systems.
+		 * The GPU should also be wedged (or in the process) at this
+		 * point.
+		 *
+		 * Only valid to read this after acquiring the dma-resv lock and
+		 * waiting for all DMA_RESV_USAGE_KERNEL fences to be signalled,
+		 * or if we otherwise know that the moving fence has signalled,
+		 * and we are certain the pages underneath are valid for
+		 * immediate access (under normal operation), like just prior to
+		 * binding the object or when setting up the CPU fault handler.
+		 * See i915_gem_object_has_unknown_state();
+		 */
+		bool unknown_state;
 
 		/**
 		 * Priority list of potential placements for this object.
 		 */
 		struct intel_memory_region **placements;
-		struct intel_memory_region *preferred_region;
 		int n_placements;
+
+		/**
+		 * Memory region for this object.
+		 */
+		struct intel_memory_region *region;
 
 		/**
 		 * Memory manager resource allocated for this object. Only
 		 * needed for the mock region.
 		 */
 		struct ttm_resource *res;
-		struct list_head blocks;
 
+		/**
+		 * Element within memory_region->objects or region->purgeable
+		 * if the object is marked as DONTNEED. Access is protected by
+		 * region->obj_lock.
+		 */
+		struct list_head region_link;
+
+		struct i915_refct_sgt *rsgt;
 		struct sg_table *pages;
 		void *mapping;
 
-		unsigned int page_sizes;
+		struct i915_page_sizes page_sizes;
 
 		I915_SELFTEST_DECLARE(unsigned int page_mask);
 
@@ -587,34 +667,23 @@ struct drm_i915_gem_object {
 		struct list_head link;
 
 		/**
-		 * Advice: are the backing pages purgeable, atomics enabled?
+		 * Advice: are the backing pages purgeable?
 		 */
 		unsigned int madv:2;
-		unsigned int madv_atomic:2;
-#define I915_BO_ATOMIC_NONE	0
-#define I915_BO_ATOMIC_SYSTEM	1
-#define I915_BO_ATOMIC_DEVICE	2
 
-		/*
-		 * Track the completion of the page construction if using the
-		 * blitter for swapin/swapout and for clears. Following
-		 * completion, it holds a persistent ERR_PTR should the
-		 * GPU operation to instantiate the pages fail and all
-		 * attempts to utilise the backing store must be prevented
-		 * (as the backing store is in undefined state) until the
-		 * taint is removed. All operations on the backing store
-		 * must wait for the fence to be signaled, be it asynchronously
-		 * as part of the scheduling pipeline or synchronously before
-		 * CPU access.
+		/**
+		 * This is set if the object has been written to since the
+		 * pages were last acquired.
 		 */
-		struct i915_active_fence migrate;
+		bool dirty:1;
 
 		u32 tlb[I915_MAX_GT];
 	} mm;
 
 	struct {
-		struct sg_table *cached_io_st;
+		struct i915_refct_sgt *cached_io_rsgt;
 		struct i915_gem_object_page_iter get_io_page;
+		struct drm_i915_gem_object *backup;
 		bool created:1;
 	} ttm;
 
@@ -629,44 +698,30 @@ struct drm_i915_gem_object {
 	unsigned long *bit_17;
 
 	union {
+#ifdef CONFIG_MMU_NOTIFIER
 		struct i915_gem_userptr {
 			uintptr_t ptr;
-#ifdef BPM_MMU_INTERVAL_NOTIFIER_NOTIFIER_NOT_PRESENT
-			struct i915_mm_struct *mm;
-#endif
+			unsigned long notifier_seq;
+
 			struct mmu_interval_notifier notifier;
+			struct page **pvec;
+			int page_ref;
 		} userptr;
+#endif
 
 		struct drm_mm_node *stolen;
 
+		resource_size_t bo_offset;
+
 		unsigned long scratch;
+		u64 encode;
 
 		void *gvt_info;
 	};
-
-	struct drm_i915_gem_object *swapto;
-
-	/*
-	 * To store the memory mask which represents the user preference about
-	 * which memory region the object should reside in
-	 */
-	u32 memory_mask;
-
-	struct {
-		spinlock_t lock;
-
-		/* list of clients which allocated/imported this object */
-		struct rb_root rb;
-
-		/* Whether this object currently resides in local memory */
-		bool resident:1;
-	} client;
-
-	/*
-	 * Implicity scaling uses two objects, allow them to be connected
-	 */
-	struct drm_i915_gem_object *pair;
 };
+
+#define intel_bo_to_drm_bo(bo) (&(bo)->base)
+#define intel_bo_to_i915(bo) to_i915(intel_bo_to_drm_bo(bo)->dev)
 
 static inline struct drm_i915_gem_object *
 to_intel_bo(struct drm_gem_object *gem)

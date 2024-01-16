@@ -220,6 +220,10 @@ static int alloc_table(struct pfn_table *pt,
 	struct scatterlist *sg;
 	unsigned long n, pfn;
 
+	/* restricted by sg_alloc_table */
+	if (overflows_type(max, unsigned int))
+		return -E2BIG;
+
 	if (sg_alloc_table(&pt->st, max,
 			   GFP_KERNEL | __GFP_NORETRY | __GFP_NOWARN))
 		return alloc_error;
@@ -341,12 +345,21 @@ static int igt_sg_trim(void *ignored)
 			if (err)
 				return err;
 
-			i915_sg_trim(&pt.st);
-			prandom_seed_state(&prng, i915_selftest.random_seed);
-			err = expect_pfn_sgtable(&pt,
-						 *npages, &prng,
-						 "i915_sg_trim",
-						 end_time);
+			if (i915_sg_trim(&pt.st)) {
+				if (pt.st.orig_nents != prime ||
+				    pt.st.nents != prime) {
+					pr_err("i915_sg_trim failed (nents %u, orig_nents %u), expected %lu\n",
+					       pt.st.nents, pt.st.orig_nents, prime);
+					err = -EINVAL;
+				} else {
+					prandom_seed_state(&prng,
+							   i915_selftest.random_seed);
+					err = expect_pfn_sgtable(&pt,
+								 *npages, &prng,
+								 "i915_sg_trim",
+								 end_time);
+				}
+			}
 			sg_free_table(&pt.st);
 			if (err)
 				return err;
