@@ -6,7 +6,11 @@
 #ifndef __BACKPORT_I915_DRM_PRELIM_H__
 #define __BACKPORT_I915_DRM_PRELIM_H__
 
-#include "drm.h"
+#ifdef BPM_HEADER_PATH_ALIGN
+#include_next <uapi/drm/drm.h>
+#else
+#include "i915_drm.h"
+#endif
 
 /*
  * Modifications to structs/values defined here are subject to

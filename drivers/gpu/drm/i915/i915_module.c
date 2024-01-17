@@ -19,6 +19,10 @@
 #include "i915_vma.h"
 #include "i915_vma_resource.h"
 
+#ifdef BPM_ADD_MODULE_VERSION_MACRO_IN_ALL_MOD
+#include <backport/bp_module_version.h>
+#endif
+
 static int i915_check_nomodeset(void)
 {
 	bool use_kms = true;
@@ -121,5 +125,8 @@ module_exit(i915_exit);
 MODULE_AUTHOR("Tungsten Graphics, Inc.");
 MODULE_AUTHOR("Intel Corporation");
 
+#ifdef BPM_ADD_MODULE_VERSION_MACRO_IN_ALL_MOD
+MODULE_VERSION(BACKPORT_MOD_VER);
+#endif
 MODULE_DESCRIPTION(DRIVER_DESC);
 MODULE_LICENSE("GPL and additional rights");
