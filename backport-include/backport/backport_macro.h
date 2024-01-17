@@ -1268,6 +1268,13 @@
  */
 #define BPM_DGLUT_24BIT_MTL_NOT_SUPPORTED
 
+#if LINUX_VERSION_IS_LESS(6,7,0)
+/*
+ * 7218779efc46 drm/edid: add drm_edid_is_digital()
+ */
+#define DRM_EDID_IS_DIGITAL_NOT_PRESENT
+#endif
+
 #define BPM_DISABLE_DRM_DMABUF
 /*
  * f58a435311672 drm/dp, drm/i915: Add support for VESA backlights using PWM for brightness control

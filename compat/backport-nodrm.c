@@ -5,6 +5,7 @@
 #include <drm/drm_dp_helper.h>
 #include <drm/drm_print.h>
 #include <drm/drm_atomic_helper.h>
+#include <drm/drm_edid.h>
 
 u8 dp_link_status(const u8 link_status[DP_LINK_STATUS_SIZE], int r)
 {
@@ -339,3 +340,27 @@ int drm_hdmi_sink_dsc_max_frl_rate(struct drm_connector *connector)
         return max_dsc_lanes * dsc_rate_per_lane;
 }
 EXPORT_SYMBOL(drm_hdmi_sink_dsc_max_frl_rate);
+
+#ifdef DRM_EDID_IS_DIGITAL_NOT_PRESENT
+/*
+ * The opaque EDID type, internal to drm_edid.c.
+ */
+struct drm_edid {
+	/* Size allocated for edid */
+	size_t size;
+	const struct edid *edid;
+};
+
+/**
+ * drm_edid_is_digital - is digital?
+ * @drm_edid: The EDID
+ *
+ * Return true if input is digital.
+ */
+bool drm_edid_is_digital(const struct drm_edid *drm_edid)
+{
+	return drm_edid && drm_edid->edid &&
+		drm_edid->edid->input & DRM_EDID_INPUT_DIGITAL;
+}
+EXPORT_SYMBOL(drm_edid_is_digital);
+#endif
