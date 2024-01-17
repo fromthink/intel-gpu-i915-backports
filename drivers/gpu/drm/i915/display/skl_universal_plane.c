@@ -966,6 +966,7 @@ static u32 glk_plane_color_ctl(const struct intel_crtc_state *crtc_state,
 	struct intel_plane *plane = to_intel_plane(plane_state->uapi.plane);
 	u32 plane_color_ctl = 0;
 
+#ifndef BPM_DGLUT_24BIT_MTL_NOT_SUPPORTED
 	/* FIXME needs hw.gamma_lut */
 	if (!plane_state->uapi.gamma_lut)
 		plane_color_ctl |= PLANE_COLOR_PLANE_GAMMA_DISABLE;
@@ -977,6 +978,9 @@ static u32 glk_plane_color_ctl(const struct intel_crtc_state *crtc_state,
 	/* FIXME needs hw.ctm */
 	if (plane_state->uapi.ctm)
 		plane_color_ctl |= PLANE_COLOR_PLANE_CSC_ENABLE;
+#else
+	plane_color_ctl |= PLANE_COLOR_PLANE_GAMMA_DISABLE;
+#endif
 
 	plane_color_ctl |= glk_plane_color_ctl_alpha(plane_state);
 
@@ -1281,10 +1285,12 @@ icl_plane_update_noarm(struct intel_plane *plane,
 	if (plane_state->force_black)
 		icl_plane_csc_load_black(plane);
 
+#ifndef BPM_DGLUT_24BIT_MTL_NOT_SUPPORTED
 	if (plane_state->uapi.color_mgmt_changed) {
 		intel_color_load_plane_luts(&plane_state->uapi);
 		intel_color_load_plane_csc_matrix(&plane_state->uapi);
 	}
+#endif
 
 	intel_psr2_program_plane_sel_fetch_noarm(plane, crtc_state, plane_state, color_plane);
 }
@@ -2384,7 +2390,9 @@ skl_universal_plane_create(struct drm_i915_private *dev_priv,
 						BIT(DRM_SCALING_FILTER_DEFAULT) |
 						BIT(DRM_SCALING_FILTER_NEAREST_NEIGHBOR));
 
+#ifndef BPM_DGLUT_24BIT_MTL_NOT_SUPPORTED
 	intel_color_plane_init(&plane->base);
+#endif
 
 	intel_plane_helper_add(plane);
 

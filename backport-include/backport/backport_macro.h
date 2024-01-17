@@ -1260,6 +1260,14 @@
 #endif
 
 #ifdef CPTCFG_I915_NO_DRM
+
+/*
+ * Add macro to disable DGLUT 24bit support for MTL+ onwards 
+ * Introduced in DII_6514
+ * a82ae9f6b7d716 Support 24 bit DGLUT for MTL+
+ */
+#define BPM_DGLUT_24BIT_MTL_NOT_SUPPORTED
+
 #define BPM_DISABLE_DRM_DMABUF
 /*
  * f58a435311672 drm/dp, drm/i915: Add support for VESA backlights using PWM for brightness control
