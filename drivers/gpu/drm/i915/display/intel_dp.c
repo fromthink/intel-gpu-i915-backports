@@ -5221,8 +5221,12 @@ intel_dp_set_edid(struct intel_dp *intel_dp)
 	intel_dp_update_dfp(intel_dp, drm_edid);
 	intel_dp_update_420(intel_dp);
 
+#ifdef DRM_DISPLAY_INFO_SOURCE_PHYSICAL_ADDRESS_NOT_PRESENT
+	drm_dp_cec_set_edid(&intel_dp->aux, drm_edid_raw(drm_edid));
+#else
 	drm_dp_cec_attach(&intel_dp->aux,
 			  connector->base.display_info.source_physical_address);
+#endif
 }
 
 static void

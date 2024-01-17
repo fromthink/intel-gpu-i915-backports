@@ -1273,6 +1273,11 @@
  * 7218779efc46 drm/edid: add drm_edid_is_digital()
  */
 #define DRM_EDID_IS_DIGITAL_NOT_PRESENT
+
+/*
+ * 82b599ece3b8 drm/edid: parse source physical address
+ */
+#define DRM_DISPLAY_INFO_SOURCE_PHYSICAL_ADDRESS_NOT_PRESENT
 #endif
 
 #define BPM_DISABLE_DRM_DMABUF

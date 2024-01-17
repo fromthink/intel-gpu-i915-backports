@@ -2480,8 +2480,13 @@ intel_hdmi_set_edid(struct drm_connector *connector)
 
 	intel_display_power_put(dev_priv, POWER_DOMAIN_GMBUS, wakeref);
 
+#ifdef DRM_DISPLAY_INFO_SOURCE_PHYSICAL_ADDRESS_NOT_PRESENT
+	cec_notifier_set_phys_addr_from_edid(intel_hdmi->cec_notifier,
+					     drm_edid_raw(drm_edid));
+#else
 	cec_notifier_set_phys_addr(intel_hdmi->cec_notifier,
 				   connector->display_info.source_physical_address);
+#endif
 
 	return connected;
 }
