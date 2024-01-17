@@ -122,6 +122,16 @@
 #if LINUX_VERSION_IS_GEQ(5,19,0)
 
 /*
+ * da68386d9edb1f57a drm: Rename dp/ to display/
+ */
+#define BPM_DRM_DP_HELPER_DIR_DISPLAY_PRESENT
+
+/*
+ * 84a1041c60ff fs: Remove pagecache_write_begin() and pagecache_write_end()
+ */
+#define BPM_PAGECACHE_WRITE_BEGIN_AND_END_NOT_PRESENT
+
+/*
  * 0192c25c03cd2f drm/dp: add 128b/132b link status helpers from DP 2.0 E11
  */
 
@@ -1270,7 +1280,9 @@
 #define BPM_DRM_PAYLOAD_PART1_START_SLOT_NOT_PRESENT
 #define DRM_DP_GET_ADJUST_NOT_PRESENT
 #define DRM_EDP_BACKLIGHT_NOT_PRESENT
+#if LINUX_VERSION_IS_LESS(6,4,0)
 #define BPM_DRM_DP_DSC_SINK_SUPPORTS_FORMAT_NOT_PRESENT
+#endif
 #endif
 
 #endif /* BP_LINUX_BACKPORT_MACRO_H */

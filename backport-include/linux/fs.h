@@ -52,4 +52,15 @@ static inline struct file *file_clone_open(struct file *file)
         return dentry_open(&file->f_path, file->f_flags, file->f_cred);
 }
 #endif
+
+#ifdef BPM_PAGECACHE_WRITE_BEGIN_AND_END_NOT_PRESENT
+int pagecache_write_begin(struct file *, struct address_space *mapping,
+                                loff_t pos, unsigned len, unsigned flags,
+                                struct page **pagep, void **fsdata);
+
+int pagecache_write_end(struct file *, struct address_space *mapping,
+                                loff_t pos, unsigned len, unsigned copied,
+                                struct page *page, void *fsdata);
+#endif
+
 #endif

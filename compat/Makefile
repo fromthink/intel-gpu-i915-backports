@@ -27,6 +27,7 @@ i915-compat-$(CPTCFG_KERNEL_5_12) += ptrace.o
 i915-compat-$(CPTCFG_KERNEL_5_13) += backport-5.13.o
 i915-compat-$(CPTCFG_KERNEL_5_15) += backport-5.15.o timer.o
 i915-compat-$(CPTCFG_I915_NO_DRM) += backport-nodrm.o
+i915-compat-y += backport-5.19.o
 
 ifeq ($(CONFIG_HDMI),)
 i915-compat-y += hdmi_5_10.o
