@@ -63,12 +63,3 @@ obj-y += drivers/gpu/drm/
 obj-y += drivers/char/agp/
 endif
 endif
-
-obj-$(CPTCFG_INTEL_VSEC) += drivers/platform/x86/intel/
-obj-$(CPTCFG_MFD_INTEL_PMT) += drivers/platform/x86/intel/
-obj-$(CPTCFG_MFD_INTEL_PMT) += drivers/mfd/
-
-ifeq (y,$(filter y,$(CPTCFG_ONLY_I915) $(CPTCFG_BUILD_DMABUF_I915_MEI)))
-obj-y += drivers/misc/mei/
-obj-y += drivers/watchdog/
-endif
