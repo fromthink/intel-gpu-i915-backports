@@ -12,6 +12,14 @@
 #define BPM_SWIOTLB_MAX_SEGMENT_NOT_PRESENT
 #endif
 
+#if LINUX_VERSION_IS_GEQ(6,2,0)
+/*
+ * 4b21d25bf519c9
+ *  overflow: Introduce overflows_type() and castable_to_type()
+ */
+#define BPM_OVERFLOWS_TYPE_AVAILABLE
+#endif
+
 #if (LINUX_VERSION_IS_GEQ(6,2,0) || \
 		REDHAT_RELEASE_VERSION_IS_GEQ(8,9))
 /*
