@@ -841,6 +841,9 @@ I915DKMSMK_DKMS := $(BACKPORT_DIR)/scripts/backport-mki915debdkms
 I915DKMSMK_README := $(BACKPORT_DIR)/scripts/backport-mkdebreadme
 I915DKMSMK_COPYRIGHT := $(BACKPORT_DIR)/scripts/backport-mkdebcopyright
 
+I915_TAR_CONTENT := $(KBUILD_ONLYI915DIRS) $(KBUILD_ONLYVSECDIRS) Makefile* local-symbols MAINTAINERS \
+               Kconfig Kconfig.sources Kconfig.package.hacks COPYING versions defconfigs backport-include kconf compat
+
 .PHONY: i915dkmsdeb-pkg
 i915dkmsdeb-pkg:
 ifeq ($(BUILD_CONFIG), nodrm)
@@ -865,7 +868,7 @@ endif
 			fi		\
 		fi 		\
 	done > $(BACKPORT_DIR)/debian/$(I915_PKG_NAME).install.in
-	$(CONFIG_SHELL) $(I915DKMSMK_DKMS) -n $(I915_PKG_NAME) -v $(I915_PKG_VERSION) -r $(I915_PKG_RELEASE) -p $(RELEASE_TYPE) > $(BACKPORT_DIR)/debian/$(I915_PKG_NAME).dkms.in
+	$(CONFIG_SHELL) $(I915DKMSMK_DKMS) -n $(I915_PKG_NAME) -v $(I915_PKG_VERSION) -r $(I915_PKG_RELEASE) -p $(RELEASE_TYPE) -s $(BUILD_KERNEL_VARIANT) > $(BACKPORT_DIR)/debian/$(I915_PKG_NAME).dkms.in
 	$(CONFIG_SHELL) $(I915DKMSMK_README) -n $(I915_PKG_NAME) -v $(I915_PKG_VERSION) -r $(I915_PKG_RELEASE) -p $(RELEASE_TYPE) > $(BACKPORT_DIR)/debian/README.Debian
 	$(CONFIG_SHELL) $(I915DKMSMK_COPYRIGHT) -n $(I915_PKG_NAME) -v $(I915_PKG_VERSION) -r $(I915_PKG_RELEASE) -p $(RELEASE_TYPE) > $(BACKPORT_DIR)/debian/copyright
 	+dch -l "+i${I915_PKG_RELEASE}-" -m "build ${I915_PKG_RELEASE}"

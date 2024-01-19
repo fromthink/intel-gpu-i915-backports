@@ -1,8 +1,8 @@
 diff --git a/Kconfig.sources b/Kconfig.sources
-index ff7b0e4..f1d66bb 100644
+index ceaddc267dbb..b1780c5bc431 100644
 --- a/Kconfig.sources
 +++ b/Kconfig.sources
-@@ -2,9 +2,9 @@
+@@ -2,13 +2,13 @@
  source "$BACKPORT_DIR/compat/Kconfig"
  
  # these are copied from the kernel
@@ -12,3 +12,11 @@ index ff7b0e4..f1d66bb 100644
 -source "$BACKPORT_DIR/drivers/gpu/drm/Kconfig"
 +#source "$BACKPORT_DIR/drivers/gpu/drm/Kconfig"
  source "$BACKPORT_DIR/drivers/gpu/drm/i915/Kconfig"
+-source "$BACKPORT_DIR/drivers/video/Kconfig"
++#source "$BACKPORT_DIR/drivers/video/Kconfig"
+ 
+-source "$BACKPORT_DIR/drivers/char/agp/Kconfig"
++#source "$BACKPORT_DIR/drivers/char/agp/Kconfig"
+ 
+ #source "$BACKPORT_DIR/net/bluetooth/Kconfig"
+ #source "$BACKPORT_DIR/drivers/net/wireless/Kconfig"

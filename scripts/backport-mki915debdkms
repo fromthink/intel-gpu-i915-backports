@@ -60,7 +60,6 @@ sed -e '/^DEL/d' -e 's/^\t*//' <<EOF
 	PACKAGE_NAME="$PKG_NAME"
 	PACKAGE_VERSION="$PKG_VER-$REL_NAME"
 	AUTOINSTALL="yes"
-	BUILD_EXCLUSIVE_KERNEL="^(5\.(10|4)\.*)"
 
 	BUILT_MODULE_NAME[0]="i915-compat"
 	BUILT_MODULE_LOCATION[0]="compat"
@@ -69,91 +68,6 @@ sed -e '/^DEL/d' -e 's/^\t*//' <<EOF
 	BUILT_MODULE_NAME[1]="i915"
 	BUILT_MODULE_LOCATION[1]="drivers/gpu/drm/i915"
 	DEST_MODULE_LOCATION[1]="/updates"
-
-	BUILT_MODULE_NAME[2]="i915_spi"
-	BUILT_MODULE_LOCATION[2]="drivers/gpu/drm/i915"
-	DEST_MODULE_LOCATION[2]="/updates"
-
-	BUILT_MODULE_NAME[3]="iaf"
-	BUILT_MODULE_LOCATION[3]="drivers/gpu/drm/i915/fabric"
-	DEST_MODULE_LOCATION[3]="/updates"
-
-	BUILT_MODULE_NAME[4]="mei"
-	BUILT_MODULE_LOCATION[4]="drivers/misc/mei/"
-	DEST_MODULE_LOCATION[4]="/updates"
-
-	BUILT_MODULE_NAME[5]="mei-me"
-	BUILT_MODULE_LOCATION[5]="drivers/misc/mei/"
-	DEST_MODULE_LOCATION[5]="/updates"
-
-	BUILT_MODULE_NAME[6]="mei-gsc"
-	BUILT_MODULE_LOCATION[6]="drivers/misc/mei/"
-	DEST_MODULE_LOCATION[6]="/updates"
-
-	BUILT_MODULE_NAME[7]="mei_wdt"
-	BUILT_MODULE_LOCATION[7]="drivers/watchdog/"
-	DEST_MODULE_LOCATION[7]="/updates"
-
-	BUILT_MODULE_NAME[8]="mei_hdcp"
-	BUILT_MODULE_LOCATION[8]="drivers/misc/mei/hdcp/"
-	DEST_MODULE_LOCATION[8]="/updates"
-
-	BUILT_MODULE_NAME[9]="mei_pxp"
-	BUILT_MODULE_LOCATION[9]="drivers/misc/mei/pxp/"
-	DEST_MODULE_LOCATION[9]="/updates"
-
-	BUILT_MODULE_NAME[10]="mei_iaf"
-	BUILT_MODULE_LOCATION[10]="drivers/misc/mei/iaf/"
-	DEST_MODULE_LOCATION[10]="/updates"
-
-	# Determine if AUXBUS is available to choose correct PMT/VSEC driver.
-	is_auxbus_available()
-	{
-		cat /boot/config-\$kernelver | grep -q 'CONFIG_AUXILIARY_BUS=y'
-		return \$?
-	}
-	
-	select_pmt_vsec() {
-		case "$PMT_VSEC_SELECTION" in
-			"pmt" ) echo pmt ;;
-			"auto" ) if is_auxbus_available ; then echo vsec; else echo pmt; fi ;;
-		esac
-	}
-	
-	if [ "\$(select_pmt_vsec)" = "vsec" ];
-	then
-		BUILT_MODULE_NAME[11]="intel_vsec"
-		BUILT_MODULE_LOCATION[11]="drivers/platform/x86/intel"
-		DEST_MODULE_LOCATION[11]="/updates"
-
-		BUILT_MODULE_NAME[12]="pmt_class"
-		BUILT_MODULE_LOCATION[12]="drivers/platform/x86/intel/pmt"
-		DEST_MODULE_LOCATION[12]="/updates"
-
-		BUILT_MODULE_NAME[13]="pmt_telemetry"
-		BUILT_MODULE_LOCATION[13]="drivers/platform/x86/intel/pmt"
-		DEST_MODULE_LOCATION[13]="/updates"
-
-		BUILT_MODULE_NAME[14]="pmt_crashlog"
-		BUILT_MODULE_LOCATION[14]="drivers/platform/x86/intel/pmt"
-		DEST_MODULE_LOCATION[14]="/updates"
-	else
-		BUILT_MODULE_NAME[11]="intel_pmt"
-		BUILT_MODULE_LOCATION[11]="drivers/mfd"
-		DEST_MODULE_LOCATION[11]="/updates"
-		
-		BUILT_MODULE_NAME[12]="intel_pmt_class"
-		BUILT_MODULE_LOCATION[12]="drivers/platform/x86/intel/pmt"
-		DEST_MODULE_LOCATION[12]="/updates"
-	
-		BUILT_MODULE_NAME[13]="intel_pmt_telemetry"
-		BUILT_MODULE_LOCATION[13]="drivers/platform/x86/intel/pmt"
-		DEST_MODULE_LOCATION[13]="/updates"
-	
-		BUILT_MODULE_NAME[14]="intel_pmt_crashlog"
-		BUILT_MODULE_LOCATION[14]="drivers/platform/x86/intel/pmt"
-		DEST_MODULE_LOCATION[14]="/updates"
-	fi
 
 $NO_DRM	BUILT_MODULE_NAME[15]="drm_kms_helper"
 $NO_DRM	BUILT_MODULE_LOCATION[15]="drivers/gpu/drm/"
@@ -209,9 +123,9 @@ $NO_DRM	DEST_MODULE_LOCATION[18]="/updates"
 	fi
 	
 	if [ -n "$CUSTOM_KERN_ID" ]; then
-	MAKE="export KBUILD_EXTRA_SYMBOLS='\$dkms_tree/$DEP_PKG_NAME/kernel-\$kernelver-x86_64/build/Module.symvers'; export LEX=flex; export YACC=bison; cp defconfigs/\$I915_CONFIG .config; 'make' -j\$(num_cpu_cores) KLIB=/lib/modules/\$kernelver olddefconfig; 'make' -j\$(num_cpu_cores) KLIB=/lib/modules/\$kernelver BUILD_CONFIG=$BUILD_TYPE CUSTOM_KERN_ID=$CUSTOM_KERN_ID"
+	MAKE="export LEX=flex; export YACC=bison; cp defconfigs/\$I915_CONFIG .config; 'make' -j\$(num_cpu_cores) KLIB=/lib/modules/\$kernelver olddefconfig; 'make' -j\$(num_cpu_cores) KLIB=/lib/modules/\$kernelver BUILD_CONFIG=$BUILD_TYPE CUSTOM_KERN_ID=$CUSTOM_KERN_ID"
 	else
-	MAKE="export KBUILD_EXTRA_SYMBOLS='\$dkms_tree/$DEP_PKG_NAME/kernel-\$kernelver-x86_64/build/Module.symvers'; export LEX=flex; export YACC=bison; cp defconfigs/\$I915_CONFIG .config; 'make' -j\$(num_cpu_cores) KLIB=/lib/modules/\$kernelver olddefconfig; 'make' -j\$(num_cpu_cores) KLIB=/lib/modules/\$kernelver BUILD_CONFIG=$BUILD_TYPE"
+	MAKE="export LEX=flex; export YACC=bison; cp defconfigs/\$I915_CONFIG .config; 'make' -j\$(num_cpu_cores) KLIB=/lib/modules/\$kernelver olddefconfig; 'make' -j\$(num_cpu_cores) KLIB=/lib/modules/\$kernelver BUILD_CONFIG=$BUILD_TYPE"
 	fi
 
 	CLEAN="export LEX=flex; export YACC=bison; 'make' clean"
