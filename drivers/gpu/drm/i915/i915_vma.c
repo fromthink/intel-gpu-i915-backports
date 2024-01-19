@@ -911,15 +911,6 @@ static bool try_qad_pin(struct i915_vma *vma, unsigned int flags)
 	unsigned int bound;
 
 	bound = atomic_read(&vma->flags);
-
-	if (flags & PIN_VALIDATE) {
-		flags &= I915_VMA_BIND_MASK;
-
-		return (flags & bound) == flags;
-	}
-
-	/* with the lock mandatory for unbind, we don't race here */
-	flags &= I915_VMA_BIND_MASK;
 	do {
 		if (unlikely(flags & ~bound))
 			return false;
@@ -1417,7 +1408,7 @@ int i915_vma_pin_ww(struct i915_vma *vma, struct i915_gem_ww_ctx *ww,
 	GEM_BUG_ON(!(flags & (PIN_USER | PIN_GLOBAL)));
 
 	/* First try and grab the pin without rebinding the vma */
-	if (try_qad_pin(vma, flags))
+	if (try_qad_pin(vma, flags & I915_VMA_BIND_MASK))
 		return 0;
 
 	err = i915_vma_get_pages(vma);
@@ -1508,8 +1499,7 @@ int i915_vma_pin_ww(struct i915_vma *vma, struct i915_gem_ww_ctx *ww,
 	}
 
 	if (unlikely(!(flags & ~bound & I915_VMA_BIND_MASK))) {
-		if (!(flags & PIN_VALIDATE))
-			__i915_vma_pin(vma);
+		__i915_vma_pin(vma);
 		goto err_unlock;
 	}
 
@@ -1539,10 +1529,8 @@ int i915_vma_pin_ww(struct i915_vma *vma, struct i915_gem_ww_ctx *ww,
 	atomic_add(I915_VMA_PAGES_ACTIVE, &vma->pages_count);
 	list_move_tail(&vma->vm_link, &vma->vm->bound_list);
 
-	if (!(flags & PIN_VALIDATE)) {
-		__i915_vma_pin(vma);
-		GEM_BUG_ON(!i915_vma_is_pinned(vma));
-	}
+	__i915_vma_pin(vma);
+	GEM_BUG_ON(!i915_vma_is_pinned(vma));
 	GEM_BUG_ON(!i915_vma_is_bound(vma, flags));
 	GEM_BUG_ON(i915_vma_misplaced(vma, size, alignment, flags));
 
@@ -1891,6 +1879,8 @@ static int __i915_vma_move_to_active(struct i915_vma *vma, struct i915_request *
 {
 	int err;
 
+	GEM_BUG_ON(!i915_vma_is_pinned(vma));
+
 	/* Wait for the vma to be bound before we start! */
 	err = __i915_request_await_bind(rq, vma);
 	if (err)
@@ -1908,8 +1898,6 @@ int _i915_vma_move_to_active(struct i915_vma *vma,
 	int err;
 
 	assert_object_held(obj);
-
-	GEM_BUG_ON(!vma->pages);
 
 	if (!(flags & __EXEC_OBJECT_NO_REQUEST_AWAIT)) {
 		err = i915_request_await_object(rq, vma->obj, flags & EXEC_OBJECT_WRITE);
