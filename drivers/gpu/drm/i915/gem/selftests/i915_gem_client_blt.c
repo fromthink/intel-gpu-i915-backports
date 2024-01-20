@@ -453,7 +453,7 @@ static int pin_buffer(struct i915_vma *vma, u64 addr)
 	int err;
 
 	if (drm_mm_node_allocated(&vma->node) && i915_vma_offset(vma) != addr) {
-		err = i915_vma_unbind_unlocked(vma);
+		err = i915_vma_unbind(vma);
 		if (err)
 			return err;
 	}
