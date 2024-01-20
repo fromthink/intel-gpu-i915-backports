@@ -762,7 +762,7 @@ static int ggtt_reserve_guc_top(struct i915_ggtt *ggtt)
 	GEM_BUG_ON(ggtt->vm.total <= GUC_TOP_RESERVE_SIZE);
 	offset = ggtt->vm.total - GUC_TOP_RESERVE_SIZE;
 
-	ret = i915_gem_gtt_reserve(&ggtt->vm, NULL, &ggtt->uc_fw,
+	ret = i915_gem_gtt_reserve(&ggtt->vm, &ggtt->uc_fw,
 				   GUC_TOP_RESERVE_SIZE, offset,
 				   I915_COLOR_UNEVICTABLE, PIN_NOEVICT);
 	if (ret)

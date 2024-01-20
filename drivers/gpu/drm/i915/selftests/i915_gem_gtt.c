@@ -1513,7 +1513,7 @@ static int reserve_gtt_with_resource(struct i915_vma *vma, u64 offset)
 		return PTR_ERR(vma_res);
 
 	mutex_lock(&vm->mutex);
-	err = i915_gem_gtt_reserve(vm, NULL, &vma->node, obj->base.size,
+	err = i915_gem_gtt_reserve(vm, &vma->node, obj->base.size,
 				   offset,
 				   obj->pat_index,
 				   0);
@@ -1694,7 +1694,7 @@ static int insert_gtt_with_resource(struct i915_vma *vma)
 		return PTR_ERR(vma_res);
 
 	mutex_lock(&vm->mutex);
-	err = i915_gem_gtt_insert(vm, NULL, &vma->node, obj->base.size, 0,
+	err = i915_gem_gtt_insert(vm, &vma->node, obj->base.size, 0,
 				  obj->pat_index, 0, vm->total, 0);
 	if (!err) {
 		i915_vma_resource_init_from_vma(vma_res, vma);
@@ -1750,7 +1750,7 @@ static int igt_gtt_insert(void *arg)
 	/* Check a couple of obviously invalid requests */
 	for (ii = invalid_insert; ii->size; ii++) {
 		mutex_lock(&ggtt->vm.mutex);
-		err = i915_gem_gtt_insert(&ggtt->vm, NULL, &tmp,
+		err = i915_gem_gtt_insert(&ggtt->vm, &tmp,
 					  ii->size, ii->alignment,
 					  I915_COLOR_UNEVICTABLE,
 					  ii->start, ii->end,

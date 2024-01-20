@@ -16,7 +16,6 @@
 
 struct drm_i915_gem_object;
 struct i915_address_space;
-struct i915_gem_ww_ctx;
 
 #define I915_COLOR_UNEVICTABLE (-1) /* a non-vma sharing the address space */
 
@@ -26,13 +25,11 @@ void i915_gem_gtt_finish_pages(struct drm_i915_gem_object *obj,
 			       struct sg_table *pages);
 
 int i915_gem_gtt_reserve(struct i915_address_space *vm,
-			 struct i915_gem_ww_ctx *ww,
 			 struct drm_mm_node *node,
 			 u64 size, u64 offset, unsigned long color,
 			 unsigned int flags);
 
 int i915_gem_gtt_insert(struct i915_address_space *vm,
-			struct i915_gem_ww_ctx *ww,
 			struct drm_mm_node *node,
 			u64 size, u64 alignment, unsigned long color,
 			u64 start, u64 end, unsigned int flags);
