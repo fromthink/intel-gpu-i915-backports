@@ -1621,12 +1621,7 @@ static int __i915_ggtt_pin(struct i915_vma *vma, struct i915_gem_ww_ctx *ww,
 		list_for_each_entry(gt, &ggtt->gt_list, ggtt_link)
 			flush_idle_contexts(gt);
 		if (mutex_lock_interruptible(&vm->mutex) == 0) {
-			/*
-			 * We pass NULL ww here, as we don't want to unbind
-			 * locked objects when called from execbuf when pinning
-			 * is removed. This would probably regress badly.
-			 */
-			i915_gem_evict_vm(vm, NULL);
+			i915_gem_evict_vm(vm);
 			mutex_unlock(&vm->mutex);
 		}
 	} while (1);
