@@ -199,13 +199,9 @@ static inline int i915_gem_object_lock_interruptible(struct drm_i915_gem_object 
 	return __i915_gem_object_lock(obj, ww, true);
 }
 
-static inline bool i915_gem_object_trylock(struct drm_i915_gem_object *obj,
-					   struct i915_gem_ww_ctx *ww)
+static inline bool i915_gem_object_trylock(struct drm_i915_gem_object *obj)
 {
-	if (!ww)
-		return dma_resv_trylock(obj->base.resv);
-	else
-		return ww_mutex_trylock(&obj->base.resv->lock, &ww->ctx);
+	return dma_resv_trylock(obj->base.resv);
 }
 
 static inline void i915_gem_object_unlock(struct drm_i915_gem_object *obj)
