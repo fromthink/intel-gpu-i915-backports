@@ -51,18 +51,7 @@ intel_pin_fb_obj_dpt(struct drm_framebuffer *fb,
 			continue;
 
 		if (HAS_LMEM(dev_priv)) {
-			unsigned int flags = obj->flags;
-
-			/*
-			 * For this type of buffer we need to able to read from the CPU
-			 * the clear color value found in the buffer, hence we need to
-			 * ensure it is always in the mappable part of lmem, if this is
-			 * a small-bar device.
-			 */
-			if (intel_fb_rc_ccs_cc_plane(fb) >= 0)
-				flags &= ~I915_BO_ALLOC_GPU_ONLY;
-			ret = __i915_gem_object_migrate(obj, &ww, INTEL_REGION_LMEM_0,
-							flags);
+			ret = i915_gem_object_migrate(obj, &ww, INTEL_REGION_LMEM_0);
 			if (ret)
 				continue;
 		}
