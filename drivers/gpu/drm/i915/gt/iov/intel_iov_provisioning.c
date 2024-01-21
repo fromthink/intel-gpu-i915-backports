@@ -674,7 +674,7 @@ release:
 		return -EDQUOT;
 
 	mutex_lock(&ggtt->vm.mutex);
-	err = i915_gem_gtt_insert(&ggtt->vm, NULL, node, size, alignment,
+	err = i915_gem_gtt_insert(&ggtt->vm, node, size, alignment,
 		I915_COLOR_UNEVICTABLE,
 		ggtt->pin_bias, GUC_GGTT_TOP,
 		PIN_HIGH);

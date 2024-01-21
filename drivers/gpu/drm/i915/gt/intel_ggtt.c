@@ -1722,7 +1722,7 @@ int i915_ggtt_balloon(struct i915_ggtt *ggtt, u64 start, u64 end,
 	gt_dbg(ggtt->vm.gt, "ballooning GGTT [%#llx-%#llx] %lluK\n",
 	       start, end, size / SZ_1K);
 
-	err = i915_gem_gtt_reserve(&ggtt->vm, NULL, node, size, start,
+	err = i915_gem_gtt_reserve(&ggtt->vm, node, size, start,
 				   I915_COLOR_UNEVICTABLE, PIN_NOEVICT);
 	if (unlikely(err)) {
 		gt_err(ggtt->vm.gt, "Failed to balloon GGTT [%#llx-%#llx] %pe\n",
