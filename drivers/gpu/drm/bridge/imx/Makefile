@@ -1,0 +1,6 @@
+obj-$(CPTCFG_DRM_IMX_LDB_HELPER) += imx-ldb-helper.o
+obj-$(CPTCFG_DRM_IMX8QM_LDB) += imx8qm-ldb.o
+obj-$(CPTCFG_DRM_IMX8QXP_LDB) += imx8qxp-ldb.o
+obj-$(CPTCFG_DRM_IMX8QXP_PIXEL_COMBINER) += imx8qxp-pixel-combiner.o
+obj-$(CPTCFG_DRM_IMX8QXP_PIXEL_LINK) += imx8qxp-pixel-link.o
+obj-$(CPTCFG_DRM_IMX8QXP_PIXEL_LINK_TO_DPI) += imx8qxp-pxl2dpi.o

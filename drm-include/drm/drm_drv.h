@@ -30,6 +30,8 @@
 #include <linux/list.h>
 #include <linux/irqreturn.h>
 
+#include <video/nomodeset.h>
+
 #include <drm/drm_device.h>
 
 struct drm_file;
@@ -94,6 +96,14 @@ enum drm_driver_feature {
 	 * synchronization of command submission.
 	 */
 	DRIVER_SYNCOBJ_TIMELINE         = BIT(6),
+	/**
+	 * @DRIVER_COMPUTE_ACCEL:
+	 *
+	 * Driver supports compute acceleration devices. This flag is mutually exclusive with
+	 * @DRIVER_RENDER and @DRIVER_MODESET. Devices that support both graphics and compute
+	 * acceleration should be handled by two drivers that are connected using auxiliary bus.
+	 */
+	DRIVER_COMPUTE_ACCEL            = BIT(7),
 
 	/* IMPORTANT: Below are all the legacy flags, add new ones above. */
 
@@ -137,19 +147,8 @@ enum drm_driver_feature {
 	 * @DRIVER_HAVE_IRQ:
 	 *
 	 * Legacy irq support. Only for legacy drivers. Do not use.
-	 *
-	 * New drivers can either use the drm_irq_install() and
-	 * drm_irq_uninstall() helper functions, or roll their own irq support
-	 * code by calling request_irq() directly.
 	 */
 	DRIVER_HAVE_IRQ			= BIT(30),
-	/**
-	 * @DRIVER_KMS_LEGACY_CONTEXT:
-	 *
-	 * Used only by nouveau for backwards compatibility with existing
-	 * userspace.  Do not use.
-	 */
-	DRIVER_KMS_LEGACY_CONTEXT	= BIT(31),
 };
 
 /**
@@ -272,42 +271,6 @@ struct drm_driver {
 	void (*release) (struct drm_device *);
 
 	/**
-	 * @irq_handler:
-	 *
-	 * Interrupt handler called when using drm_irq_install(). Not used by
-	 * drivers which implement their own interrupt handling.
-	 */
-	irqreturn_t(*irq_handler) (int irq, void *arg);
-
-	/**
-	 * @irq_preinstall:
-	 *
-	 * Optional callback used by drm_irq_install() which is called before
-	 * the interrupt handler is registered. This should be used to clear out
-	 * any pending interrupts (from e.g. firmware based drives) and reset
-	 * the interrupt handling registers.
-	 */
-	void (*irq_preinstall) (struct drm_device *dev);
-
-	/**
-	 * @irq_postinstall:
-	 *
-	 * Optional callback used by drm_irq_install() which is called after
-	 * the interrupt handler is registered. This should be used to enable
-	 * interrupt generation in the hardware.
-	 */
-	int (*irq_postinstall) (struct drm_device *dev);
-
-	/**
-	 * @irq_uninstall:
-	 *
-	 * Optional callback used by drm_irq_uninstall() which is called before
-	 * the interrupt handler is unregistered. This should be used to disable
-	 * interrupt generation in the hardware.
-	 */
-	void (*irq_uninstall) (struct drm_device *dev);
-
-	/**
 	 * @master_set:
 	 *
 	 * Called whenever the minor master is set. Only used by vmwgfx.
@@ -331,8 +294,9 @@ struct drm_driver {
 	/**
 	 * @gem_create_object: constructor for gem objects
 	 *
-	 * Hook for allocating the GEM object struct, for use by the CMA and
-	 * SHMEM GEM helpers.
+	 * Hook for allocating the GEM object struct, for use by the CMA
+	 * and SHMEM GEM helpers. Returns a GEM object on success, or an
+	 * ERR_PTR()-encoded error code otherwise.
 	 */
 	struct drm_gem_object *(*gem_create_object)(struct drm_device *dev,
 						    size_t size);
@@ -436,25 +400,13 @@ struct drm_driver {
 	int (*dumb_map_offset)(struct drm_file *file_priv,
 			       struct drm_device *dev, uint32_t handle,
 			       uint64_t *offset);
+
 	/**
-	 * @dumb_destroy:
+	 * @show_fdinfo:
 	 *
-	 * This destroys the userspace handle for the given dumb backing storage buffer.
-	 * Since buffer objects must be reference counted in the kernel a buffer object
-	 * won't be immediately freed if a framebuffer modeset object still uses it.
-	 *
-	 * Called by the user via ioctl.
-	 *
-	 * The default implementation is drm_gem_dumb_destroy(). GEM based drivers
-	 * must not overwrite this.
-	 *
-	 * Returns:
-	 *
-	 * Zero on success, negative errno on failure.
+	 * Print device specific fdinfo.  See Documentation/gpu/drm-usage-stats.rst.
 	 */
-	int (*dumb_destroy)(struct drm_file *file_priv,
-			    struct drm_device *dev,
-			    uint32_t handle);
+	void (*show_fdinfo)(struct drm_printer *p, struct drm_file *f);
 
 	/** @major: driver major number */
 	int major;
@@ -498,16 +450,19 @@ struct drm_driver {
 	 */
 	const struct file_operations *fops;
 
-	void (*preclose) (struct drm_device *, struct drm_file *file_priv);
-
 #ifdef CPTCFG_DRM_LEGACY
 	/* Everything below here is for legacy driver, never use! */
 	/* private: */
 
 	int (*firstopen) (struct drm_device *);
+	void (*preclose) (struct drm_device *, struct drm_file *file_priv);
 	int (*dma_ioctl) (struct drm_device *dev, void *data, struct drm_file *file_priv);
 	int (*dma_quiescent) (struct drm_device *);
 	int (*context_dtor) (struct drm_device *dev, int context);
+	irqreturn_t (*irq_handler)(int irq, void *arg);
+	void (*irq_preinstall)(struct drm_device *dev);
+	int (*irq_postinstall)(struct drm_device *dev);
+	void (*irq_uninstall)(struct drm_device *dev);
 	u32 (*get_vblank_counter)(struct drm_device *dev, unsigned int pipe);
 	int (*enable_vblank)(struct drm_device *dev, unsigned int pipe);
 	void (*disable_vblank)(struct drm_device *dev, unsigned int pipe);
@@ -515,7 +470,6 @@ struct drm_driver {
 #endif
 };
 
-void __devm_drm_dev_release_action(struct drm_device *dev);
 void *__devm_drm_dev_alloc(struct device *parent,
 			   const struct drm_driver *driver,
 			   size_t size, size_t offset);
@@ -549,9 +503,6 @@ void *__devm_drm_dev_alloc(struct device *parent,
 #define devm_drm_dev_alloc(parent, driver, type, member) \
 	((type *) __devm_drm_dev_alloc(parent, driver, sizeof(type), \
 				       offsetof(type, member)))
-
-#define devm_drm_release_action(drm_dev) \
-	__devm_drm_dev_release_action(drm_dev)
 
 struct drm_device *drm_dev_alloc(const struct drm_driver *driver,
 				 struct device *parent);
@@ -640,7 +591,10 @@ static inline bool drm_drv_uses_atomic_modeset(struct drm_device *dev)
 }
 
 
-int drm_dev_set_unique(struct drm_device *dev, const char *name);
-
+/* TODO: Inline drm_firmware_drivers_only() in all its callers. */
+static inline bool drm_firmware_drivers_only(void)
+{
+	return video_firmware_drivers_only();
+}
 
 #endif

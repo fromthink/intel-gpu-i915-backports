@@ -25,6 +25,11 @@
 #include <linux/types.h>
 #include <uapi/drm/drm_fourcc.h>
 
+/**
+ * DRM_FORMAT_MAX_PLANES - maximum number of planes a DRM format can have
+ */
+#define DRM_FORMAT_MAX_PLANES	4u
+
 /*
  * DRM formats are little endian.  Define host endian variants for the
  * most common formats here, to reduce the #ifdefs needed in drivers.
@@ -33,12 +38,6 @@
  * case the format can't be specified otherwise, so we don't end up
  * with two values describing the same format.
  */
-
-/**
- * DRM_FORMAT_MAX_PLANES - maximum number of planes a DRM format can have
- */
-#define DRM_FORMAT_MAX_PLANES   4u
-
 #ifdef __BIG_ENDIAN
 # define DRM_FORMAT_HOST_XRGB1555     (DRM_FORMAT_XRGB1555         |	\
 				       DRM_FORMAT_BIG_ENDIAN)
@@ -84,7 +83,7 @@ struct drm_format_info {
 		 * triplet @char_per_block, @block_w, @block_h for better
 		 * describing the pixel format.
 		 */
-		u8 cpp[4];
+		u8 cpp[DRM_FORMAT_MAX_PLANES];
 
 		/**
 		 * @char_per_block:
@@ -110,7 +109,7 @@ struct drm_format_info {
 		 * information from their drm_mode_config.get_format_info hook
 		 * if they want the core to be validating the pitch.
 		 */
-		u8 char_per_block[4];
+		u8 char_per_block[DRM_FORMAT_MAX_PLANES];
 	};
 
 	/**
@@ -119,7 +118,7 @@ struct drm_format_info {
 	 * Block width in pixels, this is intended to be accessed through
 	 * drm_format_info_block_width()
 	 */
-	u8 block_w[4];
+	u8 block_w[DRM_FORMAT_MAX_PLANES];
 
 	/**
 	 * @block_h:
@@ -127,7 +126,7 @@ struct drm_format_info {
 	 * Block height in pixels, this is intended to be accessed through
 	 * drm_format_info_block_height()
 	 */
-	u8 block_h[4];
+	u8 block_h[DRM_FORMAT_MAX_PLANES];
 
 	/** @hsub: Horizontal chroma subsampling factor */
 	u8 hsub;
@@ -139,14 +138,9 @@ struct drm_format_info {
 
 	/** @is_yuv: Is it a YUV format? */
 	bool is_yuv;
-};
 
-/**
- * struct drm_format_name_buf - name of a DRM format
- * @str: string buffer containing the format name
- */
-struct drm_format_name_buf {
-	char str[32];
+	/** @is_color_indexed: Is it a color-indexed format? */
+	bool is_color_indexed;
 };
 
 /**
@@ -322,6 +316,7 @@ unsigned int drm_format_info_block_width(const struct drm_format_info *info,
 					 int plane);
 unsigned int drm_format_info_block_height(const struct drm_format_info *info,
 					  int plane);
+unsigned int drm_format_info_bpp(const struct drm_format_info *info, int plane);
 uint64_t drm_format_info_min_pitch(const struct drm_format_info *info,
 				   int plane, unsigned int buffer_width);
 

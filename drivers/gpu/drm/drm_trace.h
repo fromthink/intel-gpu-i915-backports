@@ -5,9 +5,6 @@
 #include <linux/stringify.h>
 #include <linux/types.h>
 #include <linux/tracepoint.h>
-#ifdef BPM_TRACE_INCLUDE_PATH_NOT_PRESENT
-#include <backport/backport_path.h>
-#endif
 
 struct drm_file;
 
@@ -73,10 +70,5 @@ TRACE_EVENT(drm_vblank_event_delivered,
 
 /* This part must be outside protection */
 #undef TRACE_INCLUDE_PATH
-#ifdef BPM_TRACE_INCLUDE_PATH_NOT_PRESENT
-#define TRACE_INCLUDE_PATH BACKPORT_PATH/drivers/gpu/drm
-#else
 #define TRACE_INCLUDE_PATH ../../drivers/gpu/drm
-#endif
-
 #include <trace/define_trace.h>

@@ -1,0 +1,12 @@
+# SPDX-License-Identifier: GPL-2.0-only
+#
+# Video configuration
+#
+
+menu "Graphics support"
+
+config VIDEO_NOMODESET
+	bool
+	default n
+
+endmenu
