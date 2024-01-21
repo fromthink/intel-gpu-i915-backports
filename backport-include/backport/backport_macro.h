@@ -25,6 +25,13 @@
 #define BPM_VIDEO_FIRMWARE_DRIVERS_ONLY_NOT_EXPORTED
 #endif
 
+#if LINUX_VERSION_IS_GEQ(6,1,0)
+/*
+ * 0f60d28828dd dynamic_dname(): drop unused dentry argument
+ */
+#define BPM_DYNAMIC_DNAME_DENTRY_ARG_NOT_PRESENT
+#endif
+
 #if LINUX_VERSION_IS_GEQ(5,19,0)
 
 /*

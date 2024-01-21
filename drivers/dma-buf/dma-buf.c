@@ -54,7 +54,11 @@ static char *dmabuffs_dname(struct dentry *dentry, char *buffer, int buflen)
 		ret = strlcpy(name, dmabuf->name, DMA_BUF_NAME_LEN);
 	spin_unlock(&dmabuf->name_lock);
 
+#ifdef BPM_DYNAMIC_DNAME_DENTRY_ARG_NOT_PRESENT
 	return dynamic_dname(buffer, buflen, "/%s:%s",
+#else
+	return dynamic_dname(dentry, buffer, buflen, "/%s:%s",
+#endif
 			     dentry->d_name.name, ret > 0 ? name : "");
 }
 

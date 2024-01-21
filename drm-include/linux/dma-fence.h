@@ -626,6 +626,11 @@ struct dma_fence *dma_fence_get_stub(void);
 struct dma_fence *dma_fence_allocate_private_stub(ktime_t timestamp);
 u64 dma_fence_context_alloc(unsigned num);
 
+#ifdef BPM_ADD_BACKPORT_MACRO_TO_DMA_BUF_SYMBOLS
+#define dma_fence_array_ops LINUX_DMABUF_BACKPORT(dma_fence_array_ops)
+#define dma_fence_chain_ops  LINUX_DMABUF_BACKPORT(dma_fence_chain_ops)
+#endif
+
 extern const struct dma_fence_ops dma_fence_array_ops;
 extern const struct dma_fence_ops dma_fence_chain_ops;
 
