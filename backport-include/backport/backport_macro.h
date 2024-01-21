@@ -65,6 +65,11 @@
  * 6a99099 drm/display: Move HDCP helpers into display-helper module
  */
 #define BPM_HDCP_HELPERS_NOT_IN_DISPLAY_DIRECTORY
+
+/*
+ * ea4692c lib/string_helpers: Consolidate string helpers implementation
+ */
+#define BPM_CONSOLIDATE_STRING_HELPERS_NOT_PRESENT
 #endif
 
 #if LINUX_VERSION_IS_LESS(5,17,0)
