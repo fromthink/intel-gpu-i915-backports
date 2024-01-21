@@ -8,7 +8,8 @@
 menuconfig DRM
 	tristate "Direct Rendering Manager (XFree86 4.1.0 and higher DRI support)"
 	depends on m
-	depends on (AGP || AGP=n) && !EMULATED_CMPXCHG && HAS_DMA
+	depends on BUILD_DMABUF_I915_MEI || ONLY_I915
+	depends on !EMULATED_CMPXCHG && HAS_DMA
 	select DRM_PANEL_ORIENTATION_QUIRKS
 	select HDMI
 	depends on I2C
@@ -16,8 +17,8 @@ menuconfig DRM
 	depends on SYNC_FILE
 # gallium uses SYS_kcmp for os_same_file_description() to de-duplicate
 # device and dmabuf fd. Let's make sure that is available for our userspace.
-	depends on KCMP
-	depends on VIDEO_CMDLINE
+	select KCMP
+	depends on VIDEO_CMDLINE || FB_CMDLINE
 	select VIDEO_NOMODESET
 	help
 	  Kernel-level support for the Direct Rendering Infrastructure (DRI)
