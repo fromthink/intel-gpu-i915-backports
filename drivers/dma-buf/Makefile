@@ -13,8 +13,7 @@ dmabuf-$(CPTCFG_KERNEL_5_10) += ../../compat/backport-5.10.o
 dmabuf-y +=  ../../compat/backport-3.17.o ../../compat/fs_d_path.o
 
 dmabuf-y += dma-buf.o dma-fence.o dma-fence-array.o dma-fence-chain.o \
-         dma-resv.o seqno-fence.o
-
+	 dma-fence-unwrap.o dma-resv.o
 dmabuf-$(CPTCFG_DMABUF_HEAPS)	+= dma-heap.o
 obj-$(CPTCFG_DMABUF_HEAPS)	+= heaps/
 dmabuf-$(CPTCFG_SYNC_FILE)		+= sync_file.o
@@ -25,7 +24,9 @@ dmabuf-$(CPTCFG_DMABUF_SYSFS_STATS) += dma-buf-sysfs-stats.o
 dmabuf_selftests-y := \
 	selftest.o \
 	st-dma-fence.o \
-	st-dma-fence-chain.o
+	st-dma-fence-chain.o \
+	st-dma-fence-unwrap.o \
+	st-dma-resv.o
 
 obj-$(CPTCFG_DMABUF_SELFTESTS)	+= dmabuf_selftests.o
 endif
