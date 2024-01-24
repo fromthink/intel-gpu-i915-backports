@@ -28,6 +28,10 @@ i915-compat-$(CPTCFG_KERNEL_5_13) += backport-5.13.o
 i915-compat-$(CPTCFG_KERNEL_5_15) += backport-5.15.o timer.o
 i915-compat-$(CPTCFG_I915_NO_DRM) += backport-nodrm.o
 
+ifeq ($(CONFIG_HDMI),)
+i915-compat-y += hdmi_5_10.o
+endif
+
 get_release_version = $(strip $(shell expr $(1) \* 256 + 0$(2)))
 ifneq ($(RHEL_RELEASE_VERSION),)
 disable_rhel_drm_backport = $(strip $(shell expr $(RHEL_RELEASE_VERSION) \<= $(call  get_release_version,8,2)))
