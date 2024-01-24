@@ -53,7 +53,6 @@ struct intel_huc {
 	bool loaded_via_gsc;
 };
 
-int intel_huc_sanitize(struct intel_huc *huc);
 void intel_huc_init_early(struct intel_huc *huc);
 int intel_huc_init(struct intel_huc *huc);
 void intel_huc_fini(struct intel_huc *huc);
@@ -70,6 +69,12 @@ int intel_huc_fw_load_and_auth_via_gsc_cs(struct intel_huc *huc);
 
 void intel_huc_register_gsc_notifier(struct intel_huc *huc, struct bus_type *bus);
 void intel_huc_unregister_gsc_notifier(struct intel_huc *huc, struct bus_type *bus);
+
+static inline int intel_huc_sanitize(struct intel_huc *huc)
+{
+	intel_uc_fw_sanitize(&huc->fw);
+	return 0;
+}
 
 static inline bool intel_huc_is_supported(const struct intel_huc *huc)
 {
