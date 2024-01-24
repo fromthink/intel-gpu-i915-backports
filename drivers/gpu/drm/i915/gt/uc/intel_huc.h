@@ -7,21 +7,10 @@
 #define _INTEL_HUC_H_
 
 #include "i915_reg_defs.h"
-#include "i915_sw_fence.h"
 #include "intel_uc_fw.h"
 #include "intel_huc_fw.h"
 
-#include <linux/notifier.h>
-#include <linux/hrtimer.h>
-
-struct bus_type;
 struct i915_vma;
-
-enum intel_huc_delayed_load_status {
-	INTEL_HUC_WAITING_ON_GSC = 0,
-	INTEL_HUC_WAITING_ON_PXP,
-	INTEL_HUC_DELAYED_LOAD_ERROR,
-};
 
 enum intel_huc_authentication_type {
 	INTEL_HUC_AUTH_BY_GUC = 0,
@@ -40,13 +29,6 @@ struct intel_huc {
 		u32 value;
 	} status[INTEL_HUC_AUTH_MAX_MODES];
 
-	struct {
-		struct i915_sw_fence fence;
-		struct hrtimer timer;
-		struct notifier_block nb;
-		enum intel_huc_delayed_load_status status;
-	} delayed_load;
-
 	/* for load via GSCCS */
 	struct i915_vma *heci_pkt;
 
@@ -56,7 +38,6 @@ struct intel_huc {
 void intel_huc_init_early(struct intel_huc *huc);
 int intel_huc_init(struct intel_huc *huc);
 void intel_huc_fini(struct intel_huc *huc);
-void intel_huc_suspend(struct intel_huc *huc);
 int intel_huc_auth(struct intel_huc *huc, enum intel_huc_authentication_type type);
 int intel_huc_wait_for_auth_complete(struct intel_huc *huc,
 				     enum intel_huc_authentication_type type);
@@ -66,9 +47,6 @@ bool intel_huc_is_fully_authenticated(struct intel_huc *huc);
 int intel_huc_check_status(struct intel_huc *huc);
 void intel_huc_update_auth_status(struct intel_huc *huc);
 int intel_huc_fw_load_and_auth_via_gsc_cs(struct intel_huc *huc);
-
-void intel_huc_register_gsc_notifier(struct intel_huc *huc, struct bus_type *bus);
-void intel_huc_unregister_gsc_notifier(struct intel_huc *huc, struct bus_type *bus);
 
 static inline int intel_huc_sanitize(struct intel_huc *huc)
 {
