@@ -93,7 +93,11 @@ static void drm_sysfs_acpi_register(void) { }
 static void drm_sysfs_acpi_unregister(void) { }
 #endif
 
+#ifdef BPM_DMA_HEAP_AND_DRM_DEVNODE_CONST_ARG_NOT_PRESENT
 static char *drm_devnode(const struct device *dev, umode_t *mode)
+#else
+static char *drm_devnode(struct device *dev, umode_t *mode)
+#endif
 {
 	return kasprintf(GFP_KERNEL, "dri/%s", dev_name(dev));
 }
@@ -142,7 +146,11 @@ int drm_sysfs_init(void)
 {
 	int err;
 
+#if LINUX_VERSION_IS_GEQ(6,4,0)
 	drm_class = class_create("drm");
+#else
+	drm_class = class_create(THIS_MODULE, "drm");
+#endif
 	if (IS_ERR(drm_class))
 		return PTR_ERR(drm_class);
 

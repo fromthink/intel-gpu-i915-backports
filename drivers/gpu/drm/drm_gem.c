@@ -495,6 +495,7 @@ int drm_gem_create_mmap_offset(struct drm_gem_object *obj)
 }
 EXPORT_SYMBOL(drm_gem_create_mmap_offset);
 
+#ifdef BPM_CHECK_MOVE_UNEVICTABLE_FOLIOS_AVAILABLE
 /*
  * Move folios to appropriate lru and release the folios, decrementing the
  * ref count of those folios.
@@ -505,6 +506,18 @@ static void drm_gem_check_release_batch(struct folio_batch *fbatch)
 	__folio_batch_release(fbatch);
 	cond_resched();
 }
+#else
+/*
+ * Move pages to appropriate lru and release the pagevec, decrementing the
+ * ref count of those pages.
+ */
+static void drm_gem_check_release_pagevec(struct pagevec *pvec)
+{
+	check_move_unevictable_pages(pvec);
+	__pagevec_release(pvec);
+	cond_resched();
+}
+#endif
 
 /**
  * drm_gem_get_pages - helper to allocate backing pages for a GEM object
@@ -535,9 +548,15 @@ struct page **drm_gem_get_pages(struct drm_gem_object *obj)
 {
 	struct address_space *mapping;
 	struct page **pages;
+#ifdef BPM_CHECK_MOVE_UNEVICTABLE_FOLIOS_AVAILABLE
 	struct folio *folio;
 	struct folio_batch fbatch;
 	int i, j, npages;
+#else
+	struct page *p;
+	struct pagevec pvec;
+	int i, npages;
+#endif
 
 	if (WARN_ON(!obj->filp))
 		return ERR_PTR(-EINVAL);
@@ -561,12 +580,19 @@ struct page **drm_gem_get_pages(struct drm_gem_object *obj)
 
 	i = 0;
 	while (i < npages) {
+#ifdef BPM_CHECK_MOVE_UNEVICTABLE_FOLIOS_AVAILABLE
 		folio = shmem_read_folio_gfp(mapping, i,
 				mapping_gfp_mask(mapping));
 		if (IS_ERR(folio))
 			goto fail;
 		for (j = 0; j < folio_nr_pages(folio); j++, i++)
 			pages[i] = folio_file_page(folio, i);
+#else
+		p = shmem_read_mapping_page(mapping, i);
+		if (IS_ERR(p))
+			goto fail;
+		pages[i] = p;
+#endif
 
 		/* Make sure shmem keeps __GFP_DMA32 allocated pages in the
 		 * correct region during swapin. Note that this requires
@@ -574,13 +600,18 @@ struct page **drm_gem_get_pages(struct drm_gem_object *obj)
 		 * so shmem can relocate pages during swapin if required.
 		 */
 		BUG_ON(mapping_gfp_constraint(mapping, __GFP_DMA32) &&
+#ifdef BPM_CHECK_MOVE_UNEVICTABLE_FOLIOS_AVAILABLE
 				(folio_pfn(folio) >= 0x00100000UL));
+#else
+				(page_to_pfn(p) >= 0x00100000UL));
+#endif
 	}
 
 	return pages;
 
 fail:
 	mapping_clear_unevictable(mapping);
+#ifdef BPM_CHECK_MOVE_UNEVICTABLE_FOLIOS_AVAILABLE
 	folio_batch_init(&fbatch);
 	j = 0;
 	while (j < i) {
@@ -594,6 +625,18 @@ fail:
 
 	kvfree(pages);
 	return ERR_CAST(folio);
+#else
+	pagevec_init(&pvec);
+	while (i--) {
+		if (!pagevec_add(&pvec, pages[i]))
+			drm_gem_check_release_pagevec(&pvec);
+	}
+	if (pagevec_count(&pvec))
+		drm_gem_check_release_pagevec(&pvec);
+
+	kvfree(pages);
+	return ERR_CAST(p);
+#endif
 }
 EXPORT_SYMBOL(drm_gem_get_pages);
 
@@ -609,7 +652,11 @@ void drm_gem_put_pages(struct drm_gem_object *obj, struct page **pages,
 {
 	int i, npages;
 	struct address_space *mapping;
+#ifdef BPM_CHECK_MOVE_UNEVICTABLE_FOLIOS_AVAILABLE
 	struct folio_batch fbatch;
+#else
+	struct pagevec pvec;
+#endif
 
 	mapping = file_inode(obj->filp)->i_mapping;
 	mapping_clear_unevictable(mapping);
@@ -622,27 +669,53 @@ void drm_gem_put_pages(struct drm_gem_object *obj, struct page **pages,
 
 	npages = obj->size >> PAGE_SHIFT;
 
+#ifdef BPM_CHECK_MOVE_UNEVICTABLE_FOLIOS_AVAILABLE
 	folio_batch_init(&fbatch);
+#else
+	pagevec_init(&pvec);
+#endif
 	for (i = 0; i < npages; i++) {
+#ifdef BPM_CHECK_MOVE_UNEVICTABLE_FOLIOS_AVAILABLE
 		struct folio *folio;
+#endif
 
 		if (!pages[i])
 			continue;
+#ifdef BPM_CHECK_MOVE_UNEVICTABLE_FOLIOS_AVAILABLE
 		folio = page_folio(pages[i]);
+#endif
 
 		if (dirty)
+#ifdef BPM_CHECK_MOVE_UNEVICTABLE_FOLIOS_AVAILABLE
 			folio_mark_dirty(folio);
+#else
+			set_page_dirty(pages[i]);
+#endif
 
 		if (accessed)
+#ifdef BPM_CHECK_MOVE_UNEVICTABLE_FOLIOS_AVAILABLE
 			folio_mark_accessed(folio);
+#else
+			mark_page_accessed(pages[i]);
+#endif
 
 		/* Undo the reference we took when populating the table */
+#ifdef BPM_CHECK_MOVE_UNEVICTABLE_FOLIOS_AVAILABLE
 		if (!folio_batch_add(&fbatch, folio))
 			drm_gem_check_release_batch(&fbatch);
 		i += folio_nr_pages(folio) - 1;
+#else
+		if (!pagevec_add(&pvec, pages[i]))
+			drm_gem_check_release_pagevec(&pvec);
+#endif
 	}
+#ifdef BPM_CHECK_MOVE_UNEVICTABLE_FOLIOS_AVAILABLE
 	if (folio_batch_count(&fbatch))
 		drm_gem_check_release_batch(&fbatch);
+#else
+	if (pagevec_count(&pvec))
+		drm_gem_check_release_pagevec(&pvec);
+#endif
 
 	kvfree(pages);
 }

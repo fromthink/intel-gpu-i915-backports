@@ -5,6 +5,7 @@
 #include <linux/kref.h>
 #include <linux/mutex.h>
 #include <linux/idr.h>
+#include <linux/slab.h>
 
 #include <drm/drm_legacy.h>
 #include <drm/drm_mode_config.h>

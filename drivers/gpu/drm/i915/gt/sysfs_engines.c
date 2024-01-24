@@ -419,7 +419,11 @@ static void kobj_engine_release(struct kobject *kobj)
 	kfree(kobj);
 }
 
+#ifdef BPM_STRUCT_BUS_TYPE_UEVENT_CONST
 static const struct kobj_type kobj_engine_type = {
+#else
+static struct kobj_type kobj_engine_type = {
+#endif
 	.release = kobj_engine_release,
 	.sysfs_ops = &kobj_sysfs_ops
 };

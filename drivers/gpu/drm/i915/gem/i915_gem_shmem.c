@@ -18,6 +18,7 @@
 #include "i915_scatterlist.h"
 #include "i915_trace.h"
 
+#ifdef BPM_CHECK_MOVE_UNEVICTABLE_FOLIOS_AVAILABLE
 /*
  * Move folios to appropriate lru and release the batch, decrementing the
  * ref count of those folios.
@@ -59,6 +60,44 @@ void shmem_sg_free_table(struct sg_table *st, struct address_space *mapping,
 
 	sg_free_table(st);
 }
+#else
+/*
+ * Move pages to appropriate lru and release the pagevec, decrementing the
+ * ref count of those pages.
+ */
+static void check_release_pagevec(struct pagevec *pvec)
+{
+	check_move_unevictable_pages(pvec);
+	__pagevec_release(pvec);
+	cond_resched();
+}
+
+void shmem_sg_free_table(struct sg_table *st, struct address_space *mapping,
+			 bool dirty, bool backup)
+{
+	struct sgt_iter sgt_iter;
+	struct pagevec pvec;
+	struct page *page;
+
+	mapping_clear_unevictable(mapping);
+
+	pagevec_init(&pvec);
+	for_each_sgt_page(page, sgt_iter, st) {
+		if (dirty)
+			set_page_dirty(page);
+
+		if (backup)
+			mark_page_accessed(page);
+
+		if (!pagevec_add(&pvec, page))
+			check_release_pagevec(&pvec);
+	}
+	if (pagevec_count(&pvec))
+		check_release_pagevec(&pvec);
+
+	sg_free_table(st);
+}
+#endif
 
 int shmem_sg_alloc_table(struct drm_i915_private *i915, struct sg_table *st,
 			 size_t size, struct intel_memory_region *mr,
@@ -69,6 +108,9 @@ int shmem_sg_alloc_table(struct drm_i915_private *i915, struct sg_table *st,
 	unsigned long i;
 	struct scatterlist *sg;
 	unsigned long next_pfn = 0;	/* suppress gcc warning */
+#ifndef BPM_CHECK_MOVE_UNEVICTABLE_FOLIOS_AVAILABLE
+	struct page *page;
+#endif
 	gfp_t noreclaim;
 	int ret;
 
@@ -99,8 +141,10 @@ int shmem_sg_alloc_table(struct drm_i915_private *i915, struct sg_table *st,
 	sg = st->sgl;
 	st->nents = 0;
 	for (i = 0; i < page_count; i++) {
+#ifdef BPM_CHECK_MOVE_UNEVICTABLE_FOLIOS_AVAILABLE
 		struct folio *folio;
 		unsigned long nr_pages;
+#endif
 		const unsigned int shrink[] = {
 			I915_SHRINK_BOUND | I915_SHRINK_UNBOUND,
 			0,
@@ -109,12 +153,21 @@ int shmem_sg_alloc_table(struct drm_i915_private *i915, struct sg_table *st,
 
 		do {
 			cond_resched();
+#ifdef BPM_CHECK_MOVE_UNEVICTABLE_FOLIOS_AVAILABLE
 			folio = shmem_read_folio_gfp(mapping, i, gfp);
 			if (!IS_ERR(folio))
+#else
+			page = shmem_read_mapping_page_gfp(mapping, i, gfp);
+			if (!IS_ERR(page))
+#endif
 				break;
 
 			if (!*s) {
+#ifdef BPM_CHECK_MOVE_UNEVICTABLE_FOLIOS_AVAILABLE
 				ret = PTR_ERR(folio);
+#else
+				ret = PTR_ERR(page);
+#endif
 				goto err_sg;
 			}
 
@@ -151,22 +204,40 @@ int shmem_sg_alloc_table(struct drm_i915_private *i915, struct sg_table *st,
 			}
 		} while (1);
 
+#ifdef BPM_CHECK_MOVE_UNEVICTABLE_FOLIOS_AVAILABLE
 		nr_pages = min_t(unsigned long,
 				folio_nr_pages(folio), page_count - i);
+#endif
 		if (!i ||
 		    sg->length >= max_segment ||
+#ifdef BPM_CHECK_MOVE_UNEVICTABLE_FOLIOS_AVAILABLE
 		    folio_pfn(folio) != next_pfn) {
+#else
+				page_to_pfn(page) != next_pfn + 1) {
+#endif
 			if (i)
 				sg = sg_next(sg);
 
 			st->nents++;
+#ifdef BPM_CHECK_MOVE_UNEVICTABLE_FOLIOS_AVAILABLE
 			sg_set_folio(sg, folio, nr_pages * PAGE_SIZE, 0);
+#else
+			sg_set_page(sg, page, PAGE_SIZE, 0);
+#endif
 		} else {
+#ifdef BPM_CHECK_MOVE_UNEVICTABLE_FOLIOS_AVAILABLE
 			/* XXX: could overflow? */
 			sg->length += nr_pages * PAGE_SIZE;
+#else
+			sg->length += PAGE_SIZE;
+#endif
 		}
+#ifdef BPM_CHECK_MOVE_UNEVICTABLE_FOLIOS_AVAILABLE
 		next_pfn = folio_pfn(folio) + nr_pages;
 		i += nr_pages - 1;
+#else
+		next_pfn = page_to_pfn(page);
+#endif
 
 		/* Check that the i965g/gm workaround works. */
 		GEM_BUG_ON(gfp & __GFP_DMA32 && next_pfn >= 0x00100000UL);

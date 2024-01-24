@@ -52,7 +52,11 @@ struct drmres {
 	 * Thus we use ARCH_DMA_MINALIGN for data[] which will force the same
 	 * alignment for struct drmres when allocated by kmalloc().
 	 */
+#ifdef ARCH_DMA_MINALIGN
 	u8 __aligned(ARCH_DMA_MINALIGN) data[];
+#else
+	u8 __aligned(ARCH_KMALLOC_MINALIGN) data[];
+#endif
 };
 
 static void free_dr(struct drmres *dr)

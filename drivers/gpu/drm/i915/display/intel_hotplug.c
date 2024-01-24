@@ -638,7 +638,11 @@ static void i915_hpd_poll_init_work(struct work_struct *work)
 {
 	struct drm_i915_private *dev_priv =
 		container_of(work, struct drm_i915_private,
+#ifdef BPM_CANCEL_WORK_AVAILABLE
 			     display.hotplug.poll_init_work);
+#else
+			     display.hotplug.poll_init_work.work);
+#endif
 	struct drm_connector_list_iter conn_iter;
 	struct intel_connector *connector;
 	intel_wakeref_t wakeref;
@@ -658,7 +662,11 @@ static void i915_hpd_poll_init_work(struct work_struct *work)
 						  POWER_DOMAIN_DISPLAY_CORE);
 		drm_WARN_ON(&dev_priv->drm,
 			    READ_ONCE(dev_priv->display.hotplug.poll_enabled));
+#ifdef BPM_CANCEL_WORK_AVAILABLE
 		cancel_work(&dev_priv->display.hotplug.poll_init_work);
+#else
+		cancel_delayed_work(&dev_priv->display.hotplug.poll_init_work);
+#endif
 	}
 
 	drm_connector_list_iter_begin(&dev_priv->drm, &conn_iter);
@@ -725,8 +733,13 @@ void intel_hpd_poll_enable(struct drm_i915_private *dev_priv)
 	 * As well, there's no issue if we race here since we always reschedule
 	 * this worker anyway
 	 */
+#ifdef BPM_CANCEL_WORK_AVAILABLE
 	queue_work(dev_priv->unordered_wq,
 		   &dev_priv->display.hotplug.poll_init_work);
+#else
+	mod_delayed_work(dev_priv->unordered_wq,
+		   &dev_priv->display.hotplug.poll_init_work, 0);
+#endif
 }
 
 /**
@@ -754,8 +767,13 @@ void intel_hpd_poll_disable(struct drm_i915_private *dev_priv)
 		return;
 
 	WRITE_ONCE(dev_priv->display.hotplug.poll_enabled, false);
+#ifdef BPM_CANCEL_WORK_AVAILABLE
 	queue_work(dev_priv->unordered_wq,
 		   &dev_priv->display.hotplug.poll_init_work);
+#else
+	mod_delayed_work(dev_priv->unordered_wq,
+		   &dev_priv->display.hotplug.poll_init_work, 0);
+#endif
 }
 
 void intel_hpd_init_early(struct drm_i915_private *i915)
@@ -763,7 +781,11 @@ void intel_hpd_init_early(struct drm_i915_private *i915)
 	INIT_DELAYED_WORK(&i915->display.hotplug.hotplug_work,
 			  i915_hotplug_work_func);
 	INIT_WORK(&i915->display.hotplug.dig_port_work, i915_digport_work_func);
+#ifdef BPM_CANCEL_WORK_AVAILABLE
 	INIT_WORK(&i915->display.hotplug.poll_init_work, i915_hpd_poll_init_work);
+#else
+	INIT_DELAYED_WORK(&i915->display.hotplug.poll_init_work, i915_hpd_poll_init_work);
+#endif
 	INIT_DELAYED_WORK(&i915->display.hotplug.reenable_work,
 			  intel_hpd_irq_storm_reenable_work);
 
@@ -793,7 +815,11 @@ void intel_hpd_cancel_work(struct drm_i915_private *dev_priv)
 
 	cancel_work_sync(&dev_priv->display.hotplug.dig_port_work);
 	cancel_delayed_work_sync(&dev_priv->display.hotplug.hotplug_work);
+#ifdef BPM_CANCEL_WORK_AVAILABLE
 	cancel_work_sync(&dev_priv->display.hotplug.poll_init_work);
+#else
+	cancel_delayed_work_sync(&dev_priv->display.hotplug.poll_init_work);
+#endif
 	cancel_delayed_work_sync(&dev_priv->display.hotplug.reenable_work);
 }
 

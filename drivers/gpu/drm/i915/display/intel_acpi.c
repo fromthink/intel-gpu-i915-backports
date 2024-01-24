@@ -335,11 +335,14 @@ void intel_acpi_assign_connector_fwnodes(struct drm_i915_private *i915)
 
 void intel_acpi_video_register(struct drm_i915_private *i915)
 {
+#ifdef BPM_ACPI_VIDEO_REGISTER_BACKLIGHT_AVAILABLE
 	struct drm_connector_list_iter conn_iter;
 	struct drm_connector *connector;
+#endif
 
 	acpi_video_register();
 
+#ifdef BPM_ACPI_VIDEO_REGISTER_BACKLIGHT_AVAILABLE
 	/*
 	 * If i915 is driving an internal panel without registering its native
 	 * backlight handler try to register the acpi_video backlight.
@@ -357,4 +360,5 @@ void intel_acpi_video_register(struct drm_i915_private *i915)
 		}
 	}
 	drm_connector_list_iter_end(&conn_iter);
+#endif
 }

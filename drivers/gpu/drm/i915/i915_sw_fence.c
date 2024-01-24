@@ -465,7 +465,11 @@ static void irq_i915_sw_fence_work(struct irq_work *wrk)
 	struct i915_sw_dma_fence_cb_timer *cb =
 		container_of(wrk, typeof(*cb), work);
 
+#ifdef BPM_TIMER_SHUTDOWN_SYNC_AVAILABLE
 	timer_shutdown_sync(&cb->timer);
+#else
+	del_timer_sync(&cb->timer);
+#endif
 	dma_fence_put(cb->dma);
 
 	kfree_rcu(cb, rcu);

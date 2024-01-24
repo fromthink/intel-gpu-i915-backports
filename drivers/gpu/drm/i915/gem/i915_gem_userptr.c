@@ -133,6 +133,9 @@ static int i915_gem_userptr_get_pages(struct drm_i915_gem_object *obj)
 	struct page **pvec;
 	unsigned int num_pages; /* limited by sg_alloc_table_from_pages_segment */
 	int ret;
+#ifdef BPM_SG_ALLOC_TABLE_FROM_PAGES_SEGMENT_NOT_PRESENT
+	struct scatterlist *sg;
+#endif
 
 	if (overflows_type(obj->base.size >> PAGE_SHIFT, num_pages))
 		return -E2BIG;
@@ -151,11 +154,21 @@ static int i915_gem_userptr_get_pages(struct drm_i915_gem_object *obj)
 	pvec = obj->userptr.pvec;
 
 alloc_table:
+#ifdef BPM_SG_ALLOC_TABLE_FROM_PAGES_SEGMENT_NOT_PRESENT
+	sg = __sg_alloc_table_from_pages(st, pvec, num_pages, 0,
+					 num_pages << PAGE_SHIFT, max_segment,
+					 NULL, 0, GFP_KERNEL);
+	if (IS_ERR(sg)) {
+		ret = PTR_ERR(sg);
+		goto err;
+	}
+#else
 	ret = sg_alloc_table_from_pages_segment(st, pvec, num_pages, 0,
 						num_pages << PAGE_SHIFT,
 						max_segment, GFP_KERNEL);
 	if (ret)
 		goto err;
+#endif
 
 	ret = i915_gem_gtt_prepare_pages(obj, st);
 	if (ret) {
@@ -427,6 +440,7 @@ static const struct drm_i915_gem_object_ops i915_gem_userptr_ops = {
 static int
 probe_range(struct mm_struct *mm, unsigned long addr, unsigned long len)
 {
+#ifdef BPM_VMA_ITERATOR_AVAILABLE
 	VMA_ITERATOR(vmi, mm, addr);
 	struct vm_area_struct *vma;
 	unsigned long end = addr + len;
@@ -447,6 +461,31 @@ probe_range(struct mm_struct *mm, unsigned long addr, unsigned long len)
 	if (vma || addr < end)
 		return -EFAULT;
 	return 0;
+#else
+	const unsigned long end = addr + len;
+	struct vm_area_struct *vma;
+	int ret = -EFAULT;
+
+	mmap_read_lock(mm);
+	for (vma = find_vma(mm, addr); vma; vma = vma->vm_next) {
+		/* Check for holes, note that we also update the addr below */
+		if (vma->vm_start > addr)
+			break;
+
+		if (vma->vm_flags & (VM_PFNMAP | VM_MIXEDMAP))
+			break;
+
+		if (vma->vm_end >= end) {
+			ret = 0;
+			break;
+		}
+
+		addr = vma->vm_end;
+	}
+	mmap_read_unlock(mm);
+
+	return ret;
+#endif
 }
 
 /*

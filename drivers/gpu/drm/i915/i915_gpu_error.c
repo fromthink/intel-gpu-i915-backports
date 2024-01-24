@@ -187,6 +187,7 @@ i915_error_printer(struct drm_i915_error_state_buf *e)
 }
 
 /* single threaded page allocator with a reserved stash for emergencies */
+#ifdef BPM_CHECK_MOVE_UNEVICTABLE_FOLIOS_AVAILABLE
 static void pool_fini(struct folio_batch *fbatch)
 {
 	folio_batch_release(fbatch);
@@ -240,11 +241,70 @@ static void pool_free(struct folio_batch *fbatch, void *addr)
 	else
 		folio_put(folio);
 }
+#else
+static void pool_fini(struct pagevec *pv)
+{
+	pagevec_release(pv);
+}
+
+static int pool_refill(struct pagevec *pv, gfp_t gfp)
+{
+	while (pagevec_space(pv)) {
+		struct page *p;
+
+		p = alloc_page(gfp);
+		if (!p)
+			return -ENOMEM;
+
+		pagevec_add(pv, p);
+	}
+
+	return 0;
+}
+
+static int pool_init(struct pagevec *pv, gfp_t gfp)
+{
+	int err;
+
+	pagevec_init(pv);
+
+	err = pool_refill(pv, gfp);
+	if (err)
+		pool_fini(pv);
+
+	return err;
+}
+
+static void *pool_alloc(struct pagevec *pv, gfp_t gfp)
+{
+	struct page *p;
+
+	p = alloc_page(gfp);
+	if (!p && pagevec_count(pv))
+		p = pv->pages[--pv->nr];
+
+	return p ? page_address(p) : NULL;
+}
+
+static void pool_free(struct pagevec *pv, void *addr)
+{
+	struct page *p = virt_to_page(addr);
+
+	if (pagevec_space(pv))
+		pagevec_add(pv, p);
+	else
+		__free_page(p);
+}
+#endif
 
 #ifdef CPTCFG_DRM_I915_COMPRESS_ERROR
 
 struct i915_vma_compress {
+#ifdef BPM_CHECK_MOVE_UNEVICTABLE_FOLIOS_AVAILABLE
 	struct folio_batch pool;
+#else
+	struct pagevec pool;
+#endif
 	struct z_stream_s zstream;
 	void *tmp;
 };
@@ -381,7 +441,11 @@ static void err_compression_marker(struct drm_i915_error_state_buf *m)
 #else
 
 struct i915_vma_compress {
+#ifdef BPM_CHECK_MOVE_UNEVICTABLE_FOLIOS_AVAILABLE
 	struct folio_batch pool;
+#else
+	struct pagevec pool;
+#endif
 };
 
 static bool compress_init(struct i915_vma_compress *c)
@@ -1179,9 +1243,17 @@ i915_vma_coredump_create(const struct intel_gt *gt,
 
 			drm_clflush_pages(&page, 1);
 
+#ifdef BPM_KMAP_LOCAL_NOT_PRESENT
+			s = kmap(page);
+#else
 			s = kmap_local_page(page);
+#endif
 			ret = compress_page(compress, s, dst, false);
+#ifdef BPM_KMAP_LOCAL_NOT_PRESENT
+			kunmap(page);
+#else
 			kunmap_local(s);
+#endif
 
 			drm_clflush_pages(&page, 1);
 

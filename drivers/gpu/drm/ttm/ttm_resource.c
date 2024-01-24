@@ -564,7 +564,11 @@ retry:
 		goto retry;
 	}
 
+#ifdef BPM_KMAP_LOCAL_NOT_PRESENT
+	addr = io_mapping_map_atomic_wc(iter_io->iomap, iter_io->cache.offs +
+#else
 	addr = io_mapping_map_local_wc(iter_io->iomap, iter_io->cache.offs +
+#endif
 				       (((resource_size_t)i - iter_io->cache.i)
 					<< PAGE_SHIFT));
 	iosys_map_set_vaddr_iomem(dmap, addr);
@@ -573,7 +577,11 @@ retry:
 static void ttm_kmap_iter_iomap_unmap_local(struct ttm_kmap_iter *iter,
 					    struct iosys_map *map)
 {
+#ifdef BPM_KMAP_LOCAL_NOT_PRESENT
+	io_mapping_unmap_atomic(map->vaddr_iomem);
+#else
 	io_mapping_unmap_local(map->vaddr_iomem);
+#endif
 }
 
 static const struct ttm_kmap_iter_ops ttm_kmap_iter_io_ops = {

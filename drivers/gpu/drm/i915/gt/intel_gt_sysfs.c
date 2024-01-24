@@ -72,7 +72,11 @@ static void kobj_gt_release(struct kobject *kobj)
 {
 }
 
+#ifdef BPM_STRUCT_BUS_TYPE_UEVENT_CONST
 static const struct kobj_type kobj_gt_type = {
+#else
+static struct kobj_type kobj_gt_type = {
+#endif
 	.release = kobj_gt_release,
 	.sysfs_ops = &kobj_sysfs_ops,
 	.default_groups = id_groups,

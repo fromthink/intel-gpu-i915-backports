@@ -47,6 +47,7 @@ do {									\
 #endif
 
 #ifdef BPM_LOCKDEP_ASSERT_API_NOT_PRESENT
+#define lockdep_assert(c)			do { } while (0)
 #define lockdep_assert_once(c)                  do { } while (0)
 #define lockdep_assert_none_held_once()         \
         lockdep_assert_once(!current->lockdep_depth)

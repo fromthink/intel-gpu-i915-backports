@@ -1,6 +1,7 @@
 #ifndef __BACKPORT_DEVICE_H
 #define __BACKPORT_DEVICE_H
 #include <linux/export.h>
+#include <linux/of.h>
 #include_next <linux/device.h>
 #ifdef BPM_DEVICE_ATTR_ADMIN_RX_NOT_PRESENT
 #define DEVICE_ATTR_ADMIN_RW(_name) \
@@ -26,6 +27,14 @@ static inline struct device *class_find_device_by_devt(struct class *class,
 						       dev_t devt)
 {
 	return class_find_device(class, NULL, &devt, device_match_devt);
+}
+#endif
+
+#ifdef BPM_DEVICE_SET_NODE_NOT_PRESENT
+static inline void device_set_node(struct device *dev, struct fwnode_handle *fwnode)
+{
+	dev->fwnode = fwnode;
+	dev->of_node = to_of_node(fwnode);
 }
 #endif
 

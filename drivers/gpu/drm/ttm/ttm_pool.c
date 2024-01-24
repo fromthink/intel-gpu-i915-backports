@@ -797,7 +797,11 @@ int ttm_pool_mgr_init(unsigned long num_pages)
 	mm_shrinker.count_objects = ttm_pool_shrinker_count;
 	mm_shrinker.scan_objects = ttm_pool_shrinker_scan;
 	mm_shrinker.seeks = 1;
+#ifdef BPM_REGISTER_SHRINKER_NAME_AVAILABLE
 	return register_shrinker(&mm_shrinker, "drm-ttm_pool");
+#else
+	return register_shrinker(&mm_shrinker);
+#endif
 }
 
 /**

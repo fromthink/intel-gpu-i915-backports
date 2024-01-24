@@ -38,4 +38,20 @@
 	(((~0UL) << (l)) & (~0UL >> (BITS_PER_LONG - 1 - (h))))
 #endif
 
+#ifdef BPM_FOR_EACH_CLEAR_BITRANGE_NOT_PRESENT
+/**
+ * for_each_clear_bitrange - iterate over all unset bit ranges [b; e)
+ * @b: bit offset of start of current bitrange (first unset bit)
+ * @e: bit offset of end of current bitrange (first set bit)
+ * @addr: bitmap address to base the search on
+ * @size: bitmap size in number of bits
+ */
+#define for_each_clear_bitrange(b, e, addr, size)		\
+	for ((b) = 0;						\
+	     (b) = find_next_zero_bit((addr), (size), (b)),	\
+	     (e) = find_next_bit((addr), (size), (b) + 1),	\
+	     (b) < (size);					\
+	     (b) = (e) + 1)
+#endif
+
 #endif

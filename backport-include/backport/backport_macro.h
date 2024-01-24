@@ -3,6 +3,33 @@
 #include <linux/version.h>
 #include <backport/autoconf.h>
 
+#if LINUX_VERSION_IS_GEQ(6,4,0)
+/*
+ * 673aa1ed1c9b6 of: Rename of_modalias_node()
+ */
+#define BPM_OF_MODALIAS_NODE_RENAMED
+#endif
+
+#if LINUX_VERSION_IS_GEQ(6,3,0)
+/*
+ * 4d70c74659d974
+ *  i915: Move list_count() to list.h as list_count_nodes() for broader use
+ */
+#define BPM_LIST_COUNT_NODES_AVAILABLE
+
+/*
+ * 2a81ada32f0e58
+ *  driver core: make struct bus_type.uevent() take a const *
+ */
+#define BPM_STRUCT_BUS_TYPE_UEVENT_CONST
+
+/*
+ * 9cbad37ce8122d
+ *  of: Add of_property_present() helper
+ */
+#define BPM_OF_PROPERTY_PRESENT_AVAILABLE
+#endif
+
 #if (LINUX_VERSION_IS_GEQ(6,3,0) || \
 		LINUX_VERSION_IS_LESS(4,10,0) || \
 			REDHAT_RELEASE_VERSION_IS_GEQ(8,9))
@@ -18,6 +45,24 @@
  *  overflow: Introduce overflows_type() and castable_to_type()
  */
 #define BPM_OVERFLOWS_TYPE_AVAILABLE
+
+/*
+ * f571faf6e443b6
+ *  timers: Provide timer_shutdown[_sync]()
+ */
+#define BPM_TIMER_SHUTDOWN_SYNC_AVAILABLE
+
+/*
+ * e9a688bcb1934
+ * random: use rejection sampling for uniform bounded random integers
+ */
+#define BPM_GET_RANDOM_U32_BELOW_AVAILABLE
+
+/*
+ * 64f6a5d1922bf
+ *  container_of: add container_of_const() that preserves const-ness of the pointer
+ */
+#define BPM_CONTAINER_OF_CONST_AVAILABLE
 #endif
 
 #if (LINUX_VERSION_IS_GEQ(6,2,0) || \
@@ -38,6 +83,40 @@
  * 0f60d28828dd dynamic_dname(): drop unused dentry argument
  */
 #define BPM_DYNAMIC_DNAME_DENTRY_ARG_NOT_PRESENT
+
+/*
+ * aad0214f30264c
+ *  dyndbg: add DECLARE_DYNDBG_CLASSMAP macro
+ */
+#define BPM_DECLARE_DYNDBG_CLASSMAP_AVAILABLE
+
+/*
+ * 3dbc80a3e4c55c
+ *   ACPI: video: Make backlight class device registration a separate step (v2)
+ */
+#define BPM_ACPI_VIDEO_REGISTER_BACKLIGHT_AVAILABLE
+
+/*
+ * f39af05949a4 mm: add VMA iterator
+ */
+#define BPM_VMA_ITERATOR_AVAILABLE
+#endif
+
+#if LINUX_VERSION_IS_GEQ(6,0,0)
+/*
+ * 77414d195f90 vmscan: Add check_move_unevictable_folios()
+ */
+#define BPM_CHECK_MOVE_UNEVICTABLE_FOLIOS_AVAILABLE
+
+/*
+ * e33c267ab70d mm: shrinkers: provide shrinkers with names
+ */
+#define BPM_REGISTER_SHRINKER_NAME_AVAILABLE
+
+/*
+ * 73b4b53276a1 Revert "workqueue: remove unused cancel_work()"
+ */
+#define BPM_CANCEL_WORK_AVAILABLE
 #endif
 
 #if LINUX_VERSION_IS_GEQ(5,19,0)
@@ -92,6 +171,11 @@
  */
 #define BPM_DELETE_FROM_PAGE_CACHE_NOT_PRESENT
 #endif
+
+/*
+ * ec288a2cf7ca bitmap: unify find_bit operations
+ */
+#define BPM_FOR_EACH_CLEAR_BITRANGE_NOT_PRESENT
 #endif
 
 #if LINUX_VERSION_IS_GEQ(5,16,0)
@@ -300,6 +384,12 @@
 /* TBD: Need to check if its generic or controllable with version */
 #define BPM_PTRACE_MAY_ACCESS_NOT_PRESENT
 
+/*
+ * 43e76d463c09a0
+ *   driver core: add a helper to setup both the of_node and fwnode of a device
+ */
+#define BPM_DEVICE_SET_NODE_NOT_PRESENT
+
 #endif
 
 #if LINUX_VERSION_IS_LESS(5,13,0)
@@ -446,6 +536,11 @@
  */
 #define BPM_MOD_LRUVEC_PAGE_STATE_NOT_EXPORTED
 #endif
+
+/*
+ * f3ba3c710ac5 mm/highmem: Provide kmap_local*
+ */
+#define BPM_KMAP_LOCAL_NOT_PRESENT
 #endif
 
 #if LINUX_VERSION_IS_LESS(5,10,0)

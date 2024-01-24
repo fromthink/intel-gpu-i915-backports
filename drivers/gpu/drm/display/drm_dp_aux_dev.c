@@ -330,7 +330,11 @@ int drm_dp_aux_dev_init(void)
 {
 	int res;
 
+#if LINUX_VERSION_IS_GEQ(6,4,0)
 	drm_dp_aux_dev_class = class_create("drm_dp_aux_dev");
+#else
+	drm_dp_aux_dev_class = class_create(THIS_MODULE,"drm_dp_aux_dev");
+#endif
 	if (IS_ERR(drm_dp_aux_dev_class)) {
 		return PTR_ERR(drm_dp_aux_dev_class);
 	}

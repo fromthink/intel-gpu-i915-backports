@@ -37,5 +37,22 @@ static inline int list_is_head(const struct list_head *list, const struct list_h
 	(&pos->member == (head))
 #endif
 
+#ifndef BPM_LIST_COUNT_NODES_AVAILABLE
+/**
+ * list_count_nodes - count nodes in the list
+ * @head:	the head for your list.
+ */
+static inline size_t list_count_nodes(struct list_head *head)
+{
+	struct list_head *pos;
+	size_t count = 0;
+
+	list_for_each(pos, head)
+		count++;
+
+	return count;
+}
+#endif
+
 #endif /* _BACKPORT_LINUX_LIST_H */
 

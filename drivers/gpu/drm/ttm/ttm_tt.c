@@ -412,14 +412,22 @@ static void ttm_kmap_iter_tt_map_local(struct ttm_kmap_iter *iter,
 	struct ttm_kmap_iter_tt *iter_tt =
 		container_of(iter, typeof(*iter_tt), base);
 
+#ifdef BPM_KMAP_LOCAL_NOT_PRESENT
+	iosys_map_set_vaddr(dmap, kmap_atomic_prot(iter_tt->tt->pages[i],
+#else
 	iosys_map_set_vaddr(dmap, kmap_local_page_prot(iter_tt->tt->pages[i],
+#endif
 						       iter_tt->prot));
 }
 
 static void ttm_kmap_iter_tt_unmap_local(struct ttm_kmap_iter *iter,
 					 struct iosys_map *map)
 {
+#ifdef BPM_KMAP_LOCAL_NOT_PRESENT
+	kunmap_atomic(map->vaddr);
+#else
 	kunmap_local(map->vaddr);
+#endif
 }
 
 static const struct ttm_kmap_iter_ops ttm_kmap_iter_tt_ops = {

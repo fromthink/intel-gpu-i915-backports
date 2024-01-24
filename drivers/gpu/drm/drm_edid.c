@@ -37,6 +37,7 @@
 #include <linux/pci.h>
 #include <linux/slab.h>
 #include <linux/vga_switcheroo.h>
+#include <linux/string_helpers.h>
 
 #include <drm/drm_displayid.h>
 #include <drm/drm_drv.h>

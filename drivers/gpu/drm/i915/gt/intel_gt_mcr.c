@@ -819,7 +819,9 @@ void intel_gt_mcr_report_steering(struct drm_printer *p, struct intel_gt *gt,
 			   gt->default_steering.instanceid);
 
 	if (GRAPHICS_VER_FULL(gt->i915) >= IP_VER(12, 70)) {
-		for (int i = 0; i < NUM_STEERING_TYPES; i++)
+		int i;
+
+		for (i = 0; i < NUM_STEERING_TYPES; i++)
 			if (gt->steering_table[i])
 				report_steering_type(p, gt, i, dump_table);
 	} else if (IS_PONTEVECCHIO(gt->i915)) {

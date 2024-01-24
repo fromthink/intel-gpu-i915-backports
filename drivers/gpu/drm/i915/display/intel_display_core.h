@@ -168,7 +168,11 @@ struct intel_hotplug {
 	u32 short_port_mask;
 	struct work_struct dig_port_work;
 
+#ifdef BPM_CANCEL_WORK_AVAILABLE
 	struct work_struct poll_init_work;
+#else
+	struct delayed_work poll_init_work;
+#endif
 	bool poll_enabled;
 
 	unsigned int hpd_storm_threshold;

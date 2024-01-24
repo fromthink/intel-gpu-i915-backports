@@ -528,11 +528,24 @@ static struct i915_refct_sgt *i915_ttm_tt_get_st(struct ttm_tt *ttm)
 	struct i915_ttm_tt *i915_tt = container_of(ttm, typeof(*i915_tt), ttm);
 	struct sg_table *st;
 	int ret;
+#ifdef BPM_SG_ALLOC_TABLE_FROM_PAGES_SEGMENT_NOT_PRESENT
+	struct scatterlist *sg;
+#endif
 
 	if (i915_tt->cached_rsgt.table.sgl)
 		return i915_refct_sgt_get(&i915_tt->cached_rsgt);
 
 	st = &i915_tt->cached_rsgt.table;
+#ifdef BPM_SG_ALLOC_TABLE_FROM_PAGES_SEGMENT_NOT_PRESENT
+	sg = __sg_alloc_table_from_pages(st,
+			ttm->pages, ttm->num_pages,
+			0, (unsigned long)ttm->num_pages << PAGE_SHIFT,
+			i915_sg_segment_size(i915_tt->dev), NULL, 0, GFP_KERNEL);
+	if (IS_ERR(sg)) {
+		st->sgl = NULL;
+		return ERR_CAST(sg);
+	}
+#else
 	ret = sg_alloc_table_from_pages_segment(st,
 			ttm->pages, ttm->num_pages,
 			0, (unsigned long)ttm->num_pages << PAGE_SHIFT,
@@ -541,6 +554,7 @@ static struct i915_refct_sgt *i915_ttm_tt_get_st(struct ttm_tt *ttm)
 		st->sgl = NULL;
 		return ERR_PTR(ret);
 	}
+#endif
 
 	ret = dma_map_sgtable(i915_tt->dev, st, DMA_BIDIRECTIONAL, 0);
 	if (ret) {

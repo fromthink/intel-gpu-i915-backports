@@ -84,4 +84,18 @@ static inline bool want_init_on_alloc(gfp_t flags)
 #define unpin_user_page(X) put_user_page(X)
 #endif
 
+#if LINUX_VERSION_IS_LESS(6,3,0)
+static inline void vm_flags_set(struct vm_area_struct *vma,
+				vm_flags_t flags)
+{
+	vma->vm_flags |= flags;
+}
+
+static inline void vm_flags_clear(struct vm_area_struct *vma,
+				  vm_flags_t flags)
+{
+	vma->vm_flags &= ~flags;
+}
+#endif /* < 6.3 */
+
 #endif /* _BACKPORT_LINUX_MM_H */
