@@ -93,12 +93,6 @@ static inline bool intel_huc_is_loaded_by_gsc(const struct intel_huc *huc)
 	return huc->loaded_via_gsc;
 }
 
-static inline bool intel_huc_wait_required(struct intel_huc *huc)
-{
-	return intel_huc_is_used(huc) && intel_huc_is_loaded_by_gsc(huc) &&
-	       !intel_huc_is_authenticated(huc, INTEL_HUC_AUTH_BY_GSC);
-}
-
 void intel_huc_load_status(struct intel_huc *huc, struct drm_printer *p);
 
 #endif
