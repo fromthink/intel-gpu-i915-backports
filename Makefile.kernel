@@ -60,6 +60,7 @@ obj-y += drivers/gpu/drm/i915/
 else
 obj-y += drivers/gpu/drm/
 
+obj-y += drivers/char/agp/
 endif
 endif
 

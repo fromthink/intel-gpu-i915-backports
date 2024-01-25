@@ -1,0 +1,4 @@
+config INTEL_GTT
+	tristate
+	depends on m
+	depends on X86 && PCI
