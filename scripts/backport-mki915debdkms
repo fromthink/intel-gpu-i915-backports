@@ -90,7 +90,7 @@ $NO_DRM	DEST_MODULE_LOCATION[18]="/updates"
        	num_cpu_cores()
        	{
 		if [ -x /usr/bin/nproc ]; then
-			np=`nproc`
+			np=\$(nproc)
 			if [ "\$np" -le "64" ]; then
 				echo "\$np"
 			else
