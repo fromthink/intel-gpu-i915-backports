@@ -1,8 +1,8 @@
 diff --git a/Kconfig.sources b/Kconfig.sources
-index ceaddc267dbb..b1780c5bc431 100644
+index adc6eb4ad91b..fbb02cd1d3bd 100644
 --- a/Kconfig.sources
 +++ b/Kconfig.sources
-@@ -2,13 +2,13 @@
+@@ -2,12 +2,12 @@
  source "$BACKPORT_DIR/compat/Kconfig"
  
  # these are copied from the kernel
@@ -12,8 +12,6 @@ index ceaddc267dbb..b1780c5bc431 100644
 -source "$BACKPORT_DIR/drivers/gpu/drm/Kconfig"
 +#source "$BACKPORT_DIR/drivers/gpu/drm/Kconfig"
  source "$BACKPORT_DIR/drivers/gpu/drm/i915/Kconfig"
--source "$BACKPORT_DIR/drivers/video/Kconfig"
-+#source "$BACKPORT_DIR/drivers/video/Kconfig"
  
 -source "$BACKPORT_DIR/drivers/char/agp/Kconfig"
 +#source "$BACKPORT_DIR/drivers/char/agp/Kconfig"
@@ -21,10 +19,10 @@ index ceaddc267dbb..b1780c5bc431 100644
  #source "$BACKPORT_DIR/net/bluetooth/Kconfig"
  #source "$BACKPORT_DIR/drivers/net/wireless/Kconfig"
 diff --git a/local-symbols b/local-symbols
-index b53b143060fb..e1d2fc00299e 100644
+index 584505e76a6e..f97070a52498 100644
 --- a/local-symbols
 +++ b/local-symbols
-@@ -46,7 +46,6 @@ DRM_KUNIT_TEST=
+@@ -45,7 +45,6 @@ DRM_KUNIT_TEST=
  DRM_KMS_HELPER=
  DRM_DEBUG_DP_MST_TOPOLOGY_REFS=
  DRM_DEBUG_MODESET_LOCK=

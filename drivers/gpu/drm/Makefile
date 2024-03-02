@@ -71,7 +71,6 @@ drm-$(CPTCFG_DRM_PRIVACY_SCREEN) += \
 	drm_privacy_screen.o \
 	drm_privacy_screen_x86.o
 drm-$(CONFIG_DRM_ACCEL) += ../../accel/drm_accel.o
-drm-$(CPTCFG_VIDEO_NOMODESET) += ../../video/nomodeset.o
 obj-$(CPTCFG_DRM)	+= drm.o
 
 obj-$(CPTCFG_DRM_PANEL_ORIENTATION_QUIRKS) += drm_panel_orientation_quirks.o
