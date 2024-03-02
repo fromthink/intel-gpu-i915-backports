@@ -17,10 +17,12 @@
 #include <linux/sched/signal.h>
 #include <linux/seq_file.h>
 
+#ifndef CONFIG_DMA_SHARED_BUFFER
 #define CREATE_TRACE_POINTS
 #include <trace/events/dma_fence.h>
 
 EXPORT_TRACEPOINT_SYMBOL(dma_fence_signaled);
+#endif
 
 static DEFINE_SPINLOCK(dma_fence_stub_lock);
 static struct dma_fence dma_fence_stub;
