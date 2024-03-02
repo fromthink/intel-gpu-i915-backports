@@ -9,6 +9,7 @@
 #include <linux/stringify.h>
 #include <linux/types.h>
 #include <linux/tracepoint.h>
+#include <backport/backport_path.h>
 
 #include <drm/drm_drv.h>
 
@@ -749,6 +750,6 @@ DEFINE_EVENT(i915_context, i915_context_free,
 /* This part must be outside protection */
 #undef TRACE_INCLUDE_PATH
 #undef TRACE_INCLUDE_FILE
-#define TRACE_INCLUDE_PATH ../../drivers/gpu/drm/i915
+#define TRACE_INCLUDE_PATH BACKPORT_PATH/drivers/gpu/drm/i915
 #define TRACE_INCLUDE_FILE i915_trace
 #include <trace/define_trace.h>
