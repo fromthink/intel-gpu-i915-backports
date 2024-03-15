@@ -1,0 +1,141 @@
+name: Build
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "*-[0-9]+"
+
+jobs:
+  build_dsm:
+    strategy:
+      matrix:
+        version: [7.1, 7.2]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download toolchain
+        run: |
+          env_tarball=ds.epyc7002-${{ matrix.version }}.env.txz
+          wget https://global.synologydownload.com/download/ToolChain/toolkit/${{ matrix.version }}/epyc7002/$env_tarball
+          mkdir toolchain
+          tar xf $env_tarball -C toolchain
+
+      - name: Download kernel headers
+        run: |
+          dev_tarball=ds.epyc7002-${{ matrix.version }}.dev.txz
+          wget https://global.synologydownload.com/download/ToolChain/toolkit/${{ matrix.version }}/epyc7002/$dev_tarball
+          mkdir ksrc
+          tar xf $dev_tarball -C ksrc
+
+      - name: Build
+        run: |
+          export KLIB_BUILD=$PWD/ksrc/usr/local/x86_64-pc-linux-gnu/x86_64-pc-linux-gnu/sys-root/usr/lib/modules/DSM-${{ matrix.version }}/build
+          export CROSS_COMPILE=$PWD/toolchain/usr/local/x86_64-pc-linux-gnu/bin/x86_64-pc-linux-gnu-
+
+          make defconfig-drm
+          make -j$(nproc)
+
+          MODULES_INTERMEDIATES=$PWD/out/intermediates
+          OUT_MODULES=$PWD/out/modules
+          mkdir -p $OUT_MODULES
+          make -C $KLIB_BUILD M=$PWD \
+            INSTALL_MOD_PATH=$MODULES_INTERMEDIATES \
+            INSTALL_MOD_STRIP=1 CONFIG_MODULE_SIG_ALL= \
+            _emodinst_
+          find $MODULES_INTERMEDIATES -type f -name '*.ko'	\
+              -exec mv {} $OUT_MODULES \;
+
+      - name: Checkout firmware
+        run: |
+          git clone https://git.kernel.org/pub/scm/linux/kernel/git/firmware/linux-firmware.git \
+            -b 20240115 \
+            --depth 1
+
+      - name: Copy necessary firmware
+        run: |
+          SOURCE=linux-firmware/i915
+          DEST=out/firmware
+          mkdir -p $DEST
+          while read L; do
+            L=$(basename $L)
+            if [ -e "$SOURCE/$L" ]; then
+              cp "$SOURCE/$L" $DEST
+            else
+              echo "::warning ::Missing $L"
+            fi
+          done < <(find out/modules -name \*.ko -exec /sbin/modinfo {} -F firmware \;)
+          chmod 644 $DEST/*
+
+      - name: Pack modules and firmware
+        working-directory: out
+        run: zip -r i915_dsm-${{ matrix.version }}_epyc7002.zip firmware modules
+
+      - name: Save to artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: i915_dsm-${{ matrix.version }}_epyc7002
+          path: out/i915_dsm-${{ matrix.version }}_epyc7002.zip
+
+  build_pve:
+    runs-on: ubuntu-latest
+    container: debian:12
+    env:
+      DEBIAN_FRONTEND: noninteractive
+      DPKG_COLORS: always
+      FORCE_UNSAFE_CONFIGURE: 1
+
+    steps:
+      - name: Install Dependencies
+        run: |
+          echo 'APT::Get::Assume-Yes "true";' > /etc/apt/apt.conf.d/00noconfirm
+          apt-get update && \
+            apt-get install -yq build-essential devscripts dkms dh-dkms
+
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          path: src
+
+      - name: Build
+        working-directory: src
+        run: |
+          REF=${{ github.event.ref }}
+          if [[ $REF == refs/tags/* ]]; then
+            BUILD_VERSION=${REF##*-}
+          else
+            BUILD_VERSION=
+          fi
+          make BUILD_CONFIG=nodrm BUILD_VERSION=$BUILD_VERSION i915dkmsdeb-pkg
+
+      - name: Save to artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: i915_pve
+          path: "*.deb"
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: [build_dsm, build_pve]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+
+      - name: Append tag to filename
+        run: |
+          find . -name "i915_dsm-*.zip" -print0 | while read -d $'\0' f; do
+            mv $f ${f%.*}_${GITHUB_REF##*/}.zip
+          done
+
+      - name: Release
+        uses: softprops/action-gh-release@v1
+        with:
+          generate_release_notes: true
+          files: |
+            *.zip
+            *.deb
